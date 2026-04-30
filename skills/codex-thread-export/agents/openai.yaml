@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Thread Export"
+  short_description: "Export local Codex app threads, responses, and turns to clean Markdown with frontmatter, maps, redaction, and verified Unicode clipboard."
+  brand_color: "#2563EB"
+  default_prompt: "Export this Codex thread to Markdown. If I did not provide a session ID, run /status in this thread, list sessions with --list-sessions, or use --latest-session."
+policy:
+  allow_implicit_invocation: false

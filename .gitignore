@@ -1,0 +1,24 @@
+# Exported transcripts may contain private prompts, command output, repo paths,
+# .env names, or secrets. Always keep them local unless redacted.
+codex-thread-exports/
+*.raw.jsonl
+*.private.*.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local development context not meant for the public repo
+ChatGPT_*.md
+*.local.md
+.claude/

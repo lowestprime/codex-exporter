@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile-check
+        shell: bash
+        run: python -m py_compile Export-CodexThread.py
+
+      - name: Verify --version
+        shell: bash
+        run: python Export-CodexThread.py --version
+
+      - name: Verify skill-bundled script is in sync with root
+        shell: bash
+        run: python tools/sync_skill_script.py --check
+
+      - name: Smoke tests
+        shell: bash
+        run: python tests/test_smoke.py
+
+      - name: Validate skill manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re, sys, pathlib
+          p = pathlib.Path("skills/codex-thread-export/SKILL.md").read_text(encoding="utf-8")
+          assert p.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
+          fm = p.split("---", 2)[1]
+          for k in ("name", "description"):
+              assert re.search(rf"(?m)^{k}:\s*\S", fm), f"frontmatter missing required field: {k}"
+          print("SKILL.md frontmatter OK")
+          PY
+
+      - name: Validate openai.yaml
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys, pathlib, re
+          y = pathlib.Path("skills/codex-thread-export/agents/openai.yaml").read_text(encoding="utf-8")
+          for k in ("display_name", "short_description", "default_prompt"):
+              assert re.search(rf"(?m)^\s+{k}:\s*\S", y), f"openai.yaml missing field: {k}"
+          print("openai.yaml schema OK")
+          PY
