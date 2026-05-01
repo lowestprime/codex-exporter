@@ -42,6 +42,107 @@ python Export-CodexThread.py --session-id <UUID> --mode last-response --wrap-md 
 
 ---
 
+## Exact `cl100k_base` token counts with `tiktoken` (optional)
+
+The exporter works with zero required packages. If `tiktoken` is installed, token counts in filenames, frontmatter, the thread map, and per-turn metadata automatically use OpenAI's `cl100k_base` tokenizer instead of the built-in regex estimate. No exporter flag is required.
+
+Install `tiktoken` into the **same Python interpreter** that runs `Export-CodexThread.py`.
+
+### Windows PowerShell
+
+```powershell
+$ErrorActionPreference='Stop'
+$py=(Get-Command python).Source
+uv pip install --python $py --system --upgrade --only-binary=:all: "tiktoken>=0.12,<1"
+```
+
+If you do not use `uv`:
+
+```powershell
+python -m pip install --upgrade --only-binary=:all: "tiktoken>=0.12,<1"
+```
+
+### macOS / Linux
+
+```bash
+python3 -m pip install --upgrade --only-binary=:all: 'tiktoken>=0.12,<1'
+```
+
+### Validate tokenizer availability
+
+```powershell
+$ErrorActionPreference='Stop'
+$py=(Get-Command python).Source
+@'
+import importlib.metadata as md
+import sys
+import tiktoken
+
+text = "Codex exporter validation: I'll, I’ll, em dash —, emoji 🚀, 中文, code: `Get-ChildItem`"
+enc = tiktoken.get_encoding("cl100k_base")
+tokens = enc.encode(text)
+
+print(f"python={sys.executable}")
+print(f"tiktoken={md.version('tiktoken')}")
+print(f"encoding={enc.name}")
+print(f"tokens={len(tokens)}")
+print(f"roundtrip={enc.decode(tokens) == text}")
+'@ | & $py -
+```
+
+Expected pass conditions:
+
+```text
+encoding=cl100k_base
+roundtrip=True
+```
+
+### Validate exporter integration
+
+```powershell
+$ErrorActionPreference='Stop'
+$py=(Get-Command python).Source
+@'
+from pathlib import Path
+import tiktoken
+
+script = Path("Export-CodexThread.py")
+src = script.read_text(encoding="utf-8")
+enc = tiktoken.get_encoding("cl100k_base")
+
+print(f"script={script.resolve()}")
+print(f"encoding={enc.name}")
+print(f"roundtrip={enc.decode(enc.encode('I’ll — 🚀 中文')) == 'I’ll — 🚀 中文'}")
+print(f"source_mentions_tiktoken={'tiktoken' in src}")
+print(f"source_mentions_cl100k_base={'cl100k_base' in src}")
+'@ | & $py -
+```
+
+Expected pass conditions:
+
+```text
+encoding=cl100k_base
+roundtrip=True
+source_mentions_tiktoken=True
+source_mentions_cl100k_base=True
+```
+
+After this passes, run the exporter normally:
+
+```powershell
+cdx-thread <SESSION_ID>
+```
+
+or:
+
+```bash
+python Export-CodexThread.py --session-id <UUID> --mode thread
+```
+
+The generated token counts will use `cl100k_base` automatically.
+
+---
+
 ## Get the session ID
 
 In a Codex app/CLI thread composer, type `/status`. Copy the `Session` UUID. Or skip this step entirely and use `--list-sessions` / `--latest-session`.
@@ -208,7 +309,7 @@ codex-thread-exports/
 ## Limitations
 
 - The exporter reads local JSONL session files; it does not call any API or upload anything.
-- Token counts are approximate. Install `tiktoken` for `cl100k_base` accuracy; otherwise a dependency-free regex estimate is used.
+- Token counts are approximate unless `tiktoken` is installed in the Python interpreter that runs the exporter; when available, the exporter uses `cl100k_base` automatically.
 - Model detection is best-effort and depends on whether the local session JSONL records the model name.
 - Verified Win32 Unicode clipboard is Windows-only. Other platforms use `pbcopy` / `wl-copy` / `xclip` / `xsel`.
 
