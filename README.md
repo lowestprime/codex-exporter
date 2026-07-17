@@ -1,349 +1,340 @@
-# Codex Thread Exporter
+# Codex Exporter 0.2
 
-[![ci](https://github.com/lowestprime/codex-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/lowestprime/codex-exporter/actions/workflows/ci.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.
 
-GUI-fidelity Markdown exports of local **Codex app/CLI** thread/session JSONL — full threads, turns, single responses, ranges — with frontmatter, an export map, per-turn metadata, redaction, **verified** Win32 Unicode clipboard, and a one-command Codex skill for `$`-invocation in the Codex composer.
+## What changed in 0.2
 
-**Why this exists.** Copying responses from Codex into another tool drops Unicode (`I'll` → `IÆll`), bloats your output with `Chunk ID` / `Wall time` / `Process exited` transport headers, hides edited-file cards behind raw patch noise, and never gives you a clean full-thread Markdown with usable metadata. This tool fixes all of that, and stays dependency-light: zero required Python packages.
+- persistent export-directory and filename-template configuration;
+- Windows folder picker and Save As dialog through the Python standard library;
+- mode-aware filenames (`thread`, `turn-0012`, `response-0012`, `last-response`, and so on);
+- complete PowerShell helpers, including `cdx-sessions`;
+- method-specific token metadata instead of an always-approximate label;
+- deterministic batch export, last-N-turn extraction, collision policies, and stable short-ID filenames;
+- optional project-aware session browser;
+- compaction/rollback-aware reconstructed live-context mode;
+- explicit reasoning-summary opt-in without exporting raw internal reasoning;
+- recognized/ignored/unknown event accounting and sibling JSON manifests;
+- narrow repair of otherwise-valid JSON lines containing unescaped Windows-path backslashes;
+- explicit distinction among source-runtime loss, exporter truncation, and harmless display ellipses;
+- package metadata, `codex-export` console entry point, expanded regression tests, release automation, and a compatibility matrix.
+- deterministic UTF-8 standard output/error for Windows redirects and machine-readable JSON;
 
----
+## Windows 11 installation
 
-## Quickstart
-
-### macOS / Linux
-
-```bash
-git clone https://github.com/lowestprime/codex-exporter.git
-cd codex-exporter
-./bash/install.sh --skill           # installs script + helpers + Codex skill
-exec $SHELL                         # reload shell to pick up cdx-* helpers
-cdx-sessions                        # list local sessions
-cdx-thread <SESSION_ID>             # full export to ~/codex-thread-exports/
-```
-
-### Windows (PowerShell 7+)
+Use the same CPython interpreter that already has, or will receive, `tiktoken`:
 
 ```powershell
-git clone https://github.com/lowestprime/codex-exporter.git
-cd codex-exporter
-.\Install-CodexThreadExporter.ps1 -AppendProfile -InstallSkill
+$ErrorActionPreference = 'Stop'
+$py = (Get-Command python -ErrorAction Stop).Source
+
+Set-Location '<CLONED_OR_EXTRACTED_CODEX_EXPORTER_DIRECTORY>'
+.\Install-CodexThreadExporter.ps1 `
+    -InstallDir 'C:\projects\CodexTools' `
+    -PythonPath $py `
+    -AppendProfile `
+    -InstallSkill `
+    -InstallTiktoken
+
 . $PROFILE
-cdx-thread <SESSION_ID>
+cdx-tokenizer -Tokenizer tiktoken -Encoding cl100k_base -Require
+cdx-sessions
 ```
 
-### Direct Python (any platform)
+The installer accepts custom paths, replaces exactly one marked profile block, preserves unrelated profile content, and is idempotent. It only creates a timestamped profile backup when the generated profile content actually changes.
 
-```bash
-python Export-CodexThread.py --list-sessions
-python Export-CodexThread.py --latest-session --mode thread
-python Export-CodexThread.py --session-id <UUID> --mode last-response --wrap-md --clipboard
-```
-
----
-
-## Exact `cl100k_base` token counts with `tiktoken` (optional)
-
-The exporter works with zero required packages. If `tiktoken` is installed, token counts in filenames, frontmatter, the thread map, and per-turn metadata automatically use OpenAI's `cl100k_base` tokenizer instead of the built-in regex estimate. No exporter flag is required.
-
-Install `tiktoken` into the **same Python interpreter** that runs `Export-CodexThread.py`.
-
-### Windows PowerShell
+To install the package/console entry point as well:
 
 ```powershell
-$ErrorActionPreference='Stop'
-$py=(Get-Command python).Source
-uv pip install --python $py --system --upgrade --only-binary=:all: "tiktoken>=0.12,<1"
+.\Install-CodexThreadExporter.ps1 `
+    -InstallDir 'D:\Tools\Codex Exporter' `
+    -PythonPath $py `
+    -AppendProfile `
+    -InstallPackage `
+    -InstallTiktoken
 ```
 
-If you do not use `uv`:
+## Persistent output directory
+
+The resolver precedence is:
+
+1. `CODEX_THREAD_EXPORT_DIR` environment variable;
+2. the persisted `last_out_dir` in the exporter config;
+3. `<exporter-script-directory>\codex-thread-exports`.
+
+On Windows, the persisted config is normally:
+
+```text
+%LOCALAPPDATA%\codex-exporter\config.json
+```
+
+Override its location with `CODEX_EXPORT_CONFIG` when testing or maintaining separate profiles.
 
 ```powershell
-python -m pip install --upgrade --only-binary=:all: "tiktoken>=0.12,<1"
+cdx-set-dir                         # native folder picker; remembers selection
+cdx-set-dir 'D:\Codex Exports'     # explicit persistent default
+cdx-open                            # open current default in File Explorer
+cdx-config                          # inspect persisted settings
 ```
 
-### macOS / Linux
-
-```bash
-python3 -m pip install --upgrade --only-binary=:all: 'tiktoken>=0.12,<1'
-```
-
-### Validate tokenizer availability
+One-off controls:
 
 ```powershell
-$ErrorActionPreference='Stop'
-$py=(Get-Command python).Source
+cdx-thread <SESSION_ID> -ChooseOutDir   # select and remember a folder
+cdx-thread <SESSION_ID> -SaveAs         # native Save As dialog; remembers parent
+```
+
+At the direct CLI level, `--out-dir` and `--choose-out-dir` are remembered by default. Add `--no-remember-out-dir` for a truly one-off destination.
+
+## PowerShell commands
+
+| Command | Purpose |
+|---|---|
+| `cdx-sessions` | List active and archived local Codex sessions |
+| `cdx-browse` | Optional paginated/project-aware multi-select browser |
+| `cdx-thread <ID>` | Full chronological thread export |
+| `cdx-thread-clip <ID>` | Full thread plus verified Unicode clipboard |
+| `cdx-responses <ID>` | List prompt/response block indices |
+| `cdx-turn <ID> N` | Prompt plus response block `N`, with metadata |
+| `cdx-response-block <ID> N` | Response block `N` |
+| `cdx-response <ID>` | Latest response, wrapped Markdown, clipboard |
+| `cdx-last <ID> N` | Last `N` turns |
+| `cdx-live <ID>` | Reconstructed compaction/rollback-aware live context |
+| `cdx-batch <ID1>,<ID2>` | Deterministic batch export with short IDs |
+| `cdx-final <ID>` | Last substantial assistant message |
+| `cdx-msg <ID> N` | One message |
+| `cdx-range <ID> A B` | Inclusive message range |
+| `cdx-set-dir [PATH]` | Select or set persistent export directory |
+| `cdx-set-template [TEMPLATE]` | Set or display persistent filename template |
+| `cdx-tokenizer` | Display active tokenizer integration |
+| `cdx-config` | Display persisted exporter configuration |
+| `cdx-open` | Open the current export folder |
+
+The lower-level `Invoke-CodexThreadExport` wrapper exposes every advanced option, including `-ReasoningSummaries`, `-ReportEvents`, `-StrictEvents`, `-StableFilenames`, `-Collision`, `-OpenAfter`, and tokenizer controls.
+
+## Export modes and mode-aware names
+
+Default filenames use:
+
+```text
+codex_{title}_{mode}_{stamp}{session_short_part}{counts}.md
+```
+
+Examples:
+
+```text
+codex_example_project_thread_FRI_07172026_015336_AM-PDT_552296lines_approx7867634tokens.md
+codex_example_project_turn-0012_FRI_07172026_020000_AM-PDT_1234lines_18543cl100k_base_tokens.md
+codex_example_project_response-0012_FRI_07172026_020100_AM-PDT_233lines_2981cl100k_base_tokens.md
+```
+
+Available template placeholders:
+
+```text
+{title} {mode} {stamp} {session_id} {session_short} {session_short_part}
+{lines} {tokens} {token_method} {token_encoding} {counts}
+```
+
+Configure them persistently:
+
+```powershell
+cdx-set-template 'codex_{title}_{mode}_{stamp}{session_short_part}{counts}.md'
+cdx-set-template   # print current template
+```
+
+Direct CLI configuration:
+
+```powershell
+codex-export --set-filename-template 'archive_{title}_{mode}{session_short_part}.md'
+codex-export --print-filename-template
+codex-export --reset-filename-template
+```
+
+`--stable-filenames` removes the timestamp and forces a short session ID. Batch exports include short IDs automatically. Existing-file policy is selected with `--collision rename|overwrite|skip|error`; `rename` is the safe default.
+
+## Batch, last-N, and browsing
+
+Repeat source options or use a line-oriented input file:
+
+```powershell
+codex-export --session-id <ID1> --session-id <ID2> --mode thread
+codex-export --jsonl C:\a.jsonl --jsonl C:\b.jsonl --mode thread
+codex-export --sessions-file .\sessions.txt --mode thread --stable-filenames
+codex-export --session-id <ID> --mode thread --last-n-turns 5
+```
+
+`--browse` is optional and does not change the noninteractive architecture. Browser controls are:
+
+```text
+number/range  select rows       a  select current page
+n / p         next/previous     m  projects/sessions view
+/ text        filter            s  find ID/rollout filename
+b             back              q  quit
+```
+
+## Token counting
+
+The default is `--tokenizer auto --token-encoding cl100k_base`.
+
+When `tiktoken` succeeds, the export records:
+
+```yaml
+token_count: 12345
+token_count_method: "tiktoken"
+token_encoding: "cl100k_base"
+tokenizer_library: "tiktoken"
+tokenizer_version: "0.12.0"
+token_count_exact_for_encoding: true
+token_special_text_policy: "ordinary_text; disallowed_special=()"
+```
+
+When unavailable or intentionally disabled:
+
+```yaml
+token_count_method: "regex_estimate"
+token_encoding: "none"
+token_count_exact_for_encoding: false
+```
+
+“Exact” means exact for the selected encoding and the exact exported Unicode text. It does **not** claim to reproduce a model API’s hidden role/tool framing, server-side accounting, or another model’s native tokenizer.
+
+Install and validate in the exact interpreter used by the wrapper:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$py = (Get-Command python -ErrorAction Stop).Source
+& $py -m pip install --upgrade --only-binary=:all: 'tiktoken>=0.12,<1'
+
+cdx-tokenizer -Tokenizer tiktoken -Encoding cl100k_base -Require
+
 @'
+from pathlib import Path
 import importlib.metadata as md
+import runpy
 import sys
 import tiktoken
 
-text = "Codex exporter validation: I'll, I’ll, em dash —, emoji 🚀, 中文, code: `Get-ChildItem`"
+script = Path(r"C:\projects\CodexTools\Export-CodexThread.py")
 enc = tiktoken.get_encoding("cl100k_base")
-tokens = enc.encode(text)
+text = "Codex exporter validation: I'll, I’ll, em dash —, emoji 🚀, 中文, code: `Get-ChildItem`"
 
 print(f"python={sys.executable}")
+print(f"script={script.resolve()}")
 print(f"tiktoken={md.version('tiktoken')}")
 print(f"encoding={enc.name}")
-print(f"tokens={len(tokens)}")
-print(f"roundtrip={enc.decode(tokens) == text}")
+print(f"tokens={len(enc.encode(text, disallowed_special=()))}")
+print(f"roundtrip={enc.decode(enc.encode(text, disallowed_special=())) == text}")
+print(f"script_exists={script.is_file()}")
 '@ | & $py -
 ```
 
-Expected pass conditions:
+Do not validate with `Path("Export-CodexThread.py")` from an unrelated working directory; use the installed absolute path or `$script:CodexThreadExporter`.
 
-```text
-encoding=cl100k_base
-roundtrip=True
+## Parse integrity
+
+Every nonblank source line is attempted with strict `json.loads` first. On failure, the repair path only escapes invalid backslashes **inside JSON strings**, preserving valid JSON escapes and structural characters. It does not concatenate lines, invent braces, or guess arbitrary malformed records.
+
+Metadata distinguishes:
+
+```yaml
+parse_error_count: 0
+repaired_json_line_count: 3
 ```
 
-### Validate exporter integration
+The manifest records each repaired line number, original parser error, repair class, and repair count. Unrecoverable lines remain `parse_error_count` entries and are never silently discarded.
+
+## Source truncation versus exporter truncation
+
+Codex can store markers such as:
+
+```text
+…1234 tokens truncated…
+```
+
+That means the missing material was already absent from the rollout JSONL. No exporter can reconstruct it. The default `--source-truncation annotate` replaces the ambiguous marker with:
+
+```text
+[SOURCE TOOL OUTPUT TRUNCATED BY CODEX BEFORE EXPORT: 1234 tokens omitted; not recoverable from this rollout record]
+```
+
+Other policies:
 
 ```powershell
-$ErrorActionPreference='Stop'
-$py=(Get-Command python).Source
-@'
-from pathlib import Path
-import tiktoken
-
-script = Path("Export-CodexThread.py")
-src = script.read_text(encoding="utf-8")
-enc = tiktoken.get_encoding("cl100k_base")
-
-print(f"script={script.resolve()}")
-print(f"encoding={enc.name}")
-print(f"roundtrip={enc.decode(enc.encode('I’ll — 🚀 中文')) == 'I’ll — 🚀 中文'}")
-print(f"source_mentions_tiktoken={'tiktoken' in src}")
-print(f"source_mentions_cl100k_base={'cl100k_base' in src}")
-'@ | & $py -
+--source-truncation preserve   # keep original marker verbatim
+--source-truncation error      # abort instead of exporting lossy source
 ```
 
-Expected pass conditions:
+The manifest separately counts:
+
+- raw markers in all JSONL lines;
+- markers encountered in extracted record types;
+- markers remaining in the selected rendered record set.
+
+Exporter-created tail trimming uses an unmistakable independent sentinel:
 
 ```text
-encoding=cl100k_base
-roundtrip=True
-source_mentions_tiktoken=True
-source_mentions_cl100k_base=True
+[EXPORTER TOOL OUTPUT TRUNCATED: kept final N of M characters]
 ```
 
-After this passes, run the exporter normally:
+Overlong-line, binary/blob, repeated-line, ANSI/OSC, and transport-header cleanup are independently counted in the manifest.
+
+## Event auditing and manifest
+
+Every written export receives a sibling `.manifest.json` unless `--no-manifest` is used. It reports:
+
+- source path, SHA-256, session ID, and source-event count;
+- output path, mode, lines, tokenizer method, and exactness;
+- recognized event schemas;
+- known ignored schemas and explicit reasons;
+- unknown schemas;
+- cleaning, summarization, and redaction counts;
+- repaired and unrecovered JSON lines;
+- source/extracted/selected truncation counts;
+- compaction and rollback reconstruction history.
+
+Use:
 
 ```powershell
-cdx-thread <SESSION_ID>
+codex-export --session-id <ID> --mode thread --report-events
+codex-export --session-id <ID> --mode thread --strict-events
 ```
 
-or:
+`--strict-events` is suitable for regression/CI workflows where a new Codex schema should fail loudly.
 
-```bash
-python Export-CodexThread.py --session-id <UUID> --mode thread
-```
+## Reconstructed live context
 
-The generated token counts will use `cl100k_base` automatically.
-
----
-
-## Get the session ID
-
-In a Codex app/CLI thread composer, type `/status`. Copy the `Session` UUID. Or skip this step entirely and use `--list-sessions` / `--latest-session`.
-
----
-
-## What it exports
-
-For `--mode thread`, the Markdown contains:
-
-- YAML frontmatter (title, session id, source SHA256, models detected, prompt/response counts, action counts, edited/created/deleted file counts, total lines, approximate tokens, exported timestamp)
-- Top-of-file thread export map with a per-turn index table
-- Per-turn prompt and response metadata (timestamps, line counts, token counts, action counts, file-card counts)
-- Assistant messages, command blocks, command output blocks, `Success` markers
-- Reconstructed `Edited file` / `Created file` / `Deleted file` cards parsed from `*** Begin Patch` ... `*** End Patch` payloads — **not** raw `apply_patch` noise
-- ANSI/OSC stripping, base64/data-URI/hex blob summarization, repeated-line compaction
-- Optional secret redaction (`--redact`)
-
-Filenames are stamped:
-
-```text
-codex_<thread_name>_WED_04292026_060940_PM-PDT_12345lines_67890tokens.md
-```
-
-The timezone follows your system local tz, or `CODEX_EXPORT_TZ=America/Los_Angeles` if set.
-
----
-
-## Modes
-
-| Mode | What it does |
-|---|---|
-| `thread` | Full thread/chat with frontmatter, map, prompts, responses, actions |
-| `last-response` | Latest response after the most recent user prompt |
-| `last-substantial` | Latest assistant message ≥ `--min-chars` (default 1000) |
-| `response` | Selected response block by `--response N` |
-| `turn` | Selected prompt+response block by `--response N`, with metadata |
-| `message` | Selected user/assistant message by `--message N` |
-| `range` | Message range by `--from-message N --to-message M` |
-| `chat` | User/assistant messages only, no actions |
-| `chat-actions` | Everything: messages + actions |
-| `actions` | Extracted actions only |
-
-Use `--list-responses` to see indices for `response` / `turn` mode, or `--list` for indices for `message` mode.
-
-## Common commands
-
-### PowerShell (after `.\Install-CodexThreadExporter.ps1 -AppendProfile`)
-
-| Command | What it does |
-|---|---|
-| `cdx-sessions` | List all local Codex session JSONLs |
-| `cdx-thread <UUID>` | Full thread export |
-| `cdx-thread-clip <UUID>` | Full thread export + clipboard copy |
-| `cdx-response <UUID>` | Latest response → wrapped Markdown + verified clipboard |
-| `cdx-response <UUID> -NoFile` | Clipboard only, skip writing a file |
-| `cdx-responses <UUID>` | List prompt/response blocks |
-| `cdx-response-block <UUID> N` | Export response block N |
-| `cdx-turn <UUID> N` | Export prompt+response turn N with metadata |
-| `cdx-final <UUID>` | Last substantial assistant answer |
-| `cdx-msg <UUID> N` | Export single message N |
-| `cdx-range <UUID> A B` | Export message range A..B |
-| `cdx-open` | Open the export folder |
-| `cdx-verify-latest` | Health-check the most recent export (clipboard match, no mojibake, no transport noise) |
-
-### Bash / zsh (after `./bash/install.sh`)
-
-Same names, same args. `cdx-sessions`, `cdx-thread`, `cdx-thread-clip`, `cdx-response`, `cdx-responses`, `cdx-response-block`, `cdx-turn`, `cdx-final`, `cdx-msg`, `cdx-range`, `cdx-open`, `cdx-latest`.
-
----
-
-## Codex app integration (skill)
-
-A first-class [Codex Agent Skill](https://developers.openai.com/codex/skills) is included so you can invoke the exporter from the Codex composer:
-
-```text
-$codex-thread-export export this full thread
-$codex-thread-export copy the latest response as fenced Markdown
-$codex-thread-export list local sessions
-```
-
-The skill is self-contained — its bundled `scripts/Export-CodexThread.py` mirrors the canonical root script, so the skill folder works on its own.
-
-### Install the skill
-
-PowerShell:
 ```powershell
-.\Install-CodexThreadExporter.ps1 -InstallSkill
+cdx-live <SESSION_ID>
 ```
 
-Bash:
-```bash
-./bash/install.sh --skill
+The exporter applies recorded `compacted.payload.replacement_history` and `thread_rolled_back.num_turns` events and labels the result:
+
+```yaml
+history_semantics: "reconstructed_live_context"
 ```
 
-Or copy manually:
-```bash
-cp -R skills/codex-thread-export "$HOME/.agents/skills/codex-thread-export"
+This is an evidence-based reconstruction, not a claim to reproduce the server’s exact hidden context prompt. Chronological `cdx-thread` remains the authoritative source-history export.
+
+## Reasoning-summary privacy boundary
+
+Raw internal reasoning is not exported. `--reasoning-summaries` includes only explicit summary text already stored in Codex `response_item/reasoning.summary` records, with an opt-in label.
+
+```powershell
+Invoke-CodexThreadExport -SessionId <ID> -Mode thread -ReasoningSummaries
 ```
 
-Restart Codex if the skill doesn't appear in `/skills`.
+## Development and release checks
 
----
-
-## Verifying a clean export (Windows)
-
-After running an export, `cdx-verify-latest` should report:
-
-```text
-Clipboard_MatchesFile         True
-File_Has_Mojibake             False
-Clipboard_Has_Mojibake        False
-File_Has_ChunkMetadata        False
-Clipboard_Has_ChunkMetadata   False
-File_Has_ActionNoise          False
-File_Has_EditedFile           True
-Clipboard_Has_EditedFile      True
+```powershell
+python -m pip install -e '.[test,exact]'
+python tools\sync_cli.py
+python -m pytest
+python -m build
 ```
 
-These are the regression boundaries the tool was iterated against. If any of these flip, file an issue with the failing fixture.
+CI covers Python 3.10 and 3.13 on Windows, macOS, and Linux; mirrored-script identity; exact `cl100k_base` smoke tests; PowerShell parsing; custom installation paths; idempotent profile replacement; archived-session discovery; every export mode; batch collisions; compaction/rollback; unknown schemas; and OS clipboard integration where a runner exposes it.
 
----
+Tagged `v*` pushes build distributions and create a GitHub release. See [COMPATIBILITY.md](COMPATIBILITY.md) and [CHANGELOG.md](CHANGELOG.md).
 
-## Security and publishing guidance
+## Security
 
-Codex transcripts can contain prompts, command output, file paths, branch names, `.env` filenames, API keys, and private repo names. **Always inspect before sharing.**
-
-For public sharing:
-
-```bash
-python Export-CodexThread.py --session-id <UUID> --mode thread --redact
-```
-
-`--redact` scrubs:
-- OpenAI API keys (`sk-...`)
-- GitHub PATs and tokens (`github_pat_...`, `ghp_...`, etc.)
-- Bearer tokens
-- Generic `password=` / `token=` / `secret=` / `api_key=` lines
-- Cloudflare tunnel tokens
-
-The exporter strips embedded base64 images, data URIs, and oversize hex blobs by default. Pass `--keep-hogs` to disable (forensic local-only).
-
-Add this to `.gitignore` in projects that use the tool:
-
-```text
-codex-thread-exports/
-*.raw.jsonl
-*.private.*.md
-```
-
----
-
-## Environment variables
-
-| Variable | Purpose |
-|---|---|
-| `CODEX_THREAD_EXPORTER` | Override the path the bash/zsh and skill resolvers use to find the script |
-| `CODEX_THREAD_EXPORT_DIR` | Override the default `--out-dir` |
-| `CODEX_EXPORT_TZ` | IANA timezone (e.g. `America/Los_Angeles`) used in filename stamps |
-| `CODEX_HOME` | Override `~/.codex` for session discovery |
-
----
-
-## Limitations
-
-- The exporter reads local JSONL session files; it does not call any API or upload anything.
-- Token counts are approximate unless `tiktoken` is installed in the Python interpreter that runs the exporter; when available, the exporter uses `cl100k_base` automatically.
-- Model detection is best-effort and depends on whether the local session JSONL records the model name.
-- Verified Win32 Unicode clipboard is Windows-only. Other platforms use `pbcopy` / `wl-copy` / `xclip` / `xsel`.
-
----
-
-## Repository layout
-
-```text
-Export-CodexThread.py                 canonical Python script
-Install-CodexThreadExporter.ps1       Windows installer
-bash/
-  codex-thread-export.sh              POSIX helper functions
-  install.sh                          POSIX installer
-powershell/
-  CodexThreadExport-profile-block.v7.ps1   profile block to source
-skills/
-  codex-thread-export/                Codex Agent Skill
-    SKILL.md
-    scripts/Export-CodexThread.py     bundled copy (kept in sync via tools/sync_skill_script.py)
-    agents/openai.yaml
-tests/
-  test_smoke.py                       7 cross-platform smoke tests
-  fixtures/sample-session.jsonl       synthetic Codex session for tests
-tools/
-  sync_skill_script.py                keeps skill copy in lockstep with root
-.github/workflows/ci.yml              CI on Linux/macOS/Windows × py3.10/3.13
-```
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). The bar for behavioral changes to the extraction core is high — please attach a real failing case before changing `classify_record`, `extract_command`, `parse_apply_patch`, the secret patterns, `strip_hogs`, or the Win32 clipboard implementation.
-
-## License
-
-[MIT](LICENSE) © 2026 Cooper Beaman
+Rollouts can contain source code, local paths, credentials, and private repository names. Use `--redact` before sharing and inspect the result. Redaction and binary/blob suppression are counted in the manifest, but pattern-based redaction is not a substitute for human review.

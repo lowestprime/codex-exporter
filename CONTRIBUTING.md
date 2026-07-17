@@ -1,60 +1,76 @@
 # Contributing
 
-Thanks for taking a look! This tool was hardened against many real-world
-Codex JSONL shapes. The bar for behavioral changes to the **extraction core**
-is higher than for additive features — please read the relevant section before
-opening a PR.
+Codex session schemas evolve, and small parser changes can silently alter large
+exports. Additive features are welcome, but extraction changes must include a
+minimal anonymized fixture and a regression test.
 
-## Quick start
+## Development setup
 
 ```bash
 git clone https://github.com/lowestprime/codex-exporter.git
 cd codex-exporter
-python -m py_compile Export-CodexThread.py
-python tests/test_smoke.py
+python -m pip install -e '.[test,exact]'
+python tools/sync_cli.py
+python -m pytest
+python -m build
 ```
 
-No third-party Python dependencies are required. `tiktoken` is used opportunistically
-if installed.
+Python 3.10 through 3.13 are supported. `tiktoken` is optional at runtime and
+installed by the `exact` extra for tests.
 
-## What's safe to change
+## Canonical and mirrored CLI files
 
-**Additive features** (new flags, new modes, new output fields, new helpers,
-new docs, new tests) are welcome.
+`Export-CodexThread.py` is the canonical standalone implementation. It is
+mirrored byte-for-byte to:
 
-**Behavioral changes to the extraction core** (`classify_record`,
-`extract_command`, `extract_output_and_meta`, `parse_apply_patch`, the
-`SECRET_PATTERNS`, `strip_hogs`, `merge_command_outputs`,
-`set_windows_clipboard_unicode`) need a real failing case attached, plus a
-test fixture that exercises the regression. The core was iterated against
-many real session shapes, so changes there can quietly regress old fixes for
-mojibake, transport-header noise, base64 hogs, and Unicode clipboard fidelity.
+- `codex_exporter/cli.py`, used by the `codex-export` console entry point;
+- `skills/codex-thread-export/scripts/Export-CodexThread.py`, used by the
+  self-contained Codex skill.
 
-Please run `cdx-verify-latest` from the PowerShell helper against a real
-local export before/after your change. The expected healthy values are listed
-in the README.
-
-## Sync the skill copy
-
-The Codex skill ships with a bundled copy of `Export-CodexThread.py` at
-`skills/codex-thread-export/scripts/Export-CodexThread.py` so the skill folder
-is self-contained for direct copy installs. After every change to the root
-script, run:
+After every canonical CLI change, run:
 
 ```bash
-python tools/sync_skill_script.py
+python tools/sync_cli.py
 ```
 
-CI verifies the two are byte-identical via `python tools/sync_skill_script.py --check`.
+CI rejects drift among the three copies.
 
-## Tests
+## Parser and renderer changes
 
-Smoke tests live in `tests/test_smoke.py` and exercise the synthetic fixture at
-`tests/fixtures/sample-session.jsonl`. They invoke the script as a subprocess
-so they cover the same surface a Codex skill or shell user would invoke. To
-add coverage, append to the fixture and write a new `test_*` function.
+Changes to event classification, text extraction, command/output merging,
+patch reconstruction, JSON repair, redaction, source-truncation handling,
+clipboard code, or live-context reconstruction must include:
 
-## Don't commit secrets
+1. a minimal anonymized fixture under `tests/fixtures/regression/`;
+2. a test demonstrating the prior failure and expected behavior;
+3. manifest assertions when the change affects integrity/accounting fields;
+4. an entry in `CHANGELOG.md` when user-visible behavior changes.
 
-`codex-thread-exports/` is gitignored. Don't commit raw `.codex` session JSONL
-files or unredacted exports. Use `--redact` for anything you intend to share.
+Do not add raw private rollout files. Preserve only the minimum schema shape
+needed to reproduce a bug.
+
+## Public compatibility claims
+
+Update `COMPATIBILITY.md` when a tagged release is manually exercised against a
+new Codex app/CLI version or storage source. Do not infer exact compatibility
+from a synthetic fixture alone.
+
+## PowerShell and installer changes
+
+Windows changes must keep these guarantees:
+
+- custom installation paths;
+- explicit Python-interpreter pinning;
+- exactly one marked profile block after repeated installs;
+- preservation of unrelated profile content;
+- no user-specific paths in committed files;
+- no profile backup unless the generated content changes.
+
+The Windows CI job parses all committed `.ps1` files and runs the idempotent
+custom-path installation test.
+
+## Security and privacy
+
+Never commit raw `.codex` sessions, unredacted exports, personal PowerShell
+profiles, API keys, or machine-specific audit output. `--redact` is a helpful
+filter, not a guarantee; inspect any export before publishing it.

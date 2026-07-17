@@ -10,6 +10,8 @@
 *.gif   binary
 *.ico   binary
 *.svg   text eol=lf
+*.whl   binary
+*.gz    binary
 
-# Treat the Codex session JSONL fixtures as text/lf so diffs render cleanly
+# Codex regression fixtures remain human-diffable.
 *.jsonl text eol=lf

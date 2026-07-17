@@ -1,73 +1,113 @@
-# Install-CodexThreadExporter.ps1
-# Installs the Codex Thread Exporter and (optionally) the Codex skill on Windows.
+# Installs Codex Exporter 0.2+ and safely replaces its marked PowerShell profile block.
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\projects\CodexTools',
+    [string]$PythonPath = '',
+    [string]$ExportDir = '',
+    [string]$ProfilePath = '',
     [switch]$AppendProfile,
     [switch]$InstallSkill,
+    [switch]$InstallPackage,
+    [switch]$InstallTiktoken,
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
-
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$rootScript = Join-Path $repoRoot 'Export-CodexThread.py'
-if (-not (Test-Path $rootScript)) {
-    throw "Source script not found: $rootScript"
+$sourceScript = Join-Path $repoRoot 'Export-CodexThread.py'
+$sourcePackage = Join-Path $repoRoot 'codex_exporter'
+$sourceHelper = Join-Path $repoRoot 'powershell\CodexThreadExport-profile-block.v8.ps1'
+
+foreach ($required in @($sourceScript, $sourcePackage, $sourceHelper)) {
+    if (-not (Test-Path -LiteralPath $required)) { throw "Required source missing: $required" }
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir 'codex-thread-exports') | Out-Null
+if (-not $PythonPath) { $PythonPath = (Get-Command python -ErrorAction Stop).Source }
+$PythonPath = [System.IO.Path]::GetFullPath($PythonPath)
+if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw "Python executable not found: $PythonPath" }
 
-$installedScript = Join-Path $InstallDir 'Export-CodexThread.py'
-$installedHelper = Join-Path $InstallDir 'CodexThreadExport-profile-block.ps1'
-Copy-Item $rootScript $installedScript -Force
-Copy-Item (Join-Path $repoRoot 'powershell\CodexThreadExport-profile-block.v7.ps1') $installedHelper -Force
+$installPath = [System.IO.Path]::GetFullPath($InstallDir)
+$installedScript = Join-Path $installPath 'Export-CodexThread.py'
+$installedPackage = Join-Path $installPath 'codex_exporter'
+$installedHelper = Join-Path $installPath 'CodexThreadExport-profile-block.v8.ps1'
+New-Item -ItemType Directory -Force -Path $installPath | Out-Null
+Copy-Item -LiteralPath $sourceScript -Destination $installedScript -Force
+if (Test-Path -LiteralPath $installedPackage) {
+    Remove-Item -LiteralPath $installedPackage -Recurse -Force
+}
+Copy-Item -LiteralPath $sourcePackage -Destination $installedPackage -Recurse -Force
 
-python -m py_compile $installedScript
+$scriptLiteral = "'" + $installedScript.Replace("'", "''") + "'"
+$pythonLiteral = $PythonPath.Replace("'", "''")
+$helper = (Get-Content -LiteralPath $sourceHelper -Raw).Trim()
+$helper = $helper.Replace("'C:\projects\CodexTools\Export-CodexThread.py'", $scriptLiteral)
+$helper = $helper.Replace('__CODEX_EXPORT_PYTHON__', $pythonLiteral)
+Set-Content -LiteralPath $installedHelper -Value $helper -Encoding utf8NoBOM
+
+& $PythonPath -m py_compile $installedScript
+
+if ($InstallPackage) {
+    & $PythonPath -m pip install --upgrade $repoRoot
+}
+if ($InstallTiktoken) {
+    & $PythonPath -m pip install --upgrade --only-binary=:all: 'tiktoken>=0.12,<1'
+}
+
+if ($ExportDir) {
+    $resolvedExportDir = [System.IO.Path]::GetFullPath($ExportDir)
+    New-Item -ItemType Directory -Force -Path $resolvedExportDir | Out-Null
+    & $PythonPath $installedScript --set-default-out-dir $resolvedExportDir | Out-Null
+}
 
 if ($AppendProfile) {
-    $profilePath = $PROFILE
-    $profileDir = Split-Path -Parent $profilePath
-    if ($profileDir -and -not (Test-Path $profileDir)) {
-        New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+    $profilePath = if ($ProfilePath) { [System.IO.Path]::GetFullPath($ProfilePath) } else { $PROFILE }
+    $profileDirectory = Split-Path -Parent $profilePath
+    if ($profileDirectory) { New-Item -ItemType Directory -Force -Path $profileDirectory | Out-Null }
+    if (Test-Path -LiteralPath $profilePath) {
+        $existing = Get-Content -LiteralPath $profilePath -Raw
+    } else {
+        $existing = ''
     }
-    $marker = '# >>> Codex Thread Exporter helpers >>>'
-    $existing = if (Test-Path $profilePath) { Get-Content $profilePath -Raw } else { '' }
-    if (-not $existing.Contains($marker) -or $Force) {
-        $block = Get-Content $installedHelper -Raw
-        Add-Content -Path $profilePath -Value "`r`n$marker`r`n$block`r`n# <<< Codex Thread Exporter helpers <<<`r`n"
+
+    $begin = '# >>> Codex Thread Exporter helpers >>>'
+    $end = '# <<< Codex Thread Exporter helpers <<<'
+    $pattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+
+    if ([regex]::IsMatch($existing, $pattern)) {
+        $updated = [regex]::Replace($existing, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $helper }, 1)
+    } elseif ($existing.Contains('# Codex Thread Exporter PowerShell helper functions')) {
+        $legacyPattern = '(?s)# Codex Thread Exporter PowerShell helper functions.*?(?=# List all functions defined in this profile script|\z)'
+        $updated = [regex]::Replace($existing, $legacyPattern, $helper + "`r`n`r`n", 1)
+    } else {
+        $updated = $existing.TrimEnd() + "`r`n`r`n" + $helper.Trim() + "`r`n"
+    }
+    if ($updated -cne $existing) {
+        if (Test-Path -LiteralPath $profilePath) {
+            Copy-Item -LiteralPath $profilePath -Destination "$profilePath.codex-exporter-backup-$(Get-Date -Format yyyyMMdd-HHmmss-fff)" -Force
+        }
+        Set-Content -LiteralPath $profilePath -Value $updated -Encoding utf8NoBOM
     }
 }
 
 if ($InstallSkill) {
     $skillSource = Join-Path $repoRoot 'skills\codex-thread-export'
     $skillTarget = Join-Path $HOME '.agents\skills\codex-thread-export'
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $skillTarget) | Out-Null
-
-    if (Test-Path $skillTarget) {
+    if (Test-Path -LiteralPath $skillTarget) {
         if (-not $Force) {
-            Write-Warning "Skill target already exists: $skillTarget. Re-run with -Force to overwrite."
-        } else {
-            Remove-Item -Recurse -Force $skillTarget
-            Copy-Item $skillSource $skillTarget -Recurse -Force
+            throw "Skill already exists: $skillTarget. Re-run with -Force to replace it."
         }
-    } else {
-        Copy-Item $skillSource $skillTarget -Recurse -Force
+        Remove-Item -LiteralPath $skillTarget -Recurse -Force
     }
-
-    # Always sync the bundled script copy with the canonical root script so the
-    # skill remains self-contained even if the repo's bundled copy drifts.
-    $skillScriptDir = Join-Path $skillTarget 'scripts'
-    New-Item -ItemType Directory -Force -Path $skillScriptDir | Out-Null
-    Copy-Item $rootScript (Join-Path $skillScriptDir 'Export-CodexThread.py') -Force
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $skillTarget) | Out-Null
+    Copy-Item -LiteralPath $skillSource -Destination $skillTarget -Recurse -Force
 }
 
 [pscustomobject]@{
+    Version = (& $PythonPath $installedScript --version | Out-String).Trim()
+    Python = $PythonPath
     InstalledScript = $installedScript
-    HelperBlock     = $installedHelper
-    ExportDir       = Join-Path $InstallDir 'codex-thread-exports'
-    ProfileUpdated  = [bool]$AppendProfile
-    SkillInstalled  = [bool]$InstallSkill
-    Version         = (& python $installedScript --version) 2>&1 | Out-String
+    ProfileUpdated = [bool]$AppendProfile
+    SkillInstalled = [bool]$InstallSkill
+    PackageInstalled = [bool]$InstallPackage
+    Tokenizer = (& $PythonPath $installedScript --tokenizer-info --tokenizer auto | Out-String).Trim()
 }
