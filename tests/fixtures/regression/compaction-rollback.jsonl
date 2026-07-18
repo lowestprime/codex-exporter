@@ -1,0 +1,9 @@
+{"type":"session_meta","timestamp":"2026-06-01T00:00:00Z","payload":{"id":"22222222-2222-7222-8222-222222222222","title":"Compaction fixture"}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:01Z","payload":{"type":"user_message","message":"Old prompt"}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:02Z","payload":{"type":"agent_message","message":"Old answer"}}
+{"type":"compacted","timestamp":"2026-06-01T00:00:03Z","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Compacted prompt"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Compacted answer"}]}]}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:04Z","payload":{"type":"user_message","message":"Rolled prompt"}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:05Z","payload":{"type":"agent_message","message":"Rolled answer"}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:06Z","payload":{"type":"thread_rolled_back","num_turns":1}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:07Z","payload":{"type":"user_message","message":"Current prompt"}}
+{"type":"event_msg","timestamp":"2026-06-01T00:00:08Z","payload":{"type":"agent_message","message":"Current answer"}}

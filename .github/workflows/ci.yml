@@ -2,62 +2,142 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: ${{ matrix.os }} / py${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.13"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.10', '3.13']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test,exact]"
+      - run: python tools/sync_cli.py --check
+      - run: python -m pytest
+      - run: codex-export --tokenizer-info --tokenizer tiktoken --token-encoding cl100k_base --require-tiktoken
+      - run: codex-export --jsonl tests/fixtures/sample-session.jsonl --mode thread --out-dir .ci-output --tokenizer tiktoken --token-encoding cl100k_base --json
 
-      - name: Compile-check
-        shell: bash
-        run: python -m py_compile Export-CodexThread.py
+      - name: Validate PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+              'Install-CodexThreadExporter.ps1',
+              'powershell/CodexThreadExport-profile-block.v8.ps1'
+          )) {
+              $tokens = $null
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                  (Resolve-Path $path),
+                  [ref]$tokens,
+                  [ref]$errors
+              )
+              if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }
+          }
 
-      - name: Verify --version
-        shell: bash
-        run: python Export-CodexThread.py --version
+      - name: Verify idempotent custom-path profile installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'codex exporter custom path'
+          $profile = Join-Path $root 'Microsoft.PowerShell_profile.ps1'
+          $install = Join-Path $root 'tool'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $profile) | Out-Null
+          Set-Content -LiteralPath $profile -Value @'
+          function Existing-ProfileFunction { 'preserved' }
+          # Codex Thread Exporter PowerShell helper functions
+          function Legacy-CodexHelper { 'replace me' }
+          # List all functions defined in this profile script
+          function Existing-TrailingFunction { 'also preserved' }
+          '@ -Encoding utf8NoBOM
 
-      - name: Verify skill-bundled script is in sync with root
-        shell: bash
-        run: python tools/sync_skill_script.py --check
+          ./Install-CodexThreadExporter.ps1 -InstallDir $install -PythonPath (Get-Command python).Source -ProfilePath $profile -AppendProfile
+          $first = Get-Content -LiteralPath $profile -Raw
+          ./Install-CodexThreadExporter.ps1 -InstallDir $install -PythonPath (Get-Command python).Source -ProfilePath $profile -AppendProfile
+          $second = Get-Content -LiteralPath $profile -Raw
 
-      - name: Smoke tests
-        shell: bash
-        run: python tests/test_smoke.py
+          if ($first -cne $second) { throw 'Second installer run changed the profile.' }
+          if (($second | Select-String -Pattern '# >>> Codex Thread Exporter helpers >>>' -AllMatches).Matches.Count -ne 1) {
+              throw 'Expected exactly one exporter profile block.'
+          }
+          if ($second.Contains('Legacy-CodexHelper')) { throw 'Legacy helper region was not replaced.' }
+          if (-not $second.Contains('Existing-ProfileFunction')) { throw 'Leading profile content was not preserved.' }
+          if (-not $second.Contains('Existing-TrailingFunction')) { throw 'Trailing profile content was not preserved.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $install 'Export-CodexThread.py'))) { throw 'Installed script missing.' }
+          $installedHelper = Get-Content -LiteralPath (Join-Path $install 'CodexThreadExport-profile-block.v8.ps1') -Raw
+          if ($installedHelper.Contains('__CODEX_EXPORT_PYTHON__')) { throw 'Installed helper retained the Python placeholder.' }
+          if (-not $installedHelper.Contains((Get-Command python).Source)) { throw 'Installed helper did not pin the requested interpreter.' }
+          if (-not $installedHelper.Contains((Join-Path $install 'Export-CodexThread.py'))) { throw 'Installed helper did not pin the custom script path.' }
 
-      - name: Validate skill manifest
-        shell: bash
+      - name: Exercise real OS clipboard when available
+        if: runner.os == 'Windows' && matrix.python == '3.13'
+        shell: pwsh
+        env:
+          RUN_OS_CLIPBOARD_TESTS: '1'
+        run: python -m pytest -q tests/test_exporter.py -k real_os_clipboard_when_runner_permits
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-output-${{ matrix.os }}-py${{ matrix.python }}
+          path: .ci-output/
+          if-no-files-found: ignore
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --upgrade build twine
+      - run: python tools/sync_cli.py --check
+      - run: bash -n bash/install.sh bash/codex-thread-export.sh
+      - run: python -m build
+      - name: Verify distribution archive hygiene
         run: |
           python - <<'PY'
-          import re, sys, pathlib
-          p = pathlib.Path("skills/codex-thread-export/SKILL.md").read_text(encoding="utf-8")
-          assert p.startswith("---\n"), "SKILL.md must start with YAML frontmatter"
-          fm = p.split("---", 2)[1]
-          for k in ("name", "description"):
-              assert re.search(rf"(?m)^{k}:\s*\S", fm), f"frontmatter missing required field: {k}"
-          print("SKILL.md frontmatter OK")
-          PY
+          from pathlib import Path
+          import tarfile
+          import zipfile
 
-      - name: Validate openai.yaml
-        shell: bash
-        run: |
-          python - <<'PY'
-          import sys, pathlib, re
-          y = pathlib.Path("skills/codex-thread-export/agents/openai.yaml").read_text(encoding="utf-8")
-          for k in ("display_name", "short_description", "default_prompt"):
-              assert re.search(rf"(?m)^\s+{k}:\s*\S", y), f"openai.yaml missing field: {k}"
-          print("openai.yaml schema OK")
+          bad = []
+          for artifact in sorted(Path("dist").iterdir()):
+              if artifact.suffix == ".whl":
+                  with zipfile.ZipFile(artifact) as archive:
+                      names = archive.namelist()
+              elif artifact.name.endswith(".tar.gz"):
+                  with tarfile.open(artifact, "r:gz") as archive:
+                      names = archive.getnames()
+              else:
+                  continue
+
+              for name in names:
+                  normalized = name.replace("\\", "/")
+                  if "/__pycache__/" in f"/{normalized}/" or normalized.endswith((".pyc", ".pyo")):
+                      bad.append(f"{artifact.name}: {name}")
+
+          if bad:
+              raise SystemExit("Generated bytecode found in distributions:\n" + "\n".join(bad))
+          print("Distribution archives contain no generated bytecode.")
           PY
+      - run: python -m twine check dist/*
+      - run: python -m pip install --force-reinstall dist/*.whl
+      - run: codex-export --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*

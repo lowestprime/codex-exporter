@@ -5,16 +5,21 @@ import argparse
 import base64
 import ctypes
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 try:
     from zoneinfo import ZoneInfo
@@ -22,17 +27,335 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_OUT_DIR = Path(os.environ.get("CODEX_THREAD_EXPORT_DIR") or (SCRIPT_DIR / "codex-thread-exports"))
+FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
 LOCAL_TZ_ENV = "CODEX_EXPORT_TZ"
+DEFAULT_TOKEN_ENCODING = os.environ.get("CODEX_EXPORT_TOKEN_ENCODING", "cl100k_base")
+DEFAULT_FILENAME_TEMPLATE = "codex_{title}_{mode}_{stamp}{session_short_part}{counts}.md"
+DEFAULT_STABLE_FILENAME_TEMPLATE = "codex_{title}_{mode}{session_short_part}{counts}.md"
+SOURCE_TRUNCATION_RE = re.compile(r"…(?P<count>[0-9,]+)\s+tokens truncated…", re.IGNORECASE)
 
+_TOKEN_ENCODER: Any = None
+_TOKEN_INFO: dict[str, Any] = {
+    "method": "regex_estimate",
+    "encoding": "none",
+    "library": "builtin",
+    "version": "",
+    "exact_for_encoding": False,
+    "error": "not configured",
+}
+_SOURCE_TRUNCATION_POLICY = "annotate"
+_RUNTIME_AUDIT: dict[str, Any] = {}
+_LARGE_TEXT_METRIC_CACHE: dict[int, tuple[str, int, int]] = {}
+
+
+def reset_runtime_audit() -> None:
+    global _RUNTIME_AUDIT, _LARGE_TEXT_METRIC_CACHE
+    _LARGE_TEXT_METRIC_CACHE = {}
+    _RUNTIME_AUDIT = {
+        "cleaned": Counter(),
+        "summarized": Counter(),
+        "redacted": Counter(),
+        "source_truncation_markers": 0,
+        "source_truncation_tokens_reported": 0,
+    }
+
+
+def audit_increment(bucket: str, key: str, amount: int = 1) -> None:
+    target = _RUNTIME_AUDIT.setdefault(bucket, Counter())
+    if isinstance(target, Counter):
+        target[key] += amount
+
+
+reset_runtime_audit()
+
+
+def configure_utf8_standard_streams() -> None:
+    """Use deterministic UTF-8 for CLI output, including Windows pipes."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+def config_path() -> Path:
+    override = os.environ.get("CODEX_EXPORT_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / "codex-exporter" / "config.json"
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        raise RuntimeError(f"Invalid exporter config {path}: {exc}") from exc
+
+
+def save_config(config: dict[str, Any]) -> None:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def configured_out_dir(config: dict[str, Any] | None = None) -> Path:
+    config = config if config is not None else load_config()
+    value = os.environ.get("CODEX_THREAD_EXPORT_DIR") or config.get("last_out_dir")
+    return Path(value).expanduser() if value else FALLBACK_OUT_DIR
+
+
+def choose_directory(initial: Path) -> Path | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("Native folder selection requires the standard-library tkinter module.") from exc
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        selected = filedialog.askdirectory(
+            parent=root,
+            title="Choose Codex export folder",
+            initialdir=str(initial if initial.exists() else Path.home()),
+            mustexist=False,
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
+
+
+def choose_save_file(initial_dir: Path, initial_name: str) -> Path | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("Native Save As selection requires the standard-library tkinter module.") from exc
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        selected = filedialog.asksaveasfilename(
+            parent=root,
+            title="Save Codex export as",
+            initialdir=str(initial_dir if initial_dir.exists() else Path.home()),
+            initialfile=initial_name,
+            defaultextension=".md",
+            filetypes=(("Markdown", "*.md"), ("All files", "*.*")),
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None
+
+
+def open_in_file_manager(path: Path, *, select: bool = False) -> None:
+    target = path.resolve()
+    if sys.platform == "win32":
+        args = ["explorer.exe"]
+        if select and target.is_file():
+            args.append(f"/select,{target}")
+        else:
+            args.append(str(target if target.is_dir() else target.parent))
+        subprocess.Popen(args)
+    elif sys.platform == "darwin":
+        args = ["open"]
+        if select and target.is_file():
+            args.append("-R")
+        args.append(str(target))
+        subprocess.Popen(args)
+    else:
+        subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
+
+
+def configure_token_counter(*, encoding: str, mode: str = "auto", require: bool = False) -> dict[str, Any]:
+    global _TOKEN_ENCODER, _TOKEN_INFO
+    _TOKEN_ENCODER = None
+    if mode == "regex":
+        _TOKEN_INFO = {
+            "method": "regex_estimate",
+            "encoding": "none",
+            "library": "builtin",
+            "version": "",
+            "exact_for_encoding": False,
+            "special_token_policy": "ordinary_text",
+            "error": "forced by --tokenizer regex",
+        }
+        return dict(_TOKEN_INFO)
+    try:
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding(encoding)
+        _TOKEN_ENCODER = enc
+        try:
+            version = importlib_metadata.version("tiktoken")
+        except Exception:
+            version = "unknown"
+        _TOKEN_INFO = {
+            "method": "tiktoken",
+            "encoding": enc.name,
+            "library": "tiktoken",
+            "version": version,
+            "exact_for_encoding": True,
+            "special_token_policy": "ordinary_text; disallowed_special=()",
+            "error": "",
+        }
+    except Exception as exc:
+        _TOKEN_INFO = {
+            "method": "regex_estimate",
+            "encoding": "none",
+            "requested_encoding": encoding,
+            "library": "builtin",
+            "version": "",
+            "exact_for_encoding": False,
+            "special_token_policy": "ordinary_text",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if require or mode == "tiktoken":
+            raise RuntimeError(
+                f"tiktoken encoding {encoding!r} is required but unavailable in {sys.executable}: {exc}"
+            ) from exc
+    return dict(_TOKEN_INFO)
+
+
+def token_counter_info() -> dict[str, Any]:
+    return dict(_TOKEN_INFO)
+
+
+def token_field_label() -> str:
+    info = token_counter_info()
+    return f"tokens ({info['encoding']})" if info.get("exact_for_encoding") else "estimated tokens (regex)"
+
+
+def escape_invalid_json_string_backslashes(line: str) -> tuple[str, int]:
+    """Escape only invalid backslashes occurring inside JSON strings.
+
+    This repairs a known Codex rollout corruption class where command output embeds
+    a Windows path such as ``X:\\project`` with a single JSON backslash. It does
+    not guess missing braces, concatenate records, or otherwise alter valid JSON.
+    """
+    out: list[str] = []
+    in_string = False
+    repairs = 0
+    i = 0
+    simple = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+    while i < len(line):
+        ch = line[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == '"':
+            out.append(ch)
+            in_string = False
+            i += 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(line):
+            out.append("\\\\")
+            repairs += 1
+            i += 1
+            continue
+        nxt = line[i + 1]
+        if nxt in simple:
+            out.extend((ch, nxt))
+            i += 2
+            continue
+        if nxt == "u" and i + 5 < len(line) and re.fullmatch(r"[0-9A-Fa-f]{4}", line[i + 2 : i + 6]):
+            out.extend(line[i : i + 6])
+            i += 6
+            continue
+        out.append("\\\\")
+        repairs += 1
+        i += 1
+    return "".join(out), repairs
+
+
+def parse_jsonl_line(line: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    try:
+        value = json.loads(line)
+        return (value if isinstance(value, dict) else None), {"status": "exact", "repairs": 0}
+    except json.JSONDecodeError as first:
+        repaired, repairs = escape_invalid_json_string_backslashes(line)
+        if repairs:
+            try:
+                value = json.loads(repaired)
+                if isinstance(value, dict):
+                    return value, {"status": "repaired_invalid_escape", "repairs": repairs, "original_error": str(first)}
+            except json.JSONDecodeError as second:
+                return None, {"status": "error", "repairs": repairs, "error": str(second), "original_error": str(first)}
+        try:
+            value = json.loads(line, strict=False)
+            if isinstance(value, dict):
+                return value, {"status": "repaired_control_character", "repairs": 1, "original_error": str(first)}
+        except Exception as second:
+            return None, {"status": "error", "repairs": 0, "error": str(second), "original_error": str(first)}
+    except Exception as exc:
+        return None, {"status": "error", "repairs": 0, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def process_source_truncation_markers(text: str) -> str:
+    matches = list(SOURCE_TRUNCATION_RE.finditer(text))
+    if not matches:
+        return text
+    _RUNTIME_AUDIT["source_truncation_markers"] = int(_RUNTIME_AUDIT.get("source_truncation_markers", 0)) + len(matches)
+    total = sum(int(m.group("count").replace(",", "")) for m in matches)
+    _RUNTIME_AUDIT["source_truncation_tokens_reported"] = int(_RUNTIME_AUDIT.get("source_truncation_tokens_reported", 0)) + total
+    if _SOURCE_TRUNCATION_POLICY == "error":
+        raise RuntimeError(f"Source JSONL contains {len(matches)} Codex runtime truncation marker(s), reporting {total:,} omitted tokens.")
+    if _SOURCE_TRUNCATION_POLICY == "preserve":
+        return text
+    def repl(match: re.Match[str]) -> str:
+        count = match.group("count")
+        return f"[SOURCE TOOL OUTPUT TRUNCATED BY CODEX BEFORE EXPORT: {count} tokens omitted; not recoverable from this rollout record]"
+    return SOURCE_TRUNCATION_RE.sub(repl, text)
+
+
+# Build credential signatures from fragments so repository scanners do not
+# mistake the detector definitions themselves for live credentials.
+_OPENAI_KEY_PREFIX = "s" + "k-"
+_GITHUB_PAT_PREFIX = "github" + "_pat_"
+_GITHUB_CLASSIC_PREFIX = "g" + "h"
 
 SECRET_PATTERNS = [
-    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "[REDACTED_OPENAI_KEY]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GITHUB_PAT]"),
-    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(re.escape(_OPENAI_KEY_PREFIX) + r"[A-Za-z0-9_\-]{20,}"), "[REDACTED_OPENAI_KEY]"),
+    (re.compile(re.escape(_GITHUB_PAT_PREFIX) + r"[A-Za-z0-9_]{20,}"), "[REDACTED_GITHUB_PAT]"),
+    (re.compile(re.escape(_GITHUB_CLASSIC_PREFIX) + r"[pousr]_[A-Za-z0-9_]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{20,}"), r"\1[REDACTED_TOKEN]"),
     (re.compile(r"(?i)(password|passwd|token|secret|api[_-]?key)(\s*[:=]\s*)([^\s'\";]+)"), r"\1\2[REDACTED]"),
     (re.compile(r"(?i)(cloudflare[_-]?tunnel[_-]?token)(\s*[:=]\s*)([^\s'\";]+)"), r"\1\2[REDACTED]"),
@@ -110,23 +433,31 @@ def cp437_cp1252_mojibake_repair(text: str) -> str:
     if not any(ch in text for ch in "ÆæôöâäÖÜ"):
         return text
     out: list[str] = []
+    repaired = 0
     for ch in text:
         code = ord(ch)
         if 0x80 <= code <= 0xFF:
             try:
-                out.append(bytes([code]).decode("cp1252"))
+                decoded = bytes([code]).decode("cp1252")
+                out.append(decoded)
+                if decoded != ch:
+                    repaired += 1
                 continue
             except UnicodeDecodeError:
                 pass
         out.append(ch)
+    if repaired:
+        audit_increment("cleaned", "mojibake_codepoint_repair", repaired)
     return "".join(out)
 
 
 def redact(text: str, enabled: bool) -> str:
     if not enabled:
         return text
-    for pattern, replacement in SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
+    for index, (pattern, replacement) in enumerate(SECRET_PATTERNS, 1):
+        text, count = pattern.subn(replacement, text)
+        if count:
+            audit_increment("redacted", f"pattern_{index}", count)
     return text
 
 
@@ -155,10 +486,14 @@ def strip_hogs(
     # Remove OSC/title-control sequences before stripping ESC/BEL. Otherwise
     # Windows/Next terminal title updates can leave visible residues such as
     # ``0;npm0;npm run dev`` in exported output.
-    text = OSC_PATTERN.sub("", text)
-    text = ANSI_PATTERN.sub("", text)
-    text = CONTROL_PATTERN.sub("", text)
-    text = re.sub(r"(?m)^0;[^\n]*(?:\n|$)", "", text)
+    text, count = OSC_PATTERN.subn("", text)
+    if count: audit_increment("cleaned", "osc_sequence", count)
+    text, count = ANSI_PATTERN.subn("", text)
+    if count: audit_increment("cleaned", "ansi_sequence", count)
+    text, count = CONTROL_PATTERN.subn("", text)
+    if count: audit_increment("cleaned", "control_character", count)
+    text, count = re.subn(r"(?m)^0;[^\n]*(?:\n|$)", "", text)
+    if count: audit_increment("cleaned", "terminal_title_residue", count)
 
     def repl_markdown_img(match: re.Match[str]) -> str:
         alt = match.group("alt") or "image"
@@ -179,11 +514,16 @@ def strip_hogs(
             return match.group(0)
         return summarize_blob("base64 blob", blob)
 
-    text = MARKDOWN_DATA_IMAGE_PATTERN.sub(repl_markdown_img, text)
-    text = HTML_DATA_SRC_PATTERN.sub(repl_html_src, text)
-    text = DATA_URI_PATTERN.sub(repl_data_uri, text)
-    text = BASE64_BLOB_PATTERN.sub(repl_base64, text)
-    text = HEX_BLOB_PATTERN.sub(lambda m: summarize_blob("hex blob", m.group(0)), text)
+    text, count = MARKDOWN_DATA_IMAGE_PATTERN.subn(repl_markdown_img, text)
+    if count: audit_increment("cleaned", "markdown_data_image", count)
+    text, count = HTML_DATA_SRC_PATTERN.subn(repl_html_src, text)
+    if count: audit_increment("cleaned", "html_data_src", count)
+    text, count = DATA_URI_PATTERN.subn(repl_data_uri, text)
+    if count: audit_increment("cleaned", "data_uri", count)
+    text, count = BASE64_BLOB_PATTERN.subn(repl_base64, text)
+    if count: audit_increment("cleaned", "base64_candidate", count)
+    text, count = HEX_BLOB_PATTERN.subn(lambda m: summarize_blob("hex blob", m.group(0)), text)
+    if count: audit_increment("cleaned", "hex_blob", count)
 
     lines = text.splitlines()
     compacted: list[str] = []
@@ -192,6 +532,7 @@ def strip_hogs(
 
     for line in lines:
         if len(line) > max_line_chars:
+            audit_increment("cleaned", "overlong_line", 1)
             digest = hashlib.sha256(line.encode("utf-8", errors="ignore")).hexdigest()[:16]
             head = line[:1200].rstrip()
             tail = line[-1200:].lstrip()
@@ -200,6 +541,7 @@ def strip_hogs(
         if line == prev:
             repeat_count += 1
             if repeat_count == max_repeated_lines + 1:
+                audit_increment("cleaned", "repeated_line_run", 1)
                 compacted.append(f"[repeated identical line omitted after {max_repeated_lines:,} repeats]")
             elif repeat_count > max_repeated_lines:
                 continue
@@ -393,6 +735,7 @@ def extract_text_parts(
                     json_aware=True,
                 )
         text = strip_hogs(value, enabled=strip, max_line_chars=max_line_chars, max_repeated_lines=max_repeated_lines)
+        text = process_source_truncation_markers(text)
         return [text] if text else []
 
     if isinstance(value, (int, float, bool)):
@@ -466,6 +809,7 @@ def extract_text_parts(
         return [p for p in parts if p]
 
     text = strip_hogs(str(value), enabled=strip, max_line_chars=max_line_chars, max_repeated_lines=max_repeated_lines)
+    text = process_source_truncation_markers(text)
     return [text] if text else []
 
 
@@ -611,9 +955,11 @@ def strip_codex_tool_metadata(text: str) -> tuple[str, dict[str, Any]]:
         kept.append(line)
 
     if output_idx is not None:
+        audit_increment("cleaned", "tool_transport_header_block", 1)
         return "\n".join(lines[output_idx:]).strip(), meta
 
     if saw_transport_header:
+        audit_increment("cleaned", "tool_transport_header_block", 1)
         # Fall back to dropping only recognized transport lines from the top.
         rest: list[str] = []
         for line in lines:
@@ -683,17 +1029,22 @@ def extract_output_and_meta(
 
 def summarize_tool_output(text: str, mode: str, max_chars: int) -> str:
     clean = text.strip()
-    if not clean or mode == "none":
+    if not clean:
+        return ""
+    if mode == "none":
+        audit_increment("summarized", "tool_output_omitted", 1)
         return ""
     if mode == "full":
         return clean
     if mode == "summary":
+        audit_increment("summarized", "tool_output_summary", 1)
         first = clean.splitlines()[0][:300]
         return f"[tool output omitted: {len(clean):,} characters; first line: {first!r}]"
     if mode == "tail":
         if len(clean) <= max_chars:
             return clean
-        return f"[tool output truncated to final {max_chars:,} characters from {len(clean):,} total]\n\n{clean[-max_chars:]}"
+        audit_increment("summarized", "tool_output_tail_truncated", 1)
+        return f"[EXPORTER TOOL OUTPUT TRUNCATED: kept final {max_chars:,} of {len(clean):,} characters]\n\n{clean[-max_chars:]}"
     raise ValueError(f"Unknown tool output mode: {mode}")
 
 
@@ -728,6 +1079,7 @@ def first_line(text: str, limit: int = 220) -> str:
     line = re.sub(r"\s+", " ", text.strip().splitlines()[0] if text.strip() else "")
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
+
 def first_command_line(command: str, limit: int = 220) -> str:
     lines = [ln.strip() for ln in command.strip().splitlines() if ln.strip()]
     if len(lines) > 1 and re.fullmatch(r"\$?ErrorActionPreference\s*=\s*['\"]Stop['\"]", lines[0], flags=re.IGNORECASE):
@@ -736,7 +1088,6 @@ def first_command_line(command: str, limit: int = 220) -> str:
         line = lines[0] if lines else ""
     line = re.sub(r"\s+", " ", line)
     return line if len(line) <= limit else line[: limit - 1] + "…"
-
 
 
 def parse_apply_patch(command: str) -> list[dict[str, Any]]:
@@ -958,11 +1309,98 @@ def event_type_blob(obj: dict[str, Any]) -> tuple[str, dict[str, Any], str, dict
     return top_type, payload, payload_type, item, item_type
 
 
+def event_key(obj: dict[str, Any]) -> str:
+    top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
+    return "/".join(part or "-" for part in (top_type, payload_type, item_type))
+
+
+def extract_reasoning_summary(payload: dict[str, Any]) -> str:
+    """Return only Codex's explicit summary surface, never encrypted/raw reasoning."""
+    summary = payload.get("summary")
+    if not summary:
+        return ""
+    return extract_text(
+        summary,
+        strip=True,
+        max_line_chars=20_000,
+        max_repeated_lines=25,
+        json_aware=True,
+    ).strip()
+
+
+def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool) -> str:
+    top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
+    ptype = payload_type or item_type
+    if ptype == "token_count":
+        return "telemetry_token_count"
+    if ptype == "agent_reasoning":
+        return "raw_reasoning_not_exported"
+    if ptype == "reasoning":
+        return "reasoning_summary_empty" if include_reasoning_summaries else "reasoning_summary_opt_in_disabled"
+    if top_type in {"turn_context", "session_meta", "world_state"}:
+        return "metadata_only"
+    if top_type == "compacted" or ptype in {"context_compacted", "thread_rolled_back"}:
+        return "context_history_event"
+    if ptype in {"task_started", "task_complete", "turn_aborted", "thread_goal_updated", "thread_settings_applied"}:
+        return "lifecycle_event"
+    if ptype in {"web_search_call", "web_search_end", "tool_search_call", "tool_search_output", "mcp_tool_call_end", "view_image_tool_call"}:
+        return "unsupported_tool_lifecycle_or_specialized_event"
+    if top_type == "response_item" and ptype in {"message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}:
+        return "known_response_item_not_rendered_or_duplicate"
+    if top_type == "event_msg" and ptype == "error":
+        return "runtime_error_event"
+    return "unrecognized_schema"
+
+
+def records_from_replacement_history(
+    history: list[Any],
+    *,
+    timestamp: str,
+    include_actions: bool,
+    include_reasoning_summaries: bool,
+    tool_outputs: str,
+    max_tool_chars: int,
+    strip: bool,
+    max_line_chars: int,
+    max_repeated_lines: int,
+) -> list[Record]:
+    reconstructed: list[Record] = []
+    for offset, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        pseudo = {"timestamp": timestamp, "type": "response_item", "payload": {"type": "item", "item": item}}
+        rec = classify_record(
+            pseudo,
+            seq=-(offset + 1),
+            include_actions=include_actions,
+            include_reasoning_summaries=include_reasoning_summaries,
+            tool_outputs=tool_outputs,
+            max_tool_chars=max_tool_chars,
+            strip=strip,
+            max_line_chars=max_line_chars,
+            max_repeated_lines=max_repeated_lines,
+        )
+        if rec and rec.text.strip():
+            reconstructed.append(rec)
+    return post_process_records(reconstructed)
+
+
+def apply_rollback_to_records(records: list[Record], num_turns: int) -> list[Record]:
+    if num_turns <= 0:
+        return records
+    user_positions = [i for i, rec in enumerate(records) if rec.kind == "message" and rec.role == "user"]
+    if not user_positions:
+        return []
+    cut = user_positions[-num_turns] if num_turns <= len(user_positions) else 0
+    return records[:cut]
+
+
 def classify_record(
     obj: dict[str, Any],
     *,
     seq: int,
     include_actions: bool,
+    include_reasoning_summaries: bool = False,
     tool_outputs: str,
     max_tool_chars: int,
     strip: bool,
@@ -972,6 +1410,19 @@ def classify_record(
     timestamp = get_timestamp(obj)
     top_type, payload, payload_type, item, item_type = event_type_blob(obj)
     type_blob = " ".join([top_type, payload_type, item_type]).lower()
+
+    reasoning_payload = item if item_type == "reasoning" else payload
+    if include_reasoning_summaries and (item_type == "reasoning" or payload_type == "reasoning"):
+        summary = extract_reasoning_summary(reasoning_payload)
+        if summary:
+            return Record(
+                "note",
+                "assistant",
+                "Reasoning summary (explicit Codex summary; opt-in)\n\n" + summary,
+                timestamp,
+                "reasoning_summary",
+                seq,
+            )
 
     if any(h in type_blob for h in NOISY_TYPE_HINTS):
         return None
@@ -1190,7 +1641,6 @@ def post_process_records(records: list[Record]) -> list[Record]:
     return processed
 
 
-
 def walk_json_values(value: Any, *, depth: int = 0) -> list[Any]:
     """Small bounded JSON walker used only for metadata discovery."""
     if depth > 10:
@@ -1215,68 +1665,72 @@ def add_unique_meta(meta: dict[str, Any], key: str, value: str) -> None:
 
 
 def update_session_metadata_from_event(meta: dict[str, Any], obj: dict[str, Any]) -> None:
-    """Best-effort extraction of models/date/title-like metadata from raw JSONL events.
-
-    Codex JSONL schemas have changed across app/CLI builds. This intentionally avoids
-    assuming a single schema and instead records stable, low-risk metadata fields
-    when they appear anywhere in an event.
-    """
-    for candidate in walk_json_values(obj):
-        if not isinstance(candidate, dict):
-            continue
-
+    """Extract only structural session/turn metadata, never arbitrary tool payloads."""
+    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    candidates: list[dict[str, Any]] = [obj, payload]
+    for key in ("session", "metadata", "settings", "model_info", "collaboration_mode"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
         for k, v in candidate.items():
             key = str(k).lower()
             if v is None:
                 continue
-
-            if key in {"model", "model_id", "model_slug", "selected_model", "active_model"}:
-                if isinstance(v, str):
-                    add_unique_meta(meta, "_models_seen", v)
-
-            if key in {"effort", "reasoning_effort", "reasoning"}:
-                if isinstance(v, str):
-                    add_unique_meta(meta, "_reasoning_efforts_seen", v)
-                elif isinstance(v, dict):
-                    effort = v.get("effort") or v.get("level")
-                    if isinstance(effort, str):
-                        add_unique_meta(meta, "_reasoning_efforts_seen", effort)
-
-            if key in {"title", "thread_title", "name"} and isinstance(v, str) and v.strip():
-                meta.setdefault("_candidate_titles", [])
-                if v not in meta["_candidate_titles"]:
-                    meta["_candidate_titles"].append(v)
-
-            if key in {"created_at", "createdat", "create_time", "created"} and isinstance(v, str):
+            if key in {"model", "model_id", "model_slug", "selected_model", "active_model"} and isinstance(v, str):
+                cleaned = v.strip()
+                if cleaned and len(cleaned) <= 100 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]*", cleaned):
+                    add_unique_meta(meta, "_models_seen", cleaned)
+            elif key in {"effort", "reasoning_effort"} and isinstance(v, str):
+                add_unique_meta(meta, "_reasoning_efforts_seen", v)
+            elif key in {"title", "thread_title"} and isinstance(v, str) and v.strip():
+                add_unique_meta(meta, "_candidate_titles", v)
+            elif key in {"created_at", "createdat", "create_time", "created"} and isinstance(v, str):
                 add_unique_meta(meta, "_created_candidates", v)
-
-            if key in {"updated_at", "updatedat", "modified_at", "last_updated", "timestamp", "time"} and isinstance(v, str):
+            elif key in {"updated_at", "updatedat", "modified_at", "last_updated", "timestamp", "time"} and isinstance(v, str):
                 add_unique_meta(meta, "_updated_candidates", v)
+            elif key in {"cwd", "working_directory", "workspace"} and isinstance(v, str) and v.strip():
+                meta.setdefault("cwd", v.strip())
+
+
+def _large_text_metrics(text: str) -> tuple[int, int] | None:
+    if len(text) < 1_000_000:
+        return None
+    cached = _LARGE_TEXT_METRIC_CACHE.get(id(text))
+    if cached is not None and cached[0] is text:
+        return cached[1], cached[2]
+    tokens = len(_TOKEN_ENCODER.encode(text, disallowed_special=())) if _TOKEN_ENCODER is not None else len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+    lines = text.count("\n") + (0 if text.endswith(("\n", "\r")) else 1)
+    if len(_LARGE_TEXT_METRIC_CACHE) >= 4:
+        _LARGE_TEXT_METRIC_CACHE.clear()
+    _LARGE_TEXT_METRIC_CACHE[id(text)] = (text, tokens, lines)
+    return tokens, lines
 
 
 def approx_token_count(text: str) -> int:
-    """Dependency-free approximate token count for filenames/metadata.
+    """Count tokens with the configured counter.
 
-    If tiktoken is installed, use cl100k_base; otherwise use a conservative regex
-    estimate. The value is intentionally labelled approximate.
+    With tiktoken this is exact for the explicitly named encoding, not a claim
+    about a model's complete chat/tool framing. The dependency-free fallback is
+    deliberately and explicitly labelled a regex estimate.
     """
     if not text:
         return 0
-    try:  # optional; keep this tool dependency-free by default
-        import tiktoken  # type: ignore
-
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except Exception:
-        # Split words, numbers, punctuation, and non-space symbols. This tracks
-        # token count better than chars/4 for command-heavy technical transcripts.
-        return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+    metrics = _large_text_metrics(text)
+    if metrics is not None:
+        return metrics[0]
+    if _TOKEN_ENCODER is not None:
+        return len(_TOKEN_ENCODER.encode(text, disallowed_special=()))
+    return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
 
 
 def count_lines(text: str) -> int:
     if not text:
         return 0
-    return len(text.splitlines())
+    metrics = _large_text_metrics(text)
+    if metrics is not None:
+        return metrics[1]
+    return text.count("\n") + (0 if text.endswith(("\n", "\r")) else 1)
 
 
 def yaml_quote(value: Any) -> str:
@@ -1321,23 +1775,35 @@ def count_file_cards(records: list[Record], label: str) -> int:
 
 
 def collect_models(records: list[Record], meta: dict[str, Any]) -> list[str]:
+    del records
     models: list[str] = []
     for value in meta.get("_models_seen", []) or []:
-        if isinstance(value, str) and value.strip() and value not in models:
-            models.append(value.strip())
-
-    # Very cautious fallback: only harvest model-looking names from short lines
-    # that explicitly mention model/using/running, not arbitrary app content.
-    model_re = re.compile(r"\b(?:gpt-\d(?:[.\w-]*codex)?|gpt-\d[.\w-]*|codex-mini-latest|claude(?:\s+opus|\s+sonnet)?[ \w.-]*|gemini[ \w.-]*)\b", re.I)
-    for rec in records:
-        for line in rec.text.splitlines()[:8]:
-            if not re.search(r"\b(model|using|running|reasoning effort)\b", line, re.I):
-                continue
-            for match in model_re.findall(line):
-                cleaned = re.sub(r"\s+", " ", match).strip(" .,:;`")
-                if cleaned and cleaned not in models:
-                    models.append(cleaned)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned and cleaned not in models:
+                models.append(cleaned)
     return models
+
+
+def selected_source_truncation_summary(records: list[Record]) -> tuple[int, int]:
+    """Count source-loss sentinels that survive into the selected record set."""
+    count = 0
+    tokens = 0
+    annotated = re.compile(
+        r"\[SOURCE TOOL OUTPUT TRUNCATED BY CODEX BEFORE EXPORT:\s*"
+        r"(?P<count>[0-9][0-9,]*)\s+tokens omitted;[^\]]*\]",
+        re.IGNORECASE,
+    )
+    for record in records:
+        text = record.text or ""
+        annotated_matches = list(annotated.finditer(text))
+        count += len(annotated_matches)
+        tokens += sum(int(match.group("count").replace(",", "")) for match in annotated_matches)
+        # Under --source-truncation preserve, the original ellipsis marker remains.
+        preserved_matches = list(SOURCE_TRUNCATION_RE.finditer(annotated.sub("", text)))
+        count += len(preserved_matches)
+        tokens += sum(int(match.group("count").replace(",", "")) for match in preserved_matches)
+    return count, tokens
 
 
 def export_summary(records: list[Record], meta: dict[str, Any]) -> dict[str, Any]:
@@ -1347,6 +1813,7 @@ def export_summary(records: list[Record], meta: dict[str, Any]) -> dict[str, Any
     user_messages = [r for r in records if r.kind == "message" and r.role == "user"]
     action_records = [r for r in records if r.kind == "action"]
     note_records = [r for r in records if r.kind == "note"]
+    selected_truncation_count, selected_truncation_tokens = selected_source_truncation_summary(records)
     return {
         "created_at": created,
         "updated_at": updated,
@@ -1362,6 +1829,18 @@ def export_summary(records: list[Record], meta: dict[str, Any]) -> dict[str, Any
         "record_count": len(records),
         "source_event_count": meta.get("_source_event_count", 0),
         "parse_error_count": meta.get("_parse_error_count", 0),
+        "repaired_json_line_count": meta.get("_repaired_json_line_count", 0),
+        "reconstruction_mode": meta.get("_reconstruction_mode", "chronological_source_history"),
+        "compactions_applied": meta.get("_compactions_applied", 0),
+        "rollbacks_applied": meta.get("_rollbacks_applied", 0),
+        "unknown_event_count": sum((meta.get("_unknown_event_types") or {}).values()),
+        "ignored_event_count": sum((meta.get("_ignored_event_types") or {}).values()),
+        "source_truncation_markers": int(meta.get("_raw_source_truncation_marker_count", 0)),
+        "source_truncation_tokens_reported": int(meta.get("_raw_source_truncation_tokens_reported", 0)),
+        "extracted_source_truncation_markers": int(_RUNTIME_AUDIT.get("source_truncation_markers", 0)),
+        "extracted_source_truncation_tokens_reported": int(_RUNTIME_AUDIT.get("source_truncation_tokens_reported", 0)),
+        "rendered_source_truncation_markers": selected_truncation_count,
+        "rendered_source_truncation_tokens_reported": selected_truncation_tokens,
     }
 
 
@@ -1387,8 +1866,9 @@ def render_thread_frontmatter(
     mode: str,
     summary: dict[str, Any],
     total_lines_placeholder: str = "__CODEX_EXPORT_TOTAL_LINES__",
-    total_tokens_placeholder: str = "__CODEX_EXPORT_APPROX_TOKENS__",
+    total_tokens_placeholder: str = "__CODEX_EXPORT_TOKEN_COUNT__",
 ) -> str:
+    token = token_counter_info()
     lines: list[str] = [
         "---",
         f"title: {yaml_quote(title)}",
@@ -1399,6 +1879,7 @@ def render_thread_frontmatter(
         f"thread_created_at: {yaml_quote(summary.get('created_at', ''))}",
         f"thread_updated_at: {yaml_quote(summary.get('updated_at', ''))}",
         f"mode: {yaml_quote(mode)}",
+        f"history_semantics: {yaml_quote(summary.get('reconstruction_mode', 'chronological_source_history'))}",
         "models_used:",
         *yaml_list(summary.get("models", [])),
         f"prompt_count: {summary.get('prompt_count', 0)}",
@@ -1410,9 +1891,25 @@ def render_thread_frontmatter(
         f"deleted_file_cards: {summary.get('deleted_file_cards', 0)}",
         f"source_event_count: {summary.get('source_event_count', 0)}",
         f"parse_error_count: {summary.get('parse_error_count', 0)}",
+        f"repaired_json_line_count: {summary.get('repaired_json_line_count', 0)}",
+        f"ignored_event_count: {summary.get('ignored_event_count', 0)}",
+        f"unknown_event_count: {summary.get('unknown_event_count', 0)}",
+        f"compactions_applied: {summary.get('compactions_applied', 0)}",
+        f"rollbacks_applied: {summary.get('rollbacks_applied', 0)}",
+        f"source_truncation_marker_count: {summary.get('source_truncation_markers', 0)}",
+        f"source_truncation_tokens_reported: {summary.get('source_truncation_tokens_reported', 0)}",
+        f"extracted_source_truncation_marker_count: {summary.get('extracted_source_truncation_markers', 0)}",
+        f"extracted_source_truncation_tokens_reported: {summary.get('extracted_source_truncation_tokens_reported', 0)}",
+        f"rendered_source_truncation_marker_count: {summary.get('rendered_source_truncation_markers', 0)}",
+        f"rendered_source_truncation_tokens_reported: {summary.get('rendered_source_truncation_tokens_reported', 0)}",
         f"total_lines: {total_lines_placeholder}",
-        f"approx_tokens: {total_tokens_placeholder}",
-        "token_count_method: " + yaml_quote("approximate; tiktoken cl100k_base if installed, otherwise dependency-free regex estimate"),
+        f"token_count: {total_tokens_placeholder}",
+        f"token_count_method: {yaml_quote(token.get('method', 'unknown'))}",
+        f"token_encoding: {yaml_quote(token.get('encoding', 'none'))}",
+        f"tokenizer_library: {yaml_quote(token.get('library', 'builtin'))}",
+        f"tokenizer_version: {yaml_quote(token.get('version', ''))}",
+        f"token_count_exact_for_encoding: {str(bool(token.get('exact_for_encoding'))).lower()}",
+        f"token_special_text_policy: {yaml_quote(token.get('special_token_policy', 'ordinary_text'))}",
         "---",
         "",
     ]
@@ -1439,10 +1936,17 @@ def render_export_map(records: list[Record], meta: dict[str, Any], title: str) -
         markdown_table_row(["Created file cards", summary.get("created_file_cards", 0)]),
         markdown_table_row(["Deleted file cards", summary.get("deleted_file_cards", 0)]),
         markdown_table_row(["Models detected", ", ".join(summary.get("models", [])) or "unknown"]),
+        markdown_table_row(["History semantics", summary.get("reconstruction_mode", "chronological_source_history")]),
+        markdown_table_row(["JSON lines repaired", summary.get("repaired_json_line_count", 0)]),
+        markdown_table_row(["Unrecovered parse errors", summary.get("parse_error_count", 0)]),
+        markdown_table_row(["Ignored source events", summary.get("ignored_event_count", 0)]),
+        markdown_table_row(["Unknown source events", summary.get("unknown_event_count", 0)]),
+        markdown_table_row(["Raw source truncation markers", summary.get("source_truncation_markers", 0)]),
+        markdown_table_row(["Rendered source truncation markers", summary.get("rendered_source_truncation_markers", 0)]),
         "",
         "### Prompt/response index",
         "",
-        "| # | Prompt timestamp | Response updated | Prompt lines | Prompt tokens | Response records | Response lines | Response tokens | Actions | Edited | Created | Preview |",
+        f"| # | Prompt timestamp | Response updated | Prompt lines | Prompt {token_field_label()} | Response records | Response lines | Response {token_field_label()} | Actions | Edited | Created | Preview |",
         "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
 
@@ -1520,6 +2024,10 @@ def render_thread_export(
 
     parts.extend(["## Transcript", ""])
     blocks = split_prompt_response_blocks(records)
+    first_user = next((i for i, rec in enumerate(records) if rec.kind == "message" and rec.role == "user"), len(records))
+    preamble = [rec for rec in records[:first_user] if rec.text.strip()]
+    if preamble:
+        parts.extend(["### Reconstruction / preamble records", "", render_record_stream(preamble), ""])
 
     for block in blocks:
         idx = int(block["index"])
@@ -1544,7 +2052,7 @@ def render_thread_export(
                 markdown_table_row(["Role", prompt.role]),
                 markdown_table_row(["Timestamp", prompt.timestamp]),
                 markdown_table_row(["Lines", prompt_lines]),
-                markdown_table_row(["Approx tokens", prompt_tokens]),
+                markdown_table_row([token_field_label().capitalize(), prompt_tokens]),
                 "",
             ]
         )
@@ -1569,7 +2077,7 @@ def render_thread_export(
                 markdown_table_row(["Edited file cards", count_file_cards(response, "Edited file")]),
                 markdown_table_row(["Created file cards", count_file_cards(response, "Created file")]),
                 markdown_table_row(["Lines", response_lines]),
-                markdown_table_row(["Approx tokens", response_tokens]),
+                markdown_table_row([token_field_label().capitalize(), response_tokens]),
                 "",
             ]
         )
@@ -1590,25 +2098,213 @@ def render_thread_export(
 
 
 def finalize_count_placeholders(text: str) -> str:
-    # Two-pass replacement stabilizes counts after placeholder width changes.
-    for _ in range(3):
-        lines = count_lines(text)
-        tokens = approx_token_count(text)
-        new = text.replace("__CODEX_EXPORT_TOTAL_LINES__", str(lines)).replace("__CODEX_EXPORT_APPROX_TOKENS__", str(tokens))
-        if new == text:
-            return text
-        text = new
-    return text
+    """Resolve line/token placeholders against the final rendered document.
+
+    The original implementation replaced placeholders once and then counted a
+    different string, which could make frontmatter and filename token totals
+    disagree. Keeping the untouched template permits a true fixed-point update.
+    """
+    template = text
+    lines = 0
+    tokens = 0
+    candidate = template
+    for _ in range(12):
+        candidate = (
+            template.replace("__CODEX_EXPORT_TOTAL_LINES__", str(lines))
+            .replace("__CODEX_EXPORT_TOKEN_COUNT__", str(tokens))
+            .replace("__CODEX_EXPORT_APPROX_TOKENS__", str(tokens))
+        )
+        measured_lines = count_lines(candidate)
+        measured_tokens = approx_token_count(candidate)
+        if measured_lines == lines and measured_tokens == tokens:
+            return candidate
+        lines, tokens = measured_lines, measured_tokens
+    return (
+        template.replace("__CODEX_EXPORT_TOTAL_LINES__", str(lines))
+        .replace("__CODEX_EXPORT_TOKEN_COUNT__", str(tokens))
+        .replace("__CODEX_EXPORT_APPROX_TOKENS__", str(tokens))
+    )
 
 
 def filename_count_suffix(text: str) -> str:
-    return f"_{count_lines(text)}lines_{approx_token_count(text)}tokens"
+    info = token_counter_info()
+    tokens = approx_token_count(text)
+    if info.get("exact_for_encoding"):
+        enc = safe_slug(str(info.get("encoding") or "encoding"), max_len=30)
+        return f"_{count_lines(text)}lines_{tokens}{enc}_tokens"
+    return f"_{count_lines(text)}lines_approx{tokens}tokens"
+
+
+def mode_descriptor(args: argparse.Namespace) -> str:
+    mode = str(args.mode)
+    if mode in {"response", "turn"} and getattr(args, "response", None):
+        mode = f"{mode}-{int(args.response):04d}"
+    elif mode == "message" and getattr(args, "message", None):
+        mode = f"message-{int(args.message):04d}"
+    elif mode == "range":
+        mode = f"range-{int(args.from_message or 1):04d}-{int(args.to_message or 0):04d}"
+    if getattr(args, "last_n_turns", None):
+        mode += f"-last-{int(args.last_n_turns)}-turns"
+    if getattr(args, "live_context", False):
+        mode += "-reconstructed-live-context"
+    return mode
+
+
+def render_filename(
+    template: str,
+    *,
+    title: str,
+    mode: str,
+    session_id: str,
+    text: str,
+    include_session_short_id: bool,
+) -> str:
+    info = token_counter_info()
+    short = session_id.replace("-", "")[-8:] if session_id else ""
+    values = {
+        "title": safe_slug(title),
+        "mode": safe_slug(mode),
+        "stamp": export_stamp(),
+        "session_id": safe_slug(session_id, max_len=80),
+        "session_short": short,
+        "session_short_part": f"_{short}" if include_session_short_id and short else "",
+        "lines": count_lines(text),
+        "tokens": approx_token_count(text),
+        "token_method": safe_slug(str(info.get("method") or "unknown"), max_len=30),
+        "token_encoding": safe_slug(str(info.get("encoding") or "none"), max_len=30),
+        "counts": filename_count_suffix(text),
+    }
+    try:
+        name = template.format_map(values)
+    except KeyError as exc:
+        raise RuntimeError(f"Unknown filename-template placeholder: {exc.args[0]}") from exc
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name).strip(" .")
+    if not name.lower().endswith(".md"):
+        name += ".md"
+    if len(name) > 240:
+        stem, suffix = Path(name).stem, Path(name).suffix
+        name = stem[: 240 - len(suffix)] + suffix
+    return name
+
+
+def resolve_collision(path: Path, policy: str) -> Path | None:
+    if not path.exists() or policy == "overwrite":
+        return path
+    if policy == "skip":
+        return None
+    if policy == "error":
+        raise FileExistsError(f"Output already exists: {path}")
+    if policy != "rename":
+        raise ValueError(f"Unknown collision policy: {policy}")
+    for index in range(2, 100_000):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find a collision-free name for {path}")
+
+
+def counter_to_dict(value: Any) -> dict[str, int]:
+    if isinstance(value, Counter):
+        return dict(sorted(value.items()))
+    if isinstance(value, dict):
+        return {str(k): int(v) for k, v in sorted(value.items())}
+    return {}
+
+
+def build_manifest(
+    *,
+    source: Path,
+    output: Path | None,
+    session_id: str,
+    title: str,
+    mode: str,
+    records: list[Record],
+    meta: dict[str, Any],
+    text: str,
+    redacted: bool,
+) -> dict[str, Any]:
+    summary = export_summary(records, meta)
+    return {
+        "schema_version": 1,
+        "exporter_version": __version__,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source": {
+            "path": str(source),
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "session_id": session_id,
+            "event_count": meta.get("_source_event_count", 0),
+        },
+        "output": {
+            "path": str(output) if output else None,
+            "title": title,
+            "mode": mode,
+            "lines": count_lines(text),
+            "token_count": approx_token_count(text),
+            "token_counter": token_counter_info(),
+            "redacted": redacted,
+        },
+        "history": {
+            "semantics": meta.get("_reconstruction_mode", "chronological_source_history"),
+            "compactions_applied": meta.get("_compactions_applied", 0),
+            "rollbacks_applied": meta.get("_rollbacks_applied", 0),
+        },
+        "records": {
+            "rendered": len(records),
+            "recognized_event_types": counter_to_dict(meta.get("_recognized_event_types")),
+            "ignored_event_types": counter_to_dict(meta.get("_ignored_event_types")),
+            "ignored_event_reasons": counter_to_dict(meta.get("_ignored_event_reasons")),
+            "unknown_event_types": counter_to_dict(meta.get("_unknown_event_types")),
+            "cleaned": counter_to_dict(_RUNTIME_AUDIT.get("cleaned")),
+            "summarized": counter_to_dict(_RUNTIME_AUDIT.get("summarized")),
+            "redacted": counter_to_dict(_RUNTIME_AUDIT.get("redacted")),
+        },
+        "integrity": {
+            "parse_error_count": len(meta.get("_parse_errors", [])),
+            "parse_errors": meta.get("_parse_errors", []),
+            "repaired_json_line_count": len(meta.get("_repaired_json_lines", [])),
+            "repaired_json_lines": meta.get("_repaired_json_lines", []),
+            "raw_source_truncation_marker_count": int(meta.get("_raw_source_truncation_marker_count", 0)),
+            "raw_source_truncation_tokens_reported": int(meta.get("_raw_source_truncation_tokens_reported", 0)),
+            "extracted_source_truncation_marker_count": int(_RUNTIME_AUDIT.get("source_truncation_markers", 0)),
+            "extracted_source_truncation_tokens_reported": int(_RUNTIME_AUDIT.get("source_truncation_tokens_reported", 0)),
+            "rendered_source_truncation_marker_count": summary.get("rendered_source_truncation_markers", 0),
+            "rendered_source_truncation_tokens_reported": summary.get("rendered_source_truncation_tokens_reported", 0),
+        },
+        "content_summary": summary,
+    }
+
+
+def write_manifest(manifest: dict[str, Any], output_path: Path | None, explicit_path: Path | None = None) -> Path | None:
+    if explicit_path:
+        path = explicit_path
+    elif output_path:
+        path = output_path.with_suffix(".manifest.json")
+    else:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    return path
+
+
+def report_event_audit(meta: dict[str, Any]) -> None:
+    print("\nEvent audit:", file=sys.stderr)
+    for label, key in (
+        ("recognized", "_recognized_event_types"),
+        ("ignored", "_ignored_event_types"),
+        ("unknown", "_unknown_event_types"),
+    ):
+        values = counter_to_dict(meta.get(key))
+        print(f"  {label}: {sum(values.values())}", file=sys.stderr)
+        for name, count in values.items():
+            print(f"    {count:>8}  {name}", file=sys.stderr)
 
 
 def parse_session(
     path: Path,
     *,
     include_actions: bool,
+    include_reasoning_summaries: bool = False,
+    reconstruct_live_context: bool = False,
     tool_outputs: str,
     max_tool_chars: int,
     strip: bool,
@@ -1616,7 +2312,19 @@ def parse_session(
     max_repeated_lines: int,
 ) -> tuple[list[Record], dict[str, Any]]:
     records: list[Record] = []
-    meta: dict[str, Any] = {}
+    meta: dict[str, Any] = {
+        "_recognized_event_types": Counter(),
+        "_ignored_event_types": Counter(),
+        "_ignored_event_reasons": Counter(),
+        "_unknown_event_types": Counter(),
+        "_repaired_json_lines": [],
+        "_parse_errors": [],
+        "_compactions_applied": 0,
+        "_rollbacks_applied": 0,
+        "_reconstruction_mode": "reconstructed_live_context" if reconstruct_live_context else "chronological_source_history",
+        "_raw_source_truncation_marker_count": 0,
+        "_raw_source_truncation_tokens_reported": 0,
+    }
     last_key: tuple[str, str, str] | None = None
 
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -1624,21 +2332,91 @@ def parse_session(
             if not line.strip():
                 continue
             meta["_source_event_count"] = int(meta.get("_source_event_count", 0)) + 1
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                meta["_parse_error_count"] = int(meta.get("_parse_error_count", 0)) + 1
+            raw_truncation_matches = list(SOURCE_TRUNCATION_RE.finditer(line))
+            if raw_truncation_matches:
+                meta["_raw_source_truncation_marker_count"] += len(raw_truncation_matches)
+                meta["_raw_source_truncation_tokens_reported"] += sum(int(match.group("count").replace(",", "")) for match in raw_truncation_matches)
+            obj, status = parse_jsonl_line(line)
+            if obj is None:
+                meta["_parse_errors"].append({
+                    "line": seq,
+                    "error": status.get("error") or status.get("original_error") or "unknown parse error",
+                    "sha256": hashlib.sha256(line.encode("utf-8", errors="replace")).hexdigest(),
+                    "preview": line[:240].rstrip(),
+                })
                 continue
+            if status.get("status") != "exact":
+                meta["_repaired_json_lines"].append({
+                    "line": seq,
+                    "repair": status.get("status"),
+                    "repair_count": status.get("repairs", 0),
+                    "original_error": status.get("original_error", ""),
+                })
 
             update_session_metadata_from_event(meta, obj)
-            payload = obj.get("payload")
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            top_type = str(obj.get("type") or "")
+            payload_type = str(payload.get("type") or "")
+            key_name = event_key(obj)
+
             if obj.get("type") == "session_meta" and isinstance(payload, dict):
-                meta.update(payload)
+                # Retain stable session metadata but do not let arbitrary nested values
+                # overwrite exporter-internal audit keys.
+                for k, value in payload.items():
+                    if not str(k).startswith("_"):
+                        meta[k] = value
+
+            if reconstruct_live_context and top_type == "compacted":
+                history = payload.get("replacement_history")
+                if isinstance(history, list) and history:
+                    records = records_from_replacement_history(
+                        history,
+                        timestamp=get_timestamp(obj),
+                        include_actions=include_actions,
+                        include_reasoning_summaries=include_reasoning_summaries,
+                        tool_outputs=tool_outputs,
+                        max_tool_chars=max_tool_chars,
+                        strip=strip,
+                        max_line_chars=max_line_chars,
+                        max_repeated_lines=max_repeated_lines,
+                    )
+                    records.insert(0, Record(
+                        "note",
+                        "system",
+                        "[RECONSTRUCTED LIVE CONTEXT: derived from Codex replacement_history; not an exact byte-for-byte model prompt]",
+                        get_timestamp(obj),
+                        "reconstruction_marker",
+                        seq,
+                    ))
+                    meta["_compactions_applied"] = int(meta.get("_compactions_applied", 0)) + 1
+                    meta["_recognized_event_types"][key_name] += 1
+                    last_key = None
+                    continue
+
+            if reconstruct_live_context and payload_type == "thread_rolled_back":
+                try:
+                    num_turns = int(payload.get("num_turns") or 0)
+                except Exception:
+                    num_turns = 0
+                records = apply_rollback_to_records(records, num_turns)
+                records.append(Record(
+                    "note",
+                    "system",
+                    f"[RECONSTRUCTED ROLLBACK: removed {num_turns} turn(s) according to thread_rolled_back; reconstruction is approximate]",
+                    get_timestamp(obj),
+                    "rollback_marker",
+                    seq,
+                ))
+                meta["_rollbacks_applied"] = int(meta.get("_rollbacks_applied", 0)) + 1
+                meta["_recognized_event_types"][key_name] += 1
+                last_key = None
+                continue
 
             rec = classify_record(
                 obj,
                 seq=seq,
                 include_actions=include_actions,
+                include_reasoning_summaries=include_reasoning_summaries,
                 tool_outputs=tool_outputs,
                 max_tool_chars=max_tool_chars,
                 strip=strip,
@@ -1646,95 +2424,175 @@ def parse_session(
                 max_repeated_lines=max_repeated_lines,
             )
             if not rec or not rec.text.strip():
+                reason = known_ignored_reason(obj, include_reasoning_summaries)
+                meta["_ignored_event_types"][key_name] += 1
+                meta["_ignored_event_reasons"][reason] += 1
+                if reason == "unrecognized_schema":
+                    meta["_unknown_event_types"][key_name] += 1
                 continue
 
+            meta["_recognized_event_types"][key_name] += 1
             key = (rec.kind, rec.role, rec.text)
             if key == last_key:
+                audit_increment("cleaned", "adjacent_duplicate_record", 1)
                 continue
             last_key = key
             records.append(rec)
 
+    meta["_parse_error_count"] = len(meta["_parse_errors"])
+    meta["_repaired_json_line_count"] = len(meta["_repaired_json_lines"])
     return post_process_records(records), meta
 
 
 def read_session_index_title(session_id: str) -> str:
+    return read_all_session_index_titles().get(session_id.lower(), "")
+
+
+def read_jsonl_set_thread_title(session_id: str) -> str:
+    """Read the title argument from the most recent set_thread_title tool call in the JSONL."""
+    from pathlib import Path
     home = codex_home()
-    candidates = [home / "session_index.jsonl", home / "sessions" / "session_index.jsonl"]
-    for index_path in candidates:
-        if not index_path.exists():
-            continue
-        try:
-            for line in index_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                if session_id not in line:
-                    continue
-                obj = json.loads(line)
-                for key in ("title", "name", "thread_title", "summary"):
-                    val = obj.get(key)
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
-        except Exception:
-            continue
+    sessions_dir = home / "sessions"
+    # find the JSONL for this session_id
+    for p in sessions_dir.rglob(f"*{session_id}*.jsonl"):
+        if p.suffix == ".jsonl" and not p.name.endswith(".bak"):
+            last_title = ""
+            try:
+                with p.open("r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if "set_thread_title" not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            # walk for {"name":"set_thread_title", ...} or {"function":"set_thread_title", ...}
+                            for candidate in walk_json_values(obj):
+                                if not isinstance(candidate, dict):
+                                    continue
+                                fn = candidate.get("name") or candidate.get("function") or ""
+                                if str(fn).lower() == "set_thread_title":
+                                    args = candidate.get("arguments") or candidate.get("input") or candidate.get("parameters") or {}
+                                    if isinstance(args, str):
+                                        args = json.loads(args)
+                                    t = args.get("title") or args.get("name") or ""
+                                    if isinstance(t, str) and t.strip():
+                                        last_title = t.strip()
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            if last_title:
+                return last_title
     return ""
 
 
-def read_sqlite_title(session_id: str) -> str:
+@lru_cache(maxsize=1)
+def read_all_sqlite_titles() -> dict[str, str]:
+    """Load app-owned session titles once per process from known Codex state DBs."""
     home = codex_home()
-    for db in (home / "state_5.sqlite", home / "state.sqlite"):
+    titles: dict[str, str] = {}
+    for db in (home / "state_5.sqlite", home / "state.sqlite", home / "codex.db"):
         if not db.exists():
             continue
         con = None
         try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            cur = con.cursor()
-            tables = [r[0] for r in cur.execute("select name from sqlite_master where type='table'").fetchall()]
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+            con.execute("pragma query_only=on")
+            tables = [str(row[0]) for row in con.execute("select name from sqlite_master where type='table'")]
+            tables.sort(key=lambda name: (name.lower() not in {"threads", "sessions"}, name.lower()))
             for table in tables:
-                cols = [r[1] for r in cur.execute(f'pragma table_info("{table}")').fetchall()]
-                title_cols = [c for c in cols if c.lower() in {"title", "name", "summary", "thread_title"}]
-                id_cols = [c for c in cols if c.lower() in {"id", "thread_id", "session_id", "uuid"}]
-                if not title_cols or not id_cols:
-                    continue
-                for id_col in id_cols:
-                    for title_col in title_cols:
+                columns = [str(row[1]) for row in con.execute(f'pragma table_info("{table}")')]
+                id_columns = [c for c in columns if c.lower() in {"id", "thread_id", "session_id", "uuid"}]
+                title_columns = [c for c in columns if c.lower() in {"title", "thread_title", "thread_name", "name"}]
+                for id_column in id_columns:
+                    for title_column in title_columns:
                         try:
-                            row = cur.execute(
-                                f'select "{title_col}" from "{table}" where "{id_col}" = ? limit 1',
-                                (session_id,),
-                            ).fetchone()
-                            if row and isinstance(row[0], str) and row[0].strip():
-                                return row[0].strip()
-                        except Exception:
-                            pass
-        except Exception:
+                            query = f'select "{id_column}", "{title_column}" from "{table}" where "{title_column}" is not null'
+                            for raw_id, raw_title in con.execute(query):
+                                if not isinstance(raw_id, str) or not isinstance(raw_title, str):
+                                    continue
+                                sid = raw_id.strip()
+                                title = raw_title.strip()
+                                if SESSION_ID_RE.fullmatch(sid) and title and len(title) <= 300:
+                                    titles.setdefault(sid.lower(), title)
+                        except sqlite3.Error:
+                            continue
+        except sqlite3.Error:
             continue
         finally:
             if con is not None:
-                try:
-                    con.close()
-                except Exception:
-                    pass
-    return ""
+                con.close()
+    return titles
+
+
+def read_sqlite_title(session_id: str) -> str:
+    return read_all_sqlite_titles().get(session_id.lower(), "")
+
+
+@lru_cache(maxsize=1)
+def read_all_session_index_titles() -> dict[str, str]:
+    titles: dict[str, str] = {}
+    home = codex_home()
+    for index_path in (home / "session_index.jsonl", home / "sessions" / "session_index.jsonl"):
+        if not index_path.exists():
+            continue
+        try:
+            with index_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    obj, _status = parse_jsonl_line(line)
+                    if not isinstance(obj, dict):
+                        continue
+                    sid = obj.get("id") or obj.get("session_id") or obj.get("thread_id")
+                    if not isinstance(sid, str) or not SESSION_ID_RE.fullmatch(sid.strip()):
+                        continue
+                    for key in ("title", "thread_title", "thread_name", "name"):
+                        value = obj.get(key)
+                        if isinstance(value, str) and value.strip():
+                            titles[sid.strip().lower()] = value.strip()
+                            break
+        except OSError:
+            continue
+    return titles
+
+def normalize_title(value: str) -> str:
+    value = re.sub(r"^\s*#{1,6}\s+", "", value.strip())
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:200]
 
 
 def discover_title(records: list[Record], meta: dict[str, Any], override: str | None, session_id: str | None) -> str:
-    if override:
-        return override.strip()
+    if override and override.strip():
+        return normalize_title(override)
 
-    for key in ("title", "thread_title", "name", "summary"):
-        value = meta.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
+    # Canonical, mutable app-owned title stores take precedence over prompt-derived
+    # guesses. This prevents a long first prompt from replacing a manually renamed
+    # Codex thread title.
     if session_id:
-        for fn in (read_session_index_title, read_sqlite_title):
+        for fn in (read_sqlite_title, read_session_index_title, read_jsonl_set_thread_title):
             title = fn(session_id)
             if title:
-                return title
+                return normalize_title(title)
+
+    for key in ("title", "thread_title", "thread_name", "name"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return normalize_title(value)
 
     for rec in records:
         if rec.kind == "message" and rec.role == "user" and rec.text.strip():
-            return rec.text.strip().splitlines()[0][:80]
+            return normalize_title(rec.text.strip().splitlines()[0])[:80]
 
-    return str(meta.get("id") or session_id or "codex_thread")
+    return normalize_title(str(meta.get("id") or session_id or "codex_thread"))
+
+
+def select_last_n_turns(records: list[Record], count: int | None) -> list[Record]:
+    if count is None:
+        return records
+    if count < 1:
+        raise RuntimeError("--last-n-turns must be >= 1")
+    blocks = split_prompt_response_blocks(records)
+    if not blocks or count >= len(blocks):
+        return records
+    return records[blocks[-count]["start"] :]
 
 
 def response_block_records(records: list[Record], response_index: int, *, include_prompt: bool) -> list[Record]:
@@ -1812,37 +2670,19 @@ def choose_records(records: list[Record], args: argparse.Namespace) -> list[Reco
         return actions
 
     raise RuntimeError(f"Unknown mode: {args.mode}")
-def print_session_list() -> None:
-    """List all local Codex session JSONLs as a Markdown table.
 
-    Resolves titles cheaply via ``session_index.jsonl`` and the local sqlite
-    state if available; otherwise leaves the title column blank. Sorted newest
-    first by file mtime so the user can quickly grab the most recent session.
-    """
-    files = all_session_files()
-    if not files:
+
+def print_session_list() -> None:
+    rows = list_session_descriptors()
+    if not rows:
         print(f"_No Codex session JSONLs found under {codex_home()}._")
         return
-
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-
-    print("| # | session_id | size | modified | title |")
-    print("|---:|---|---:|---|---|")
-    for i, p in enumerate(files, 1):
-        sid = parse_session_id_from_name(p)
-        try:
-            size = p.stat().st_size
-            mtime = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
-        except OSError:
-            size = 0
-            mtime = ""
-        title = ""
-        if sid:
-            title = read_session_index_title(sid) or read_sqlite_title(sid)
-            title = title.replace("|", "\\|")
-        if not sid:
-            sid = p.name
-        print(f"| {i} | {sid} | {size:,} | {mtime} | {title} |")
+    print("| # | session_id | size | modified | project | archived | title |")
+    print("|---:|---|---:|---|---|---|---|")
+    for index, row in enumerate(rows, 1):
+        title = str(row["title"]).replace("|", "\\|")
+        project = str(row["project"]).replace("|", "\\|")
+        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title} |")
 
 
 def print_message_list(records: list[Record]) -> None:
@@ -1860,7 +2700,7 @@ def print_message_list(records: list[Record]) -> None:
 
 def print_response_list(records: list[Record]) -> None:
     blocks = split_prompt_response_blocks(records)
-    print("| response | user message # | records | assistant chars | response lines | response tokens | action records | edited | created | first assistant preview |")
+    print(f"| response | user message # | records | assistant chars | response lines | {token_field_label()} | action records | edited | created | first assistant preview |")
     print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for block in blocks:
         idx = block["index"]
@@ -1900,6 +2740,8 @@ def render_export(records: list[Record], title: str, source: Path, mode: str, pl
                 f"- Source JSONL: `{source}`",
                 f"- Source SHA256: `{sha}`",
                 f"- Mode: `{mode}`",
+                f"- Token count method: `{token_counter_info().get('method')}`",
+                f"- Token encoding: `{token_counter_info().get('encoding')}`",
                 f"- Exported: `{datetime.now().isoformat(timespec='seconds')}`",
                 "",
             ]
@@ -2032,6 +2874,7 @@ def verify_windows_clipboard_unicode(expected: str) -> None:
             f"Clipboard verification failed: expected {len(expected):,} chars, got {len(actual):,} chars"
         )
 
+
 def copy_to_clipboard(text: str) -> None:
     if os.name == "nt":
         set_windows_clipboard_unicode(text)
@@ -2047,189 +2890,498 @@ def copy_to_clipboard(text: str) -> None:
         raise RuntimeError("No supported clipboard command found.")
 
 
+
+def human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{size}B"
+
+
+def session_head_metadata(path: Path, max_events: int = 80) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_events:
+                    break
+                obj, _ = parse_jsonl_line(line)
+                if not isinstance(obj, dict):
+                    continue
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                for candidate in (obj, payload):
+                    for key in ("cwd", "working_directory", "workspace", "project", "source", "originator"):
+                        value = candidate.get(key)
+                        if isinstance(value, str) and value.strip() and key not in out:
+                            out[key] = value.strip()
+                    for key in ("title", "thread_title", "thread_name", "name"):
+                        value = candidate.get(key)
+                        if isinstance(value, str) and value.strip() and "title" not in out:
+                            out["title"] = value.strip()
+    except OSError:
+        pass
+    return out
+
+
+def session_descriptor(path: Path, title_map: dict[str, str] | None = None) -> dict[str, Any]:
+    sid = parse_session_id_from_name(path)
+    stat = path.stat()
+    head = session_head_metadata(path)
+    title = ""
+    if sid:
+        title = (
+            (title_map or {}).get(sid.lower(), "")
+            or read_sqlite_title(sid)
+            or read_session_index_title(sid)
+            or str(head.get("title") or "")
+        )
+    cwd = str(head.get("cwd") or head.get("working_directory") or head.get("workspace") or "")
+    project = Path(cwd).name if cwd else ""
+    return {
+        "path": path,
+        "session_id": sid or path.stem,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        "title": title,
+        "cwd": cwd,
+        "project": project,
+        "archived": "archived_sessions" in path.parts,
+    }
+
+
+def list_session_descriptors() -> list[dict[str, Any]]:
+    title_map = read_all_session_index_titles()
+    title_map.update(read_all_sqlite_titles())
+    descriptors = []
+    for path in all_session_files():
+        try:
+            descriptors.append(session_descriptor(path, title_map))
+        except OSError:
+            continue
+    return sorted(descriptors, key=lambda row: row["mtime"], reverse=True)
+
+
+def _browser_selection(raw: str, upper: int) -> list[int]:
+    selected: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            first, last = part.split("-", 1)
+            selected.update(range(int(first), int(last) + 1))
+        else:
+            selected.add(int(part))
+    invalid = sorted(value for value in selected if value < 1 or value > upper)
+    if invalid:
+        raise RuntimeError(f"Invalid browser row(s): {invalid}")
+    return sorted(selected)
+
+
+def _clear_browser_screen() -> None:
+    if sys.stdout.isatty():
+        print("\033[2J\033[H", end="")
+
+
+def browse_sessions() -> list[str]:
+    """Portable optional TUI; the noninteractive CLI remains the core architecture."""
+    all_rows = list_session_descriptors()
+    if not all_rows:
+        raise RuntimeError(f"No Codex session JSONLs found under {codex_home()}")
+
+    page_size = 20
+    page = 0
+    query = ""
+    view = "sessions"  # sessions | projects | project
+    active_project = ""
+
+    while True:
+        filtered = [
+            row for row in all_rows
+            if (not query or query in " ".join((row["project"], row["title"], row["session_id"], row["cwd"])).lower())
+            and (view != "project" or row["project"] == active_project)
+        ]
+        _clear_browser_screen()
+        print("Codex session browser — noninteractive commands remain available for automation")
+        print(f"View: {view}" + (f" / {active_project}" if active_project else "") + (f" | Filter: {query}" if query else ""))
+
+        if view == "projects":
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in filtered:
+                grouped.setdefault(row["project"] or "(unknown project)", []).append(row)
+            project_rows = sorted(grouped.items(), key=lambda item: max(r["mtime"] for r in item[1]), reverse=True)
+            pages = max(1, (len(project_rows) + page_size - 1) // page_size)
+            page = min(page, pages - 1)
+            visible_projects = project_rows[page * page_size : (page + 1) * page_size]
+            print(f"Page {page + 1}/{pages}")
+            print()
+            print("| # | project | sessions | most recent |")
+            print("|---:|---|---:|---|")
+            for index, (project, rows) in enumerate(visible_projects, 1):
+                modified = datetime.fromtimestamp(max(row["mtime"] for row in rows)).isoformat(timespec="seconds")
+                escaped_project = project.replace("|", "\\|")
+                print(f"| {index} | {escaped_project} | {len(rows)} | {modified} |")
+            visible_sessions: list[dict[str, Any]] = []
+        else:
+            pages = max(1, (len(filtered) + page_size - 1) // page_size)
+            page = min(page, pages - 1)
+            visible_sessions = filtered[page * page_size : (page + 1) * page_size]
+            print(f"Page {page + 1}/{pages} — {len(filtered)} matching sessions")
+            print()
+            print("| # | session_id | modified | size | project | A | title |")
+            print("|---:|---|---|---:|---|---|---|")
+            for index, row in enumerate(visible_sessions, 1):
+                title = str(row["title"]).replace("|", "\\|")
+                project = str(row["project"]).replace("|", "\\|")
+                print(f"| {index} | {row['session_id']} | {row['modified']} | {human_size(row['size'])} | {project} | {'Y' if row['archived'] else ''} | {title} |")
+            visible_projects = []
+
+        print()
+        print("Commands: number/range select · a page-all · n/p page · m projects/sessions · / search · s ID · b back · q quit")
+        raw = input("> ").strip()
+        if not sys.stdin.isatty():
+            print()
+        lowered = raw.lower()
+        if lowered in {"q", "quit", "exit"}:
+            return []
+        if lowered == "n":
+            page = min(page + 1, pages - 1)
+            continue
+        if lowered == "p":
+            page = max(page - 1, 0)
+            continue
+        if lowered == "m":
+            view = "projects" if view != "projects" else "sessions"
+            active_project = ""
+            page = 0
+            continue
+        if lowered == "b":
+            view = "projects"
+            active_project = ""
+            page = 0
+            continue
+        if raw.startswith("/"):
+            query = raw[1:].strip().lower()
+            page = 0
+            continue
+        if lowered == "s":
+            needle = input("Session ID, rollout filename, or ID prefix: ").strip().lower()
+            if not sys.stdin.isatty():
+                print()
+            matches = [row for row in all_rows if needle in row["session_id"].lower() or needle in row["path"].name.lower()]
+            if len(matches) == 1:
+                return [matches[0]["session_id"]]
+            query = needle
+            view = "sessions"
+            page = 0
+            continue
+        if lowered == "a":
+            return [row["session_id"] for row in visible_sessions]
+        try:
+            if view == "projects":
+                choices = _browser_selection(raw, len(visible_projects))
+                if len(choices) != 1:
+                    raise RuntimeError("Select one project row at a time.")
+                active_project = visible_projects[choices[0] - 1][0]
+                view = "project"
+                page = 0
+                continue
+            choices = _browser_selection(raw, len(visible_sessions))
+            if choices:
+                return [visible_sessions[index - 1]["session_id"] for index in choices]
+        except (ValueError, RuntimeError) as exc:
+            input(f"{exc} Press Enter to continue.")
+
+
+def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[tuple[Path, str]]:
+    pairs: list[tuple[Path, str]] = []
+    if args.browse:
+        for sid in browse_sessions():
+            pairs.append((find_session_file(sid), sid))
+    for sid in args.session_id or []:
+        pairs.append((find_session_file(sid), sid))
+    for path in args.jsonl or []:
+        path = path.expanduser().resolve()
+        if not path.is_file():
+            parser.error(f"JSONL not found: {path}")
+        pairs.append((path, parse_session_id_from_name(path)))
+    if args.sessions_file:
+        for raw in args.sessions_file.read_text(encoding="utf-8").splitlines():
+            value = raw.strip()
+            if not value or value.startswith("#"):
+                continue
+            candidate = Path(value).expanduser()
+            if candidate.is_file():
+                pairs.append((candidate.resolve(), parse_session_id_from_name(candidate)))
+            else:
+                pairs.append((find_session_file(value), value))
+    if args.latest_session:
+        path = latest_session_file()
+        pairs.append((path, parse_session_id_from_name(path)))
+    dedup: dict[str, tuple[Path, str]] = {}
+    for path, sid in pairs:
+        dedup[str(path.resolve()).casefold()] = (path, sid)
+    result = list(dedup.values())
+    if not result:
+        parser.error("provide --session-id, --jsonl, --sessions-file, --latest-session, or --browse")
+    return result
+
+
 def main() -> int:
+    configure_utf8_standard_streams()
     ap = argparse.ArgumentParser(
         prog="codex-export",
-        description=(
-            "Export local Codex app/CLI session JSONL transcripts to clean, "
-            "GUI-fidelity Markdown with frontmatter, thread maps, per-turn "
-            "metadata, edited-file patch cards, verified Unicode clipboard, "
-            "and base64/blob stripping."
-        ),
+        description="Export local Codex session JSONL to fidelity-oriented Markdown, individually or in deterministic batches.",
     )
     ap.add_argument("--version", action="version", version=f"codex-export {__version__}")
-    source = ap.add_mutually_exclusive_group()
-    source.add_argument("--session-id", help="Codex session/thread UUID (run /status in the Codex app to copy it)")
-    source.add_argument("--jsonl", type=Path, help="Direct path to a rollout/session JSONL file")
-    source.add_argument(
-        "--latest-session",
-        action="store_true",
-        help="Use the most recently modified local session JSONL (no session-id needed)",
-    )
+    ap.add_argument("--session-id", action="append", help="Session UUID; repeat for batch export")
+    ap.add_argument("--jsonl", action="append", type=Path, help="Direct JSONL path; repeat for batch export")
+    ap.add_argument("--sessions-file", type=Path, help="Text file containing one session UUID or JSONL path per line")
+    ap.add_argument("--latest-session", action="store_true")
+    ap.add_argument("--list-sessions", action="store_true")
+    ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
 
-    ap.add_argument(
-        "--list-sessions",
-        action="store_true",
-        help="List all local Codex session JSONLs (id, size, mtime, title) and exit",
-    )
+    config_group = ap.add_argument_group("persistent configuration")
+    config_group.add_argument("--show-config", action="store_true")
+    config_group.add_argument("--print-out-dir", action="store_true")
+    config_group.add_argument("--set-default-out-dir", type=Path)
+    config_group.add_argument("--choose-default-out-dir", action="store_true")
+    config_group.add_argument("--set-filename-template")
+    config_group.add_argument("--print-filename-template", action="store_true")
+    config_group.add_argument("--reset-filename-template", action="store_true")
+    config_group.add_argument("--reset-config", action="store_true")
 
-    ap.add_argument(
-        "--mode",
-        choices=["thread", "response", "turn", "last-response", "last-assistant", "last-substantial", "message", "range", "chat", "chat-actions", "actions"],
-        default="last-response",
-    )
-    ap.add_argument("--message", type=int, help="1-based message index for --mode message")
-    ap.add_argument("--response", type=int, help="1-based prompt/response block index for --mode response or --mode turn")
-    ap.add_argument("--from-message", type=int, help="1-based start message index for --mode range")
-    ap.add_argument("--to-message", type=int, help="1-based end message index for --mode range")
-    ap.add_argument("--min-chars", type=int, default=1000, help="Minimum assistant chars for --mode last-substantial")
-    ap.add_argument("--list", action="store_true", help="List user/assistant messages and exit")
-    ap.add_argument("--list-responses", action="store_true", help="List prompt-to-response blocks and action counts")
+    ap.add_argument("--mode", choices=["thread", "response", "turn", "last-response", "last-assistant", "last-substantial", "message", "range", "chat", "chat-actions", "actions"], default="last-response")
+    ap.add_argument("--message", type=int)
+    ap.add_argument("--response", type=int)
+    ap.add_argument("--from-message", type=int)
+    ap.add_argument("--to-message", type=int)
+    ap.add_argument("--min-chars", type=int, default=1000)
+    ap.add_argument("--last-n-turns", type=int)
+    ap.add_argument("--live-context", action="store_true", help="Reconstruct active context from compaction and rollback events; explicitly approximate")
+    ap.add_argument("--reasoning-summaries", action="store_true", help="Include explicit recorded reasoning summaries; never raw internal reasoning")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--list-responses", action="store_true")
+    ap.add_argument("--report-events", action="store_true")
+    ap.add_argument("--strict-events", action="store_true", help="Fail if an unrecognized event schema is observed")
 
-    ap.add_argument("--name", help="Override thread name used in title and filename")
-    ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    ap.add_argument("--plain", action="store_true", help="Write only selected Markdown content, no metadata wrapper")
-    ap.add_argument("--ui-style", action="store_true", default=True, help="Render selected turn like Codex UI transcript text")
+    ap.add_argument("--name")
+    ap.add_argument("--out-dir", type=Path)
+    ap.add_argument("--choose-out-dir", action="store_true")
+    ap.add_argument("--remember-out-dir", dest="remember_out_dir", action="store_true", default=True)
+    ap.add_argument("--no-remember-out-dir", dest="remember_out_dir", action="store_false")
+    ap.add_argument("--save-as", action="store_true", help="Open native Save As dialog; single-session exports only")
+    ap.add_argument("--filename-template")
+    ap.add_argument("--save-filename-template", action="store_true")
+    ap.add_argument("--stable-filenames", action="store_true", help="Use a timestamp-free template and include a short session ID")
+    ap.add_argument("--include-session-short-id", action="store_true")
+    ap.add_argument("--collision", choices=["rename", "overwrite", "skip", "error"], default="rename")
+    ap.add_argument("--open-after", action="store_true")
+    ap.add_argument("--plain", action="store_true")
+    ap.add_argument("--ui-style", action="store_true", default=True)
     ap.add_argument("--no-ui-style", dest="ui_style", action="store_false")
-    ap.add_argument("--wrap-md", action="store_true", help="Wrap entire export in an outer markdown code fence")
-    ap.add_argument("--wrap-title", default="", help="Optional heading before the outer markdown fence, e.g. Last Response")
-    ap.add_argument("--no-file", action="store_true", help="Do not write file; useful with --clipboard or --stdout")
-    ap.add_argument("--no-filename-counts", action="store_true", help="Do not append total line/token counts to output filenames")
-    ap.add_argument("--no-frontmatter", action="store_true", help="Disable YAML frontmatter for --mode thread")
-    ap.add_argument("--no-map", action="store_true", help="Disable top thread export map for --mode thread")
-    ap.add_argument("--fence-turns", action="store_true", help="Fence each prompt/response body in --mode thread for maximum boundary safety")
+    ap.add_argument("--wrap-md", action="store_true")
+    ap.add_argument("--wrap-title", default="")
+    ap.add_argument("--no-file", action="store_true")
+    ap.add_argument("--no-filename-counts", action="store_true")
+    ap.add_argument("--no-frontmatter", action="store_true")
+    ap.add_argument("--no-map", action="store_true")
+    ap.add_argument("--fence-turns", action="store_true")
     ap.add_argument("--stdout", action="store_true")
     ap.add_argument("--clipboard", action="store_true")
+    ap.add_argument("--manifest", dest="manifest", action="store_true", default=True)
+    ap.add_argument("--no-manifest", dest="manifest", action="store_false")
+    ap.add_argument("--manifest-path", type=Path)
 
-    ap.add_argument("--redact", action="store_true", help="Apply secret-pattern redaction (OpenAI/GitHub tokens, bearer tokens, password=... lines)")
-    ap.add_argument("--fix-mojibake", action="store_true", help=argparse.SUPPRESS)  # back-compat no-op; repair is on by default
-    ap.add_argument("--keep-mojibake", action="store_true", help="Disable default repair of already-corrupted CP437/CP1252 mojibake such as IÆll -> I’ll")
-    ap.add_argument("--keep-hogs", action="store_true", help="Disable default stripping of base64/data-URI/hex/overlong-line hogs")
+    ap.add_argument("--tokenizer", choices=["auto", "tiktoken", "regex"], default="auto")
+    ap.add_argument("--token-encoding", default=DEFAULT_TOKEN_ENCODING)
+    ap.add_argument("--require-tiktoken", action="store_true")
+    ap.add_argument("--tokenizer-info", action="store_true")
+    ap.add_argument("--source-truncation", choices=["annotate", "preserve", "error"], default="annotate")
+    ap.add_argument("--redact", action="store_true")
+    ap.add_argument("--fix-mojibake", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--keep-mojibake", action="store_true")
+    ap.add_argument("--keep-hogs", action="store_true")
     ap.add_argument("--max-line-chars", type=int, default=20_000)
     ap.add_argument("--max-repeated-lines", type=int, default=25)
     ap.add_argument("--tool-outputs", choices=["none", "summary", "tail", "full"], default="full")
     ap.add_argument("--max-tool-chars", type=int, default=20_000)
-    ap.add_argument(
-        "--json",
-        dest="json_result",
-        action="store_true",
-        help="Print a single JSON line summarizing the export (file path, lines, tokens, models, source SHA) for skill/script chaining",
-    )
-
+    ap.add_argument("--json", dest="json_result", action="store_true")
     args = ap.parse_args()
 
+    cfg = load_config()
+    if args.reset_config:
+        config_path().unlink(missing_ok=True)
+        print(config_path())
+        return 0
+    if args.set_filename_template is not None:
+        cfg["filename_template"] = args.set_filename_template
+        save_config(cfg)
+        print(args.set_filename_template)
+        return 0
+    if args.reset_filename_template:
+        cfg.pop("filename_template", None)
+        save_config(cfg)
+        print(DEFAULT_FILENAME_TEMPLATE)
+        return 0
+    if args.print_filename_template:
+        print(str(cfg.get("filename_template") or DEFAULT_FILENAME_TEMPLATE))
+        return 0
+    if args.choose_default_out_dir:
+        selected = choose_directory(configured_out_dir(cfg))
+        if selected is None:
+            return 1
+        cfg["last_out_dir"] = str(selected.resolve())
+        save_config(cfg)
+        print(selected.resolve())
+        return 0
+    if args.set_default_out_dir:
+        chosen = args.set_default_out_dir.expanduser().resolve()
+        chosen.mkdir(parents=True, exist_ok=True)
+        cfg["last_out_dir"] = str(chosen)
+        save_config(cfg)
+        print(chosen)
+        return 0
+    if args.show_config:
+        print(json.dumps({"config_path": str(config_path()), **cfg}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.print_out_dir:
+        print(configured_out_dir(cfg).resolve())
+        return 0
     if args.list_sessions:
         print_session_list()
         return 0
 
-    if args.latest_session:
-        path = latest_session_file()
-    elif args.jsonl:
-        path = args.jsonl
-    elif args.session_id:
-        path = find_session_file(args.session_id)
-    else:
-        ap.error("one of --session-id, --jsonl, --latest-session, or --list-sessions is required")
-    include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
+    configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
+    if args.tokenizer_info:
+        print(json.dumps({"python": sys.executable, **token_counter_info()}, ensure_ascii=False, indent=2, sort_keys=True))
+        if not any((args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+            return 0
 
-    records, meta = parse_session(
-        path=path,
-        include_actions=include_actions,
-        tool_outputs=args.tool_outputs,
-        max_tool_chars=args.max_tool_chars,
-        strip=not args.keep_hogs,
-        max_line_chars=args.max_line_chars,
-        max_repeated_lines=args.max_repeated_lines,
+    global _SOURCE_TRUNCATION_POLICY
+    _SOURCE_TRUNCATION_POLICY = args.source_truncation
+    sources = resolve_source_paths(args, ap)
+    if args.save_as and len(sources) != 1:
+        ap.error("--save-as is only valid for a single source")
+    if args.manifest_path and len(sources) != 1:
+        ap.error("--manifest-path is only valid for a single source")
+
+    out_dir = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
+    if args.choose_out_dir:
+        selected = choose_directory(out_dir)
+        if selected is None:
+            return 1
+        out_dir = selected.resolve()
+    if (args.out_dir or args.choose_out_dir) and args.remember_out_dir:
+        cfg["last_out_dir"] = str(out_dir)
+        save_config(cfg)
+    template = (
+        DEFAULT_STABLE_FILENAME_TEMPLATE if args.stable_filenames
+        else args.filename_template or str(cfg.get("filename_template") or DEFAULT_FILENAME_TEMPLATE)
     )
+    if args.save_filename_template:
+        cfg["filename_template"] = template
+        save_config(cfg)
 
-    if args.list:
-        print_message_list(records)
-        return 0
-    if args.list_responses:
-        print_response_list(records)
-        return 0
-
-    selected = choose_records(records, args)
-    title = discover_title(records, meta, args.name, args.session_id)
-    if args.mode == "thread" and not args.plain:
-        text = render_thread_export(
-            records=selected,
-            title=title,
-            source=path,
-            mode=args.mode,
-            meta=meta,
-            session_id=args.session_id,
-            include_frontmatter=not args.no_frontmatter,
-            include_map=not args.no_map,
-            fence_turns=args.fence_turns,
+    results: list[dict[str, Any]] = []
+    clipboard_parts: list[str] = []
+    for source_path, supplied_sid in sources:
+        reset_runtime_audit()
+        include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
+        records, meta = parse_session(
+            path=source_path,
+            include_actions=include_actions,
+            include_reasoning_summaries=args.reasoning_summaries,
+            reconstruct_live_context=args.live_context,
+            tool_outputs=args.tool_outputs,
+            max_tool_chars=args.max_tool_chars,
+            strip=not args.keep_hogs,
+            max_line_chars=args.max_line_chars,
+            max_repeated_lines=args.max_repeated_lines,
         )
-    elif args.mode == "turn" and not args.plain and not args.ui_style:
-        # Structured single prompt+response block, with full per-turn metadata.
-        text = render_thread_export(
-            records=selected,
-            title=title,
-            source=path,
-            mode=args.mode,
-            meta=meta,
-            session_id=args.session_id,
-            include_frontmatter=not args.no_frontmatter,
-            include_map=not args.no_map,
-            fence_turns=args.fence_turns,
-        )
-    else:
-        text = render_export(
-            selected,
-            title=title,
-            source=path,
-            mode=args.mode,
-            plain=args.plain,
-            ui_style=args.ui_style,
-            include_meta=not args.plain,
-        )
+        if args.report_events:
+            report_event_audit(meta)
+        if args.strict_events and sum(counter_to_dict(meta.get("_unknown_event_types")).values()):
+            raise RuntimeError("Unknown event schemas were detected; inspect --report-events or the manifest.")
+        if args.list:
+            print_message_list(records)
+            continue
+        if args.list_responses:
+            print_response_list(records)
+            continue
 
-    if not getattr(args, "keep_mojibake", False):
-        text = cp437_cp1252_mojibake_repair(text)
-    text = redact(text, args.redact)
-    text = strip_hogs(text, enabled=not args.keep_hogs, max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines)
+        scoped = select_last_n_turns(records, args.last_n_turns)
+        selected_records = choose_records(scoped, args)
+        effective_sid = supplied_sid or parse_session_id_from_name(source_path) or str(meta.get("id") or "")
+        title = discover_title(records, meta, args.name, effective_sid)
+        descriptor = mode_descriptor(args)
+        if args.mode == "thread" and not args.plain:
+            text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns)
+        elif args.mode == "turn" and not args.plain and not args.ui_style:
+            text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns)
+        else:
+            text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain)
+        if not args.keep_mojibake:
+            text = cp437_cp1252_mojibake_repair(text)
+        text = redact(text, args.redact)
+        text = strip_hogs(text, enabled=not args.keep_hogs, max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines)
+        if args.wrap_md:
+            text = wrap_markdown(text, title=args.wrap_title or None)
+        text = finalize_count_placeholders(text)
 
-    if args.wrap_md:
-        text = wrap_markdown(text, title=args.wrap_title or None)
+        include_short = args.stable_filenames or args.include_session_short_id or len(sources) > 1
+        filename = render_filename(template, title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
+        if args.no_filename_counts:
+            filename = render_filename(template.replace("{counts}", ""), title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
+        output_path: Path | None = None
+        if not args.no_file:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            candidate = out_dir / filename
+            if args.save_as:
+                selected_path = choose_save_file(out_dir, filename)
+                if selected_path is None:
+                    return 1
+                candidate = selected_path
+                if args.remember_out_dir:
+                    cfg["last_out_dir"] = str(candidate.parent.resolve())
+                    save_config(cfg)
+            output_path = resolve_collision(candidate, args.collision)
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(text, encoding="utf-8", newline="\n")
 
-    text = finalize_count_placeholders(text)
-
-    out_path = None
-    if not args.no_file:
-        args.out_dir.mkdir(parents=True, exist_ok=True)
-        suffix = "" if args.no_filename_counts else filename_count_suffix(text)
-        filename = f"codex_{safe_slug(title)}_{export_stamp()}{suffix}.md"
-        out_path = args.out_dir / filename
-        out_path.write_text(text, encoding="utf-8", newline="\n")
-
-    if args.clipboard:
-        copy_to_clipboard(text)
-
-    if args.stdout:
-        print(text, end="")
-
-    if args.json_result:
+        manifest_path = None
+        if args.manifest:
+            manifest = build_manifest(source=source_path, output=output_path, session_id=effective_sid, title=title, mode=descriptor, records=selected_records, meta=meta, text=text, redacted=args.redact)
+            manifest_path = write_manifest(manifest, output_path, args.manifest_path)
+        if args.stdout:
+            if len(sources) > 1:
+                print(f"\n<!-- codex-export source: {source_path} -->\n")
+            print(text, end="")
+        if args.clipboard:
+            clipboard_parts.append(text)
+        if args.open_after and output_path:
+            open_in_file_manager(output_path, select=True)
         result = {
-            "version": __version__,
-            "file": str(out_path) if out_path else None,
-            "source_jsonl": str(path),
-            "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "session_id": args.session_id or parse_session_id_from_name(path) or None,
-            "title": title,
-            "mode": args.mode,
-            "lines": count_lines(text),
-            "approx_tokens": approx_token_count(text),
-            "redacted": bool(args.redact),
-            "clipboard": bool(args.clipboard),
-            "models": collect_models(records, meta),
+            "version": __version__, "file": str(output_path) if output_path else None,
+            "manifest": str(manifest_path) if manifest_path else None,
+            "source_jsonl": str(source_path), "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "session_id": effective_sid or None, "title": title, "mode": descriptor,
+            "lines": count_lines(text), "token_count": approx_token_count(text), "token_counter": token_counter_info(),
+            "parse_error_count": len(meta.get("_parse_errors", [])), "repaired_json_line_count": len(meta.get("_repaired_json_lines", [])),
+            "redacted": bool(args.redact), "models": collect_models(selected_records, meta),
         }
-        print(json.dumps(result, ensure_ascii=False))
-    elif out_path:
-        print(out_path)
+        results.append(result)
+        if not args.json_result and output_path:
+            print(output_path)
 
+    if args.clipboard and clipboard_parts:
+        copy_to_clipboard("\n\n".join(clipboard_parts))
+    if args.json_result:
+        print(json.dumps(results[0] if len(results) == 1 else results, ensure_ascii=False))
     return 0
 
 

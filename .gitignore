@@ -1,8 +1,17 @@
-# Exported transcripts may contain private prompts, command output, repo paths,
-# .env names, or secrets. Always keep them local unless redacted.
+# Exported transcripts and manifests may contain private prompts, source code,
+# paths, credentials, or command output. Keep them local unless deliberately
+# redacted and reviewed.
 codex-thread-exports/
+*.manifest.json
 *.raw.jsonl
 *.private.*.md
+
+# Generated audit/release output
+.audit-output/
+.ci-output/
+build/
+dist/
+*.egg-info/
 
 # Python
 __pycache__/
@@ -18,7 +27,11 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Local development context not meant for the public repo
+# Local development context not meant for the public repository
 ChatGPT_*.md
 *.local.md
 .claude/
+Microsoft.PowerShell_profile*.ps1
+SOURCE_EXPORT_AUDIT.json
+VALIDATION_RESULTS.json
+TOKENIZER_INFO_*.json
