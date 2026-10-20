@@ -1,4 +1,4 @@
-# Installs Codex Exporter 0.2+ and safely replaces its marked PowerShell profile block.
+# Installs Codex Exporter 0.3+ and safely replaces its marked PowerShell profile block.
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\projects\CodexTools',
@@ -31,6 +31,14 @@ $installedScript = Join-Path $installPath 'Export-CodexThread.py'
 $installedPackage = Join-Path $installPath 'codex_exporter'
 $installedHelper = Join-Path $installPath 'CodexThreadExport-profile-block.v8.ps1'
 New-Item -ItemType Directory -Force -Path $installPath | Out-Null
+if (Test-Path -LiteralPath $installedScript) {
+    $backupRoot = Join-Path $installPath ('backups\upgrade-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+    Copy-Item -LiteralPath $installedScript -Destination (Join-Path $backupRoot 'Export-CodexThread.py') -Force
+    if (Test-Path -LiteralPath $installedPackage) {
+        Copy-Item -LiteralPath $installedPackage -Destination (Join-Path $backupRoot 'codex_exporter') -Recurse -Force
+    }
+}
 Copy-Item -LiteralPath $sourceScript -Destination $installedScript -Force
 if (Test-Path -LiteralPath $installedPackage) {
     Remove-Item -LiteralPath $installedPackage -Recurse -Force

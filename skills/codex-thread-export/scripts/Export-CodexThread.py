@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -645,31 +645,20 @@ def latest_session_file() -> Path:
 
 
 def find_session_file(session_id: str) -> Path:
-    roots = session_roots()
-    if not roots:
-        raise FileNotFoundError(f"No Codex session roots found under {codex_home()}")
-
-    candidates: list[Path] = []
-    for root in roots:
-        candidates.extend(root.rglob(f"*{session_id}*.jsonl"))
-
-    if not candidates:
-        needle = session_id.encode("utf-8")
-        for root in roots:
-            for path in root.rglob("*.jsonl"):
-                try:
-                    with path.open("rb") as f:
-                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                            if needle in chunk:
-                                candidates.append(path)
-                                break
-                except OSError:
-                    continue
-
-    if not candidates:
-        raise FileNotFoundError(f"No local Codex JSONL transcript found for session: {session_id}")
-
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    """Resolve by filename or SQLite catalog; never scan entire multi-GB files for a UUID."""
+    from codex_exporter.modern import discover
+    match = session_id.lower().strip()
+    if not SESSION_ID_RE.fullmatch(match):
+        raise ValueError(f"Invalid session UUID: {session_id}")
+    for row in discover(codex_home()):
+        if row['session_id'] == match:
+            if row['path'] is None:
+                raise FileNotFoundError(
+                    f"Thread {match} remains indexed in SQLite but its rollout JSONL is missing. "
+                    "Use --audit-sessions to inspect catalog/filesystem inconsistencies."
+                )
+            return row['path']
+    raise FileNotFoundError(f"No local Codex JSONL transcript found for session: {session_id}")
 
 
 def maybe_json(value: Any) -> Any:
@@ -2682,7 +2671,7 @@ def print_session_list() -> None:
     for index, row in enumerate(rows, 1):
         title = str(row["title"]).replace("|", "\\|")
         project = str(row["project"]).replace("|", "\\|")
-        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title} |")
+        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{' [ROLLOUT MISSING]' if row.get('missing_rollout') else ''} |")
 
 
 def print_message_list(records: list[Record]) -> None:
@@ -2953,15 +2942,20 @@ def session_descriptor(path: Path, title_map: dict[str, str] | None = None) -> d
 
 
 def list_session_descriptors() -> list[dict[str, Any]]:
-    title_map = read_all_session_index_titles()
-    title_map.update(read_all_sqlite_titles())
-    descriptors = []
-    for path in all_session_files():
-        try:
-            descriptors.append(session_descriptor(path, title_map))
-        except OSError:
-            continue
-    return sorted(descriptors, key=lambda row: row["mtime"], reverse=True)
+    """Prefer authoritative SQLite thread metadata; show missing-rollout rows."""
+    from codex_exporter.modern import discover
+    rows = discover(codex_home())
+    titles = read_all_session_index_titles()
+    for row in rows:
+        if not row.get('title'):
+            row['title'] = titles.get(row['session_id'], '')
+        if row['path'] is not None and (not row.get('title') or not row.get('cwd')):
+            head = session_head_metadata(row['path'], max_events=8)
+            row['title'] = row.get('title') or str(head.get('title') or '')
+            row['cwd'] = row.get('cwd') or str(head.get('cwd') or head.get('working_directory') or '')
+            row['project'] = row['cwd'].replace('\\', '/').rstrip('/').split('/')[-1]
+        row['modified'] = datetime.fromtimestamp(row['mtime']).isoformat(timespec='seconds') if row['mtime'] else ''
+    return rows
 
 
 def _browser_selection(raw: str, upper: int) -> list[int]:
@@ -3103,6 +3097,18 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
             pairs.append((find_session_file(sid), sid))
     for sid in args.session_id or []:
         pairs.append((find_session_file(sid), sid))
+    if args.project:
+        from codex_exporter.modern import choose_project
+        matches = choose_project(list_session_descriptors(), args.project)
+        if not matches:
+            parser.error(f"No session records matched --project {args.project!r}; inspect --audit-sessions")
+        missing = [r['session_id'] for r in matches if r.get('missing_rollout')]
+        if missing:
+            print(f"WARNING: {len(missing)} project sessions are indexed but their rollout is missing: "
+                  + ', '.join(missing), file=sys.stderr)
+        for row in matches:
+            if row['path'] is not None:
+                pairs.append((row['path'], row['session_id']))
     for path in args.jsonl or []:
         path = path.expanduser().resolve()
         if not path.is_file():
@@ -3126,7 +3132,7 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
         dedup[str(path.resolve()).casefold()] = (path, sid)
     result = list(dedup.values())
     if not result:
-        parser.error("provide --session-id, --jsonl, --sessions-file, --latest-session, or --browse")
+        parser.error("provide --session-id, --project, --jsonl, --sessions-file, --latest-session, or --browse")
     return result
 
 
@@ -3143,6 +3149,18 @@ def main() -> int:
     ap.add_argument("--latest-session", action="store_true")
     ap.add_argument("--list-sessions", action="store_true")
     ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
+    ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
+    ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_OR_JSON", help="Convert user-supplied official ChatGPT conversations.json or account export ZIP")
+    ap.add_argument("--chatgpt-id", action="append", default=[], help="Filter account export by conversation ID (repeatable)")
+    ap.add_argument("--chatgpt-title-regex", default="", help="Filter account export by conversation title regex")
+    ap.add_argument("--chatgpt-project-id", default="", help="Exact project ID; matches only records with an explicit project_id field")
+    ap.add_argument("--audit-sessions", action="store_true", help="Reconcile SQLite thread catalog with live/archived rollouts, as JSON")
+    ap.add_argument("--fast", dest="fast", action="store_true", default=None, help="Stream full threads with bounded memory")
+    ap.add_argument("--no-fast", dest="fast", action="store_false", help="Use original in-memory renderer")
+    ap.add_argument("--fast-threshold-mib", type=int, default=128, help="Auto-stream full threads this size or larger (default: 128 MiB)")
+    ap.add_argument("--progress", dest="progress", action="store_true", default=None, help="Show real-time progress on stderr")
+    ap.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress")
+    ap.add_argument("--unknown-events", choices=['report', 'sidecar'], default='report', help="Report unknown schemas, or separately preserve their raw JSONL")
 
     config_group = ap.add_argument_group("persistent configuration")
     config_group.add_argument("--show-config", action="store_true")
@@ -3254,6 +3272,26 @@ def main() -> int:
     if args.list_sessions:
         print_session_list()
         return 0
+    if args.audit_sessions:
+        from codex_exporter.modern import audit
+        print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
+        return 0
+    if args.chatgpt_export:
+        if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+            ap.error('--chatgpt-export cannot be combined with Codex source selectors')
+        from codex_exporter.chatgpt_archive import export_chatgpt
+        out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
+        exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
+            conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
+            project_id=args.chatgpt_project_id,
+            progress=args.progress if args.progress is not None else sys.stderr.isatty())
+        if args.json_result:
+            print(json.dumps(exported, ensure_ascii=False))
+        else:
+            for item in exported: print(item['file'])
+        if not exported:
+            print('WARNING: no conversation records matched the supplied filters.', file=sys.stderr)
+        return 0
 
     configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
     if args.tokenizer_info:
@@ -3289,6 +3327,51 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     clipboard_parts: list[str] = []
     for source_path, supplied_sid in sources:
+        auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
+            args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
+            args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
+        use_fast = args.fast if args.fast is not None else (
+            auto_stream_eligible and source_path.stat().st_size >= args.fast_threshold_mib * 1048576
+        )
+        if use_fast:
+            if args.mode != 'thread' or args.list or args.list_responses or args.last_n_turns is not None or args.live_context:
+                ap.error('--fast only supports full chronological --mode thread (without turn limits or live-context)')
+            if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
+                ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
+            from codex_exporter.modern import discover, stream_export
+            row = next((r for r in discover(codex_home()) if r['session_id'] == supplied_sid), None)
+            sid = supplied_sid or parse_session_id_from_name(source_path)
+            title = normalize_title(args.name or (row or {}).get('title') or read_session_index_title(sid) or sid or source_path.stem)
+            fast_out = out_dir
+            # Stable, collision-safe regardless of current title or clock.
+            filename = 'codex_' + normalize_title(title).replace(' ', '_')[:70] + '_thread_' + sid[-8:] + '.md'
+            if args.filename_template:
+                from string import Formatter
+                accepted = {'title': normalize_title(title).replace(' ', '_')[:70],
+                    'session_id': sid, 'session_short': sid[-8:], 'mode': 'thread', 'stamp': export_stamp()}
+                invalid = {field for _, field, _, _ in Formatter().parse(args.filename_template) if field not in accepted and field is not None}
+                if invalid:
+                    ap.error(f'--fast supports filename placeholders {sorted(accepted)} only; unsupported: {sorted(invalid)}')
+                filename = args.filename_template.format(**accepted)
+                if not filename.endswith('.md') or Path(filename).name != filename:
+                    ap.error('--filename-template must resolve to a plain .md filename in --fast mode')
+            result = stream_export(source_path, fast_out / filename, session_id=sid, title=title,
+                include_reasoning_summaries=args.reasoning_summaries,
+                tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
+                strip=False,  # preserve every recorded printable character in stream mode
+                max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines,
+                source_truncation=args.source_truncation, unknown_events=args.unknown_events,
+                collision=args.collision, redact=args.redact, strict_events=args.strict_events,
+                progress=args.progress if args.progress is not None else sys.stderr.isatty())
+            results.append(result)
+            if args.report_events:
+                print(json.dumps({'stream_event_count': result.get('rendered_records'),
+                     'unknown_event_count': result.get('unknown_event_count'),
+                     'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
+            if args.open_after and result.get('file'):
+                open_in_file_manager(Path(result['file']), select=True)
+            if not args.json_result: print(result['file'])
+            continue
         reset_runtime_audit()
         include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
         records, meta = parse_session(

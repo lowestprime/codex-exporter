@@ -1,6 +1,21 @@
-# Codex Exporter 0.2
+# Codex Exporter 0.3
 
 Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.
+
+## What changed in 0.3
+
+- SQLite thread catalog reconciliation for newer Windows Codex desktop sessions, including
+  missing-rollout diagnostics and Windows long-path normalization;
+- `codex-export --project Full-Time --mode thread` and PowerShell `cdx-project`, `cdx-audit`, and `cdx-fast`;
+- bounded-memory chronological Markdown writing for full threads >=128 MiB by default,
+  with byte-accurate streaming SHA-256 and progress on stderr;
+- upstream source-truncation locations, source-event audit, and optional raw unknown-event sidecars;
+- opt-in ingestion of official ChatGPT account export ZIP/`conversations.json` records
+  through `--chatgpt-export`, including recorded alternate branches;
+- fixes for standalone script/skill distribution, with new module dependencies bundled;
+- regression fixtures for the catalog, streaming, project selection, and account archive adapter.
+
+Full instructions and limitations: [docs/MODERN-WINDOWS-2026.md](docs/MODERN-WINDOWS-2026.md). Implementation audit: [docs/AUDIT-2026-10-20.md](docs/AUDIT-2026-10-20.md).
 
 ## What changed in 0.2
 

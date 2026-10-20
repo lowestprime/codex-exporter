@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (proposed)
+
+- Reconcile SQLite threads against active and archived rollouts; normalize Windows extended paths.
+- Export all available local rollouts for a named project in one command.
+- Add efficient streaming full-thread export with progress, provenance, and schema audit.
+- Convert user-supplied official ChatGPT account export JSON/ZIP, including branches.
+- Bundle new components in the Windows standalone and Codex skill distributions.
+
 ## 0.2.0
 
 - Persist and natively select export directories and Save As filenames.
