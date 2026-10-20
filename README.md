@@ -15,7 +15,7 @@ Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. 
 - fixes for standalone script/skill distribution, with new module dependencies bundled;
 - regression fixtures for the catalog, streaming, project selection, and account archive adapter.
 
-Full instructions and limitations: [docs/MODERN-WINDOWS-2026.md](docs/MODERN-WINDOWS-2026.md). Implementation audit: [docs/AUDIT-2026-10-20.md](docs/AUDIT-2026-10-20.md).
+Full instructions and limitations: [docs/MODERN-WINDOWS-2026.md](docs/MODERN-WINDOWS-2026.md). The user-specific input audit is distributed privately with the downloadable review package, not committed to this public repository.
 
 ## What changed in 0.2
 
