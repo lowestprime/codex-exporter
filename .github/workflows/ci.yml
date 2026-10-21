@@ -35,7 +35,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           foreach ($path in @(
               'Install-CodexThreadExporter.ps1',
-              'powershell/CodexThreadExport-profile-block.v8.ps1'
+              'powershell/CodexThreadExport-profile-block.v8.ps1',
+              'powershell/Repair-CodexExporterPath.ps1'
           )) {
               $tokens = $null
               $errors = $null
@@ -45,6 +46,20 @@ jobs:
                   [ref]$errors
               )
               if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }
+          }
+
+      - name: Exercise process-only command PATH reconciliation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python).Source
+          $report = ./powershell/Repair-CodexExporterPath.ps1 -PythonPath $python -SessionOnly
+          if (-not $report.ConsoleExecutable -or $report.ExpectedVersion -ne 'codex-export 0.3.0') {
+              throw 'Process-only PATH reconciliation did not identify the expected CLI.'
+          }
+          if ((codex-export --version) -ne 'codex-export 0.3.0') {
+              throw 'Repaired PATH does not resolve to Codex Exporter 0.3.0.'
           }
 
       - name: Verify idempotent custom-path profile installation

@@ -353,3 +353,23 @@ Tagged `v*` pushes build distributions and create a GitHub release. See [COMPATI
 ## Security
 
 Rollouts can contain source code, local paths, credentials, and private repository names. Use `--redact` before sharing and inspect the result. Redaction and binary/blob suppression are counted in the manifest, but pattern-based redaction is not a substitute for human review.
+
+### Windows PATH conflict repair (opt-in)
+
+After updating the package, `codex-export --version` may still invoke an old
+`%LOCALAPPDATA%\codex-exporter\venvs\0.2.0\Scripts\codex-export.exe`
+when that directory precedes the selected Python `Scripts` on PATH.
+Run `Get-Command codex-export -All` to confirm. The installer now ships
+`Repair-CodexExporterPath.ps1` alongside the installed exporter; run:
+
+```powershell
+$py = (& py -3.13 -c 'import sys; print(sys.executable)').Trim()
+& 'C:\projects\CodexTools\Repair-CodexExporterPath.ps1' -PythonPath $py
+codex-export --version
+```
+
+Or add `-RepairCommandPath` to a future installer invocation that also uses
+`-InstallPackage`. This is intentionally opt-in: the repair backs up your
+PATH and modifies only User and current-process PATH values, without deleting
+the older venv or changing Machine PATH. See
+[Windows usage notes](docs/MODERN-WINDOWS-2026.md).

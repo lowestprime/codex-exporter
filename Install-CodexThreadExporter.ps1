@@ -9,6 +9,7 @@ param(
     [switch]$InstallSkill,
     [switch]$InstallPackage,
     [switch]$InstallTiktoken,
+    [switch]$RepairCommandPath,
     [switch]$Force
 )
 
@@ -17,8 +18,9 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourceScript = Join-Path $repoRoot 'Export-CodexThread.py'
 $sourcePackage = Join-Path $repoRoot 'codex_exporter'
 $sourceHelper = Join-Path $repoRoot 'powershell\CodexThreadExport-profile-block.v8.ps1'
+$sourcePathRepair = Join-Path $repoRoot 'powershell\Repair-CodexExporterPath.ps1'
 
-foreach ($required in @($sourceScript, $sourcePackage, $sourceHelper)) {
+foreach ($required in @($sourceScript, $sourcePackage, $sourceHelper, $sourcePathRepair)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required source missing: $required" }
 }
 
@@ -30,6 +32,7 @@ $installPath = [System.IO.Path]::GetFullPath($InstallDir)
 $installedScript = Join-Path $installPath 'Export-CodexThread.py'
 $installedPackage = Join-Path $installPath 'codex_exporter'
 $installedHelper = Join-Path $installPath 'CodexThreadExport-profile-block.v8.ps1'
+$installedPathRepair = Join-Path $installPath 'Repair-CodexExporterPath.ps1'
 New-Item -ItemType Directory -Force -Path $installPath | Out-Null
 if (Test-Path -LiteralPath $installedScript) {
     $backupRoot = Join-Path $installPath ('backups\upgrade-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
@@ -44,6 +47,7 @@ if (Test-Path -LiteralPath $installedPackage) {
     Remove-Item -LiteralPath $installedPackage -Recurse -Force
 }
 Copy-Item -LiteralPath $sourcePackage -Destination $installedPackage -Recurse -Force
+Copy-Item -LiteralPath $sourcePathRepair -Destination $installedPathRepair -Force
 
 $scriptLiteral = "'" + $installedScript.Replace("'", "''") + "'"
 $pythonLiteral = $PythonPath.Replace("'", "''")
@@ -56,9 +60,18 @@ Set-Content -LiteralPath $installedHelper -Value $helper -Encoding utf8NoBOM
 
 if ($InstallPackage) {
     & $PythonPath -m pip install --upgrade $repoRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Package installation failed; PATH was not changed.' }
 }
 if ($InstallTiktoken) {
     & $PythonPath -m pip install --upgrade --only-binary=:all: 'tiktoken>=0.12,<1'
+    if ($LASTEXITCODE -ne 0) { throw 'Optional tiktoken installation failed.' }
+}
+
+# No PATH mutation unless explicitly requested; do it only after package installation.
+$pathRepairResult = $null
+if ($RepairCommandPath) {
+    if (-not $InstallPackage) { throw '-RepairCommandPath requires -InstallPackage.' }
+    $pathRepairResult = & $installedPathRepair -PythonPath $PythonPath
 }
 
 if ($ExportDir) {
@@ -110,6 +123,20 @@ if ($InstallSkill) {
     Copy-Item -LiteralPath $skillSource -Destination $skillTarget -Recurse -Force
 }
 
+# A successful pip install does not prove that an unqualified command resolves to it.
+$consoleResolution = $null
+if ($InstallPackage -and $env:OS -eq 'Windows_NT') {
+    $selectedVersion = (& $PythonPath $installedScript --version | Out-String).Trim()
+    $resolvedCommand = Get-Command codex-export -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($resolvedCommand) {
+        $resolvedVersion = (& $resolvedCommand.Source --version | Out-String).Trim()
+        $consoleResolution = [pscustomobject]@{ Path = $resolvedCommand.Source; Version = $resolvedVersion }
+        if ($resolvedVersion -cne $selectedVersion) {
+            Write-Warning "codex-export still resolves to '$($resolvedCommand.Source)' ($resolvedVersion), not $selectedVersion. Reinstall with -InstallPackage -RepairCommandPath."
+        }
+    }
+}
+
 [pscustomobject]@{
     Version = (& $PythonPath $installedScript --version | Out-String).Trim()
     Python = $PythonPath
@@ -117,5 +144,8 @@ if ($InstallSkill) {
     ProfileUpdated = [bool]$AppendProfile
     SkillInstalled = [bool]$InstallSkill
     PackageInstalled = [bool]$InstallPackage
+    CommandPathRepaired = [bool]$RepairCommandPath
+    PathRepair = $pathRepairResult
+    ConsoleResolution = $consoleResolution
     Tokenizer = (& $PythonPath $installedScript --tokenizer-info --tokenizer auto | Out-String).Trim()
 }

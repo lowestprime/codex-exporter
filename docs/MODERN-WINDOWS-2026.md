@@ -115,3 +115,34 @@ is recoverable, even if its marker appears multiple times in a source transcript
 For developer regression tests, run `& $py -m pytest -q` from the extracted source directory
 with pytest installed. Test fixtures are synthetic: they do not verify the specific
 5.4 GB rollout or newer cloud-only desktop data, neither of which was supplied in this archive.
+
+## Repair a stale 0.2.0 console command after installing 0.3.0
+
+If `& $py -m codex_exporter --version` reports 0.3.0 but `codex-export --version`
+still reports 0.2.0, run `Get-Command codex-export -All`. A common Windows cause
+is an obsolete `%LOCALAPPDATA%\codex-exporter\venvs\0.2.0\Scripts` PATH entry
+preceding the selected Python `Scripts` directory.
+
+The dedicated repair is opt-in and makes no changes to packages or older venv files:
+
+```powershell
+$py = (& py -3.13 -c 'import sys; print(sys.executable)').Trim()
+& 'C:\projects\CodexTools\Repair-CodexExporterPath.ps1' -PythonPath $py -WhatIf
+& 'C:\projects\CodexTools\Repair-CodexExporterPath.ps1' -PythonPath $py
+Get-Command codex-export -All
+codex-export --version
+```
+
+On a subsequent source installation, supply `-InstallPackage -RepairCommandPath`
+to perform the same narrowly scoped reconciliation *after* pip installs the
+package. Without `-RepairCommandPath`, the installer never modifies PATH.
+
+The repair validates that the targeted Python module and executable agree,
+backups original User/Process PATH values under
+`%LOCALAPPDATA%\codex-exporter\backups`, removes only recognized old
+`codex-exporter\venvs\*\Scripts` entries with an actual `codex-export.exe`,
+and prioritizes the selected Python Scripts directory in User and current
+Process PATH. It does not remove the venv itself or change Machine PATH.
+If Machine PATH or shell startup scripts also inject the obsolete entry, a
+warning identifies that additional source; check a newly started terminal.
+Use `-SessionOnly` for a non-persistent test and `-WhatIf` to preview changes.
