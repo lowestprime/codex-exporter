@@ -2,6 +2,25 @@
 
 Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.
 
+## Windows hotfix in 0.3.1
+
+The streaming filename builder now sanitizes Windows-reserved characters in session
+names, including Codex `/goal` titles that contain `C:\Users\...` paths.
+This resolves `WinError 123` before the first JSONL event is read. Filename
+substitutions are bounded and always create a single `.md` file in the selected
+output directory, never unintended nested directories. Large multiline titles
+are condensed to one listing row, at most 140 characters by default:
+
+```powershell
+cdx-sessions                                    # compact, valid Markdown table
+codex-export --list-sessions --full-session-titles  # expanded one-line titles
+cdx-project 'Full-Time' -UnknownSidecar
+cdx-fast 01a0fecf-02ee-77d2-99a2-59e86e27cc9e
+```
+
+Missing rollout JSONL files listed by `cdx-audit` are **not** repaired or
+fabricated; the SQLite catalog alone cannot reconstruct transcript content.
+
 ## What changed in 0.3
 
 - SQLite thread catalog reconciliation for newer Windows Codex desktop sessions, including

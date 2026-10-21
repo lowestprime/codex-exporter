@@ -146,3 +146,22 @@ Process PATH. It does not remove the venv itself or change Machine PATH.
 If Machine PATH or shell startup scripts also inject the obsolete entry, a
 warning identifies that additional source; check a newly started terminal.
 Use `-SessionOnly` for a non-persistent test and `-WhatIf` to preview changes.
+
+## Windows filename and session-table regression (0.3.1)
+
+The 2026-10-21 validation captured a 6,017,864,127-byte active JSONL and an
+attachment-path title that created invalid Windows output directories in v0.3.0.
+The v0.3.1 streaming filename builder uses the same safe-slug policy as the
+legacy exporter plus an independent portable basename sanitizer for custom
+templates. It does not rewrite the original conversation data. The existing
+`--collision rename` behavior remains in force.
+
+`codex-export --list-sessions` prints single-line 140-character title previews,
+preventing large prompt bodies from expanding a session index into thousands of
+lines. For a full one-line display, add `--full-session-titles`; retrieve actual
+transcript material through an export, never by relying on list previews.
+
+Five Full-Time sessions in the test log were indexed in SQLite but had no
+accessible corresponding JSONL in the two expected rollout roots or their
+indexed paths. This is a separate source-availability limitation, not a claim
+that their contents have been recovered.

@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -561,6 +561,27 @@ def safe_slug(text: str, max_len: int = 80) -> str:
     text = re.sub(r"\s+", "_", text)
     text = re.sub(r"_+", "_", text).strip("._- ")
     return (text or "codex_thread")[:max_len].strip("._- ")
+
+
+def safe_export_filename(name: str, *, max_len: int = 220) -> str:
+    """Turn a formatted export name into one portable, Windows-safe basename.
+
+    Windows treats both slash forms, colon and other reserved characters as
+    path syntax; path-bearing user prompt titles must never become directories.
+    """
+    stem = str(name)
+    if stem.lower().endswith('.md'):
+        stem = stem[:-3]
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', stem)
+    stem = re.sub(r'\s+', '_', stem).strip(' ._')
+    stem = re.sub(r'_+', '_', stem)
+    if not stem:
+        stem = 'codex_thread'
+    # Windows device names are invalid even when followed by an extension.
+    if re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])', stem.split('.')[0]):
+        stem = '_' + stem
+    stem = stem[:max_len - 3].rstrip(' ._') or 'codex_thread'
+    return stem + '.md'
 
 
 def _abbrev_tz(name: str) -> str:
@@ -2661,7 +2682,19 @@ def choose_records(records: list[Record], args: argparse.Namespace) -> list[Reco
     raise RuntimeError(f"Unknown mode: {args.mode}")
 
 
-def print_session_list() -> None:
+def compact_session_cell(value: str, *, limit: int = 140) -> str:
+    """Keep session listings as single-line Markdown even for multi-MB prompt titles.
+
+    Full source titles remain accessible through --audit-sessions and in the
+    original SQLite catalog; a listing is an index, not an archival export.
+    """
+    display = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(display) > limit:
+        display = display[:limit - 1].rstrip() + "…"
+    return display.replace("|", "\\|")
+
+
+def print_session_list(*, full_titles: bool = False) -> None:
     rows = list_session_descriptors()
     if not rows:
         print(f"_No Codex session JSONLs found under {codex_home()}._")
@@ -2669,9 +2702,10 @@ def print_session_list() -> None:
     print("| # | session_id | size | modified | project | archived | title |")
     print("|---:|---|---:|---|---|---|---|")
     for index, row in enumerate(rows, 1):
-        title = str(row["title"]).replace("|", "\\|")
-        project = str(row["project"]).replace("|", "\\|")
-        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{' [ROLLOUT MISSING]' if row.get('missing_rollout') else ''} |")
+        title = compact_session_cell(str(row['title']), limit=1000000 if full_titles else 140)
+        project = compact_session_cell(str(row['project']), limit=140)
+        missing = ' [ROLLOUT MISSING]' if row.get('missing_rollout') else ''
+        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{missing} |")
 
 
 def print_message_list(records: list[Record]) -> None:
@@ -3148,6 +3182,7 @@ def main() -> int:
     ap.add_argument("--sessions-file", type=Path, help="Text file containing one session UUID or JSONL path per line")
     ap.add_argument("--latest-session", action="store_true")
     ap.add_argument("--list-sessions", action="store_true")
+    ap.add_argument("--full-session-titles", action="store_true", help="Show complete single-line titles in session listings (may be very large)")
     ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
     ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
     ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_OR_JSON", help="Convert user-supplied official ChatGPT conversations.json or account export ZIP")
@@ -3270,7 +3305,7 @@ def main() -> int:
         print(configured_out_dir(cfg).resolve())
         return 0
     if args.list_sessions:
-        print_session_list()
+        print_session_list(full_titles=args.full_session_titles)
         return 0
     if args.audit_sessions:
         from codex_exporter.modern import audit
@@ -3326,6 +3361,7 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     clipboard_parts: list[str] = []
+    fast_catalog = None
     for source_path, supplied_sid in sources:
         auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
             args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
@@ -3339,22 +3375,26 @@ def main() -> int:
             if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
                 ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
             from codex_exporter.modern import discover, stream_export
-            row = next((r for r in discover(codex_home()) if r['session_id'] == supplied_sid), None)
+            if fast_catalog is None:
+                fast_catalog = {r['session_id']: r for r in discover(codex_home())}
+            row = fast_catalog.get(supplied_sid)
             sid = supplied_sid or parse_session_id_from_name(source_path)
             title = normalize_title(args.name or (row or {}).get('title') or read_session_index_title(sid) or sid or source_path.stem)
             fast_out = out_dir
             # Stable, collision-safe regardless of current title or clock.
-            filename = 'codex_' + normalize_title(title).replace(' ', '_')[:70] + '_thread_' + sid[-8:] + '.md'
+            filename = safe_export_filename('codex_' + safe_slug(title, max_len=70) + '_thread_' + sid.replace('-', '')[-8:] + '.md')
             if args.filename_template:
                 from string import Formatter
-                accepted = {'title': normalize_title(title).replace(' ', '_')[:70],
+                accepted = {'title': safe_slug(title, max_len=70),
                     'session_id': sid, 'session_short': sid[-8:], 'mode': 'thread', 'stamp': export_stamp()}
                 invalid = {field for _, field, _, _ in Formatter().parse(args.filename_template) if field not in accepted and field is not None}
                 if invalid:
                     ap.error(f'--fast supports filename placeholders {sorted(accepted)} only; unsupported: {sorted(invalid)}')
-                filename = args.filename_template.format(**accepted)
-                if not filename.endswith('.md') or Path(filename).name != filename:
-                    ap.error('--filename-template must resolve to a plain .md filename in --fast mode')
+                # Reject explicit directory templates; sanitize substituted fields
+                # and any literal Windows-reserved characters without inventing subdirs.
+                if '/' in args.filename_template or '\\' in args.filename_template:
+                    ap.error('--filename-template must specify a basename, not a directory')
+                filename = safe_export_filename(args.filename_template.format(**accepted))
             result = stream_export(source_path, fast_out / filename, session_id=sid, title=title,
                 include_reasoning_summaries=args.reasoning_summaries,
                 tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,

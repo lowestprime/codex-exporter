@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 (proposed; Windows filename/listing hotfix)
+
+- Prevent Windows `WinError 123` in streaming project/single-session exports when session titles contain pasted-text attachment paths or other Windows-reserved filename characters. Sanitize both default and user-template filename substitutions, retain compact unique session IDs, and prohibit explicit subfolder templates.
+- Make `--list-sessions`/`cdx-sessions` output compact, valid single-line Markdown table entries regardless of title length. Use `--full-session-titles` for complete single-line display; original SQLite source metadata is unmodified.
+- Cache streaming session-catalog lookup once per batch instead of rescanning for every session.
+- Regression-test exact Windows-style attachment-path titles, custom filenames, collisions, project batches, and very long multiline catalog titles.
+
 ## 0.3.0 (proposed)
 
 - Reconcile SQLite threads against active and archived rollouts; normalize Windows extended paths.
