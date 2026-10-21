@@ -54,12 +54,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $python = (Get-Command python).Source
+          $expected = & $python -m codex_exporter --version
           $report = ./powershell/Repair-CodexExporterPath.ps1 -PythonPath $python -SessionOnly
-          if (-not $report.ConsoleExecutable -or $report.ExpectedVersion -ne 'codex-export 0.3.0') {
-              throw 'Process-only PATH reconciliation did not identify the expected CLI.'
+          if (-not $report.ConsoleExecutable -or $report.ExpectedVersion -ne $expected) {
+              throw 'Process-only PATH reconciliation did not identify the installed CLI version.'
           }
-          if ((codex-export --version) -ne 'codex-export 0.3.0') {
-              throw 'Repaired PATH does not resolve to Codex Exporter 0.3.0.'
+          if ((codex-export --version) -ne $expected) {
+              throw 'Repaired PATH does not resolve to the installed Codex Exporter version.'
           }
 
       - name: Verify idempotent custom-path profile installation
