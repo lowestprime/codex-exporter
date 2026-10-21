@@ -1,6 +1,8 @@
 """Regression coverage for real Windows project titles containing attachment paths."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import re
 import subprocess
@@ -53,7 +55,7 @@ def test_stream_custom_template_normalizes_substitution_and_rejects_directories(
        '--out-dir',str(tmp_path/'out'),'--json'],home)
     assert result.returncode==0,result.stderr
     filename=json.loads(result.stdout)['file']
-    assert not re.search(r'[<>:"\\|?*]', filename.split('/')[-1])
+    assert not re.search(r'[<>:"\\|?*]', Path(filename).name)
     rejected=cli(['--session-id',ids[0], '--mode','thread','--fast',
        '--filename-template','subdir/{title}.md'],home)
     assert rejected.returncode!=0
