@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.4"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -563,6 +563,27 @@ def safe_slug(text: str, max_len: int = 80) -> str:
     return (text or "codex_thread")[:max_len].strip("._- ")
 
 
+def safe_export_filename(name: str, *, max_len: int = 220) -> str:
+    """Turn a formatted export name into one portable, Windows-safe basename.
+
+    Windows treats both slash forms, colon and other reserved characters as
+    path syntax; path-bearing user prompt titles must never become directories.
+    """
+    stem = str(name)
+    if stem.lower().endswith('.md'):
+        stem = stem[:-3]
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', stem)
+    stem = re.sub(r'\s+', '_', stem).strip(' ._')
+    stem = re.sub(r'_+', '_', stem)
+    if not stem:
+        stem = 'codex_thread'
+    # Windows device names are invalid even when followed by an extension.
+    if re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])', stem.split('.')[0]):
+        stem = '_' + stem
+    stem = stem[:max_len - 3].rstrip(' ._') or 'codex_thread'
+    return stem + '.md'
+
+
 def _abbrev_tz(name: str) -> str:
     """Compress full Windows tz names like ``Pacific Daylight Time`` to ``PDT``.
 
@@ -613,6 +634,17 @@ def export_stamp() -> str:
 pacific_stamp = export_stamp
 
 
+def open_rollout_text(path: Path):
+    """Open ordinary or Zstandard cold Codex rollout files without extraction."""
+    if path.name.lower().endswith('.jsonl.zst'):
+        try:
+            import zstandard as zstd
+        except ImportError as exc:
+            raise RuntimeError('Compressed Codex rollouts require: py -3.13 -m pip install zstandard') from exc
+        return zstd.open(path, mode='rt', encoding='utf-8', errors='replace')
+    return path.open('r', encoding='utf-8', errors='replace')
+
+
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
@@ -629,6 +661,7 @@ def all_session_files() -> list[Path]:
     out: list[Path] = []
     for root in session_roots():
         out.extend(root.rglob("*.jsonl"))
+        out.extend(root.rglob("*.jsonl.zst"))
     return out
 
 
@@ -645,31 +678,20 @@ def latest_session_file() -> Path:
 
 
 def find_session_file(session_id: str) -> Path:
-    roots = session_roots()
-    if not roots:
-        raise FileNotFoundError(f"No Codex session roots found under {codex_home()}")
-
-    candidates: list[Path] = []
-    for root in roots:
-        candidates.extend(root.rglob(f"*{session_id}*.jsonl"))
-
-    if not candidates:
-        needle = session_id.encode("utf-8")
-        for root in roots:
-            for path in root.rglob("*.jsonl"):
-                try:
-                    with path.open("rb") as f:
-                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                            if needle in chunk:
-                                candidates.append(path)
-                                break
-                except OSError:
-                    continue
-
-    if not candidates:
-        raise FileNotFoundError(f"No local Codex JSONL transcript found for session: {session_id}")
-
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    """Resolve by filename or SQLite catalog; never scan entire multi-GB files for a UUID."""
+    from codex_exporter.modern import discover
+    match = session_id.lower().strip()
+    if not SESSION_ID_RE.fullmatch(match):
+        raise ValueError(f"Invalid session UUID: {session_id}")
+    for row in discover(codex_home()):
+        if row['session_id'] == match:
+            if row['path'] is None:
+                raise FileNotFoundError(
+                    f"Thread {match} remains indexed in SQLite but its rollout JSONL is missing. "
+                    "Use --audit-sessions to inspect catalog/filesystem inconsistencies."
+                )
+            return row['path']
+    raise FileNotFoundError(f"No local Codex JSONL transcript found for session: {session_id}")
 
 
 def maybe_json(value: Any) -> Any:
@@ -1316,7 +1338,7 @@ def event_key(obj: dict[str, Any]) -> str:
 
 def extract_reasoning_summary(payload: dict[str, Any]) -> str:
     """Return only Codex's explicit summary surface, never encrypted/raw reasoning."""
-    summary = payload.get("summary")
+    summary = payload.get("summary") or payload.get("summary_text")
     if not summary:
         return ""
     return extract_text(
@@ -1330,13 +1352,15 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
 
 def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool) -> str:
     top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
-    ptype = payload_type or item_type
-    if ptype == "token_count":
+    ptype = (payload_type if payload_type not in {"item_completed", "item_started", "item_updated"} else item_type).casefold()
+    if top_type == "token_usage_record" or ptype == "token_count":
         return "telemetry_token_count"
     if ptype == "agent_reasoning":
         return "raw_reasoning_not_exported"
     if ptype == "reasoning":
         return "reasoning_summary_empty" if include_reasoning_summaries else "reasoning_summary_opt_in_disabled"
+    if top_type == "event_msg" and payload_type == "item_completed" and ptype == "contextcompaction":
+        return "context_history_event"
     if top_type in {"turn_context", "session_meta", "world_state"}:
         return "metadata_only"
     if top_type == "compacted" or ptype in {"context_compacted", "thread_rolled_back"}:
@@ -1411,8 +1435,8 @@ def classify_record(
     top_type, payload, payload_type, item, item_type = event_type_blob(obj)
     type_blob = " ".join([top_type, payload_type, item_type]).lower()
 
-    reasoning_payload = item if item_type == "reasoning" else payload
-    if include_reasoning_summaries and (item_type == "reasoning" or payload_type == "reasoning"):
+    reasoning_payload = item if item_type.casefold() == "reasoning" else payload
+    if include_reasoning_summaries and (item_type.casefold() == "reasoning" or payload_type.casefold() == "reasoning"):
         summary = extract_reasoning_summary(reasoning_payload)
         if summary:
             return Record(
@@ -1423,6 +1447,49 @@ def classify_record(
                 "reasoning_summary",
                 seq,
             )
+
+    # Newer desktop/app-server item-completed snapshots have capitalized type
+    # names and do not necessarily carry a role. Earlier releases wrongly put
+    # substantive user/agent/file-change records into the unknown-event sidecar.
+    if top_type == "event_msg" and payload_type == "item_completed" and item:
+        subtype = item_type.casefold()
+        if subtype in {"usermessage", "agentmessage"}:
+            text = extract_text(item.get("content") or item.get("text") or item.get("message"),
+                strip=strip, max_line_chars=max_line_chars, max_repeated_lines=max_repeated_lines)
+            if text:
+                return Record("message", "user" if subtype == "usermessage" else "assistant",
+                              text, timestamp, item_type, seq)
+        if subtype == "filechange" and include_actions:
+            changes = item.get("changes")
+            sections = [f"File change status: {item.get('status', 'unknown')}"]
+            if isinstance(changes, dict):
+                for pathname, change in changes.items():
+                    sections.append(f"File: {pathname}")
+                    if isinstance(change, dict):
+                        sections.append(f"Change type: {change.get('type', 'unknown')}")
+                        # The complete recorded content remains intact; no excerpt cap.
+                        for field, value in change.items():
+                            if field == "type":
+                                continue
+                            sections.append(f"{field}:\n" + (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)))
+                    else:
+                        sections.append(change if isinstance(change, str) else json.dumps(change, ensure_ascii=False))
+            for field in ("stdout", "stderr"):
+                if item.get(field):
+                    sections.append(f"{field}:\n" + str(item[field]))
+            return Record("action", "tool", "\n\n".join(sections), timestamp, item_type, seq)
+        if subtype == "extension" and include_actions:
+            # Query/action/result data are meaningful even when no conventional
+            # action text keys are present. Preserve all values with their keys.
+            body = json.dumps(item, ensure_ascii=False, indent=2)
+            return Record("action", "tool", "Extension activity\n\n" + body, timestamp, item_type, seq)
+        if subtype == "imageview" and include_actions and item.get("path"):
+            return Record("note", "tool", "Image viewed (external file reference, image bytes not embedded): " + str(item["path"]),
+                          timestamp, item_type, seq)
+        if subtype == "mcptoolcall" and include_actions:
+            # Fallback for MCP items lacking the usual command/output text.
+            return Record("action", "tool", "MCP tool item\n\n" + json.dumps(item, ensure_ascii=False, indent=2),
+                          timestamp, item_type, seq)
 
     if any(h in type_blob for h in NOISY_TYPE_HINTS):
         return None
@@ -1441,7 +1508,7 @@ def classify_record(
                 return Record("message", item_role, text, timestamp, item_type, seq)
 
         if include_actions and any(h in item_type.lower() for h in ACTION_HINTS):
-            return extract_action_record(
+            parsed_action = extract_action_record(
                 item,
                 timestamp=timestamp,
                 source_type=item_type,
@@ -1452,6 +1519,8 @@ def classify_record(
                 tool_outputs=tool_outputs,
                 max_tool_chars=max_tool_chars,
             )
+            if parsed_action is not None:
+                return parsed_action
 
     # Codex app/CLI message shapes.
     if payload_type in {"user_message", "agent_message", "assistant_message"}:
@@ -1492,6 +1561,11 @@ def classify_record(
         )
         if rec:
             return rec
+
+    if (top_type == "event_msg" and payload_type == "item_completed" and
+            item_type.casefold() == "mcptoolcall" and include_actions):
+        return Record("action", "tool", "MCP tool completion\n\n" +
+                      json.dumps(item, ensure_ascii=False, indent=2), timestamp, item_type, seq)
 
     return None
 
@@ -2327,7 +2401,7 @@ def parse_session(
     }
     last_key: tuple[str, str, str] | None = None
 
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    with open_rollout_text(path) as f:
         for seq, line in enumerate(f, 1):
             if not line.strip():
                 continue
@@ -2454,11 +2528,11 @@ def read_jsonl_set_thread_title(session_id: str) -> str:
     home = codex_home()
     sessions_dir = home / "sessions"
     # find the JSONL for this session_id
-    for p in sessions_dir.rglob(f"*{session_id}*.jsonl"):
-        if p.suffix == ".jsonl" and not p.name.endswith(".bak"):
+    for p in list(sessions_dir.rglob(f"*{session_id}*.jsonl")) + list(sessions_dir.rglob(f"*{session_id}*.jsonl.zst")):
+        if p.name.endswith((".jsonl", ".jsonl.zst")) and not p.name.endswith(".bak"):
             last_title = ""
             try:
-                with p.open("r", encoding="utf-8", errors="replace") as f:
+                with open_rollout_text(p) as f:
                     for line in f:
                         if "set_thread_title" not in line:
                             continue
@@ -2672,7 +2746,19 @@ def choose_records(records: list[Record], args: argparse.Namespace) -> list[Reco
     raise RuntimeError(f"Unknown mode: {args.mode}")
 
 
-def print_session_list() -> None:
+def compact_session_cell(value: str, *, limit: int = 140) -> str:
+    """Keep session listings as single-line Markdown even for multi-MB prompt titles.
+
+    Full source titles remain accessible through --audit-sessions and in the
+    original SQLite catalog; a listing is an index, not an archival export.
+    """
+    display = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(display) > limit:
+        display = display[:limit - 1].rstrip() + "…"
+    return display.replace("|", "\\|")
+
+
+def print_session_list(*, full_titles: bool = False) -> None:
     rows = list_session_descriptors()
     if not rows:
         print(f"_No Codex session JSONLs found under {codex_home()}._")
@@ -2680,9 +2766,10 @@ def print_session_list() -> None:
     print("| # | session_id | size | modified | project | archived | title |")
     print("|---:|---|---:|---|---|---|---|")
     for index, row in enumerate(rows, 1):
-        title = str(row["title"]).replace("|", "\\|")
-        project = str(row["project"]).replace("|", "\\|")
-        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title} |")
+        title = compact_session_cell(str(row['title']), limit=1000000 if full_titles else 140)
+        project = compact_session_cell(str(row['project']), limit=140)
+        missing = ' [ROLLOUT MISSING]' if row.get('missing_rollout') else ''
+        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{missing} |")
 
 
 def print_message_list(records: list[Record]) -> None:
@@ -2903,7 +2990,7 @@ def human_size(size: int) -> str:
 def session_head_metadata(path: Path, max_events: int = 80) -> dict[str, Any]:
     out: dict[str, Any] = {}
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
+        with open_rollout_text(path) as handle:
             for index, line in enumerate(handle):
                 if index >= max_events:
                     break
@@ -2953,15 +3040,20 @@ def session_descriptor(path: Path, title_map: dict[str, str] | None = None) -> d
 
 
 def list_session_descriptors() -> list[dict[str, Any]]:
-    title_map = read_all_session_index_titles()
-    title_map.update(read_all_sqlite_titles())
-    descriptors = []
-    for path in all_session_files():
-        try:
-            descriptors.append(session_descriptor(path, title_map))
-        except OSError:
-            continue
-    return sorted(descriptors, key=lambda row: row["mtime"], reverse=True)
+    """Prefer authoritative SQLite thread metadata; show missing-rollout rows."""
+    from codex_exporter.modern import discover
+    rows = discover(codex_home())
+    titles = read_all_session_index_titles()
+    for row in rows:
+        if not row.get('title'):
+            row['title'] = titles.get(row['session_id'], '')
+        if row['path'] is not None and (not row.get('title') or not row.get('cwd')):
+            head = session_head_metadata(row['path'], max_events=8)
+            row['title'] = row.get('title') or str(head.get('title') or '')
+            row['cwd'] = row.get('cwd') or str(head.get('cwd') or head.get('working_directory') or '')
+            row['project'] = row['cwd'].replace('\\', '/').rstrip('/').split('/')[-1]
+        row['modified'] = datetime.fromtimestamp(row['mtime']).isoformat(timespec='seconds') if row['mtime'] else ''
+    return rows
 
 
 def _browser_selection(raw: str, upper: int) -> list[int]:
@@ -3103,6 +3195,18 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
             pairs.append((find_session_file(sid), sid))
     for sid in args.session_id or []:
         pairs.append((find_session_file(sid), sid))
+    if args.project:
+        from codex_exporter.modern import choose_project
+        matches = choose_project(list_session_descriptors(), args.project)
+        if not matches:
+            parser.error(f"No session records matched --project {args.project!r}; inspect --audit-sessions")
+        missing = [r['session_id'] for r in matches if r.get('missing_rollout')]
+        if missing:
+            print(f"WARNING: {len(missing)} project sessions are indexed but their rollout is missing: "
+                  + ', '.join(missing), file=sys.stderr)
+        for row in matches:
+            if row['path'] is not None:
+                pairs.append((row['path'], row['session_id']))
     for path in args.jsonl or []:
         path = path.expanduser().resolve()
         if not path.is_file():
@@ -3126,7 +3230,7 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
         dedup[str(path.resolve()).casefold()] = (path, sid)
     result = list(dedup.values())
     if not result:
-        parser.error("provide --session-id, --jsonl, --sessions-file, --latest-session, or --browse")
+        parser.error("provide --session-id, --project, --jsonl, --sessions-file, --latest-session, or --browse")
     return result
 
 
@@ -3142,7 +3246,21 @@ def main() -> int:
     ap.add_argument("--sessions-file", type=Path, help="Text file containing one session UUID or JSONL path per line")
     ap.add_argument("--latest-session", action="store_true")
     ap.add_argument("--list-sessions", action="store_true")
+    ap.add_argument("--full-session-titles", action="store_true", help="Show complete single-line titles in session listings (may be very large)")
     ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
+    ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
+    ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_DIR_OR_JSON", help="Convert account-export ZIP, extracted directory, conversations.json or numbered shards")
+    ap.add_argument("--chatgpt-audit", action="store_true", help="Read-only inventory of account-export conversation shards; no Markdown written")
+    ap.add_argument("--chatgpt-id", action="append", default=[], help="Filter account export by conversation ID (repeatable)")
+    ap.add_argument("--chatgpt-title-regex", default="", help="Filter account export by conversation title regex")
+    ap.add_argument("--chatgpt-project-id", default="", help="Exact project ID; matches only records with an explicit project_id field")
+    ap.add_argument("--audit-sessions", action="store_true", help="Reconcile SQLite thread catalog with live/archived rollouts, as JSON")
+    ap.add_argument("--fast", dest="fast", action="store_true", default=None, help="Stream full threads with bounded memory")
+    ap.add_argument("--no-fast", dest="fast", action="store_false", help="Use original in-memory renderer")
+    ap.add_argument("--fast-threshold-mib", type=int, default=128, help="Auto-stream full threads this size or larger (default: 128 MiB)")
+    ap.add_argument("--progress", dest="progress", action="store_true", default=None, help="Show real-time progress on stderr")
+    ap.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress")
+    ap.add_argument("--unknown-events", choices=['report', 'sidecar'], default='report', help="Report unknown schemas, or separately preserve their raw JSONL")
 
     config_group = ap.add_argument_group("persistent configuration")
     config_group.add_argument("--show-config", action="store_true")
@@ -3252,9 +3370,38 @@ def main() -> int:
         print(configured_out_dir(cfg).resolve())
         return 0
     if args.list_sessions:
-        print_session_list()
+        print_session_list(full_titles=args.full_session_titles)
+        return 0
+    if args.audit_sessions:
+        from codex_exporter.modern import audit
+        print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
+        return 0
+    if args.chatgpt_export:
+        if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+            ap.error('--chatgpt-export cannot be combined with Codex source selectors')
+        from codex_exporter.chatgpt_archive import export_chatgpt, audit_chatgpt
+        if args.chatgpt_audit:
+            report = audit_chatgpt(args.chatgpt_export.expanduser().resolve(),
+                conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
+                project_id=args.chatgpt_project_id,
+                progress=args.progress if args.progress is not None else sys.stderr.isatty())
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
+        exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
+            conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
+            project_id=args.chatgpt_project_id,
+            progress=args.progress if args.progress is not None else sys.stderr.isatty())
+        if args.json_result:
+            print(json.dumps(exported, ensure_ascii=False))
+        else:
+            for item in exported: print(item['file'])
+        if not exported:
+            print('WARNING: no conversation records matched the supplied filters.', file=sys.stderr)
         return 0
 
+    if args.chatgpt_audit:
+        ap.error('--chatgpt-audit requires --chatgpt-export ZIP_OR_DIRECTORY')
     configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
     if args.tokenizer_info:
         print(json.dumps({"python": sys.executable, **token_counter_info()}, ensure_ascii=False, indent=2, sort_keys=True))
@@ -3288,7 +3435,57 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     clipboard_parts: list[str] = []
+    fast_catalog = None
     for source_path, supplied_sid in sources:
+        auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
+            args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
+            args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
+        use_fast = args.fast if args.fast is not None else (
+            auto_stream_eligible and source_path.stat().st_size >= args.fast_threshold_mib * 1048576
+        )
+        if use_fast:
+            if args.mode != 'thread' or args.list or args.list_responses or args.last_n_turns is not None or args.live_context:
+                ap.error('--fast only supports full chronological --mode thread (without turn limits or live-context)')
+            if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
+                ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
+            from codex_exporter.modern import discover, stream_export
+            if fast_catalog is None:
+                fast_catalog = {r['session_id']: r for r in discover(codex_home())}
+            row = fast_catalog.get(supplied_sid)
+            sid = supplied_sid or parse_session_id_from_name(source_path)
+            title = normalize_title(args.name or (row or {}).get('title') or read_session_index_title(sid) or sid or source_path.stem)
+            fast_out = out_dir
+            # Stable, collision-safe regardless of current title or clock.
+            filename = safe_export_filename('codex_' + safe_slug(title, max_len=70) + '_thread_' + sid.replace('-', '')[-8:] + '.md')
+            if args.filename_template:
+                from string import Formatter
+                accepted = {'title': safe_slug(title, max_len=70),
+                    'session_id': sid, 'session_short': sid[-8:], 'mode': 'thread', 'stamp': export_stamp()}
+                invalid = {field for _, field, _, _ in Formatter().parse(args.filename_template) if field not in accepted and field is not None}
+                if invalid:
+                    ap.error(f'--fast supports filename placeholders {sorted(accepted)} only; unsupported: {sorted(invalid)}')
+                # Reject explicit directory templates; sanitize substituted fields
+                # and any literal Windows-reserved characters without inventing subdirs.
+                if '/' in args.filename_template or '\\' in args.filename_template:
+                    ap.error('--filename-template must specify a basename, not a directory')
+                filename = safe_export_filename(args.filename_template.format(**accepted))
+            result = stream_export(source_path, fast_out / filename, session_id=sid, title=title,
+                include_reasoning_summaries=args.reasoning_summaries,
+                tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
+                strip=False,  # preserve every recorded printable character in stream mode
+                max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines,
+                source_truncation=args.source_truncation, unknown_events=args.unknown_events,
+                collision=args.collision, redact=args.redact, strict_events=args.strict_events,
+                progress=args.progress if args.progress is not None else sys.stderr.isatty())
+            results.append(result)
+            if args.report_events:
+                print(json.dumps({'stream_event_count': result.get('rendered_records'),
+                     'unknown_event_count': result.get('unknown_event_count'),
+                     'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
+            if args.open_after and result.get('file'):
+                open_in_file_manager(Path(result['file']), select=True)
+            if not args.json_result: print(result['file'])
+            continue
         reset_runtime_audit()
         include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
         records, meta = parse_session(

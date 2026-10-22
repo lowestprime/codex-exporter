@@ -1,6 +1,44 @@
-# Codex Exporter 0.2
+# Codex Exporter 0.3.2
 
 Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.
+
+## Source-event coverage fix in 0.3.2
+
+Streaming export now recognizes current capitalized desktop `item_completed` records for user/agent messages, file changes, extensions, image paths and MCP completions. Known reasoning-status and token-usage records are no longer misreported as unknown schemas; only explicit reasoning summaries are opt-in. Original JSONL remains authoritative.
+
+## Windows hotfix in 0.3.1
+
+The streaming filename builder now sanitizes Windows-reserved characters in session
+names, including Codex `/goal` titles that contain `C:\Users\...` paths.
+This resolves `WinError 123` before the first JSONL event is read. Filename
+substitutions are bounded and always create a single `.md` file in the selected
+output directory, never unintended nested directories. Large multiline titles
+are condensed to one listing row, at most 140 characters by default:
+
+```powershell
+cdx-sessions                                    # compact, valid Markdown table
+codex-export --list-sessions --full-session-titles  # expanded one-line titles
+cdx-project 'Full-Time' -UnknownSidecar
+cdx-fast 01a0fecf-02ee-77d2-99a2-59e86e27cc9e
+```
+
+Missing rollout JSONL files listed by `cdx-audit` are **not** repaired or
+fabricated; the SQLite catalog alone cannot reconstruct transcript content.
+
+## What changed in 0.3
+
+- SQLite thread catalog reconciliation for newer Windows Codex desktop sessions, including
+  missing-rollout diagnostics and Windows long-path normalization;
+- `codex-export --project Full-Time --mode thread` and PowerShell `cdx-project`, `cdx-audit`, and `cdx-fast`;
+- bounded-memory chronological Markdown writing for full threads >=128 MiB by default,
+  with byte-accurate streaming SHA-256 and progress on stderr;
+- upstream source-truncation locations, source-event audit, and optional raw unknown-event sidecars;
+- opt-in ingestion of official ChatGPT account export ZIP/`conversations.json` records
+  through `--chatgpt-export`, including recorded alternate branches;
+- fixes for standalone script/skill distribution, with new module dependencies bundled;
+- regression fixtures for the catalog, streaming, project selection, and account archive adapter.
+
+Full instructions and limitations: [docs/MODERN-WINDOWS-2026.md](docs/MODERN-WINDOWS-2026.md). The user-specific input audit is distributed privately with the downloadable review package, not committed to this public repository.
 
 ## What changed in 0.2
 
@@ -338,3 +376,40 @@ Tagged `v*` pushes build distributions and create a GitHub release. See [COMPATI
 ## Security
 
 Rollouts can contain source code, local paths, credentials, and private repository names. Use `--redact` before sharing and inspect the result. Redaction and binary/blob suppression are counted in the manifest, but pattern-based redaction is not a substitute for human review.
+
+### Windows PATH conflict repair (opt-in)
+
+After updating the package, `codex-export --version` may still invoke an old
+`%LOCALAPPDATA%\codex-exporter\venvs\0.2.0\Scripts\codex-export.exe`
+when that directory precedes the selected Python `Scripts` on PATH.
+Run `Get-Command codex-export -All` to confirm. The installer now ships
+`Repair-CodexExporterPath.ps1` alongside the installed exporter; run:
+
+```powershell
+$py = (& py -3.13 -c 'import sys; print(sys.executable)').Trim()
+& 'C:\projects\CodexTools\Repair-CodexExporterPath.ps1' -PythonPath $py
+codex-export --version
+```
+
+Or add `-RepairCommandPath` to a future installer invocation that also uses
+`-InstallPackage`. This is intentionally opt-in: the repair backs up your
+PATH and modifies only User and current-process PATH values, without deleting
+the older venv or changing Machine PATH. See
+[Windows usage notes](docs/MODERN-WINDOWS-2026.md).
+
+### Large ChatGPT account exports (numbered shards, v0.3.3)
+
+ChatGPT data backups may contain `conversations-000.json` ... `conversations-NNN.json` instead of a single `conversations.json`. The exporter accepts either the **original ZIP** or an **extracted directory**, selects shards in numeric order, and refuses missing/duplicate shards. It never extracts the ZIP or touches the original backup. For the largest shards, install the optional bounded-memory parser first: `py -3.13 -m pip install "codex-exporter[chatgpt]"`.
+
+```powershell
+$dir = Join-Path $HOME '.mychatarchive\imports\<name-of-your-extracted-backup>'
+codex-export --chatgpt-export $dir --chatgpt-audit --chatgpt-title-regex 'Codex|Full-Time|Career Application' > "$HOME\Documents\chatgpt-backup-audit.json"
+codex-export --chatgpt-export $dir --chatgpt-title-regex 'Codex|Full-Time|Career Application' --out-dir "$HOME\Documents\ChatGPT Archive Exports"
+```
+
+For `--chatgpt-audit` without filters, `matched` includes up to 1,000 inventory entries, but the aggregate count includes all records; the scan is read-only. For a targeted scan, filter by a title regex or exact exported conversation ID. Source member provenance is attached to each exported conversation. A ChatGPT backup **does not replace local Codex rollout files**; IDs are not interchangeable and there is no supported mechanism to restore cloud ChatGPT JSON as an original Codex Desktop thread.
+
+
+### Compressed Codex rollouts (`.jsonl.zst`)
+
+New in v0.3.4: Codex cold-storage rollouts are discoverable and readable without modifying originals. Install the optional decoder with `py -3.13 -m pip install "codex-exporter[zstd]"` (or `py -3.13 -m pip install zstandard`), then run `cdx-audit Full-Time` and `cdx-project Full-Time -UnknownSidecar`. Plain `.jsonl` wins when both forms exist. SQLite catalogs may retain a `.jsonl` path while the compressed sibling remains available. Only a complete JSONL/codec validation establishes content integrity.

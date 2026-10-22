@@ -22,7 +22,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[test,exact]"
+      - run: python -m pip install -e ".[test,exact,zstd]"
       - run: python tools/sync_cli.py --check
       - run: python -m pytest
       - run: codex-export --tokenizer-info --tokenizer tiktoken --token-encoding cl100k_base --require-tiktoken
@@ -35,7 +35,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           foreach ($path in @(
               'Install-CodexThreadExporter.ps1',
-              'powershell/CodexThreadExport-profile-block.v8.ps1'
+              'powershell/CodexThreadExport-profile-block.v8.ps1',
+              'powershell/Repair-CodexExporterPath.ps1'
           )) {
               $tokens = $null
               $errors = $null
@@ -45,6 +46,21 @@ jobs:
                   [ref]$errors
               )
               if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }
+          }
+
+      - name: Exercise process-only command PATH reconciliation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python).Source
+          $expected = & $python -m codex_exporter --version
+          $report = ./powershell/Repair-CodexExporterPath.ps1 -PythonPath $python -SessionOnly
+          if (-not $report.ConsoleExecutable -or $report.ExpectedVersion -ne $expected) {
+              throw 'Process-only PATH reconciliation did not identify the installed CLI version.'
+          }
+          if ((codex-export --version) -ne $expected) {
+              throw 'Repaired PATH does not resolve to the installed Codex Exporter version.'
           }
 
       - name: Verify idempotent custom-path profile installation

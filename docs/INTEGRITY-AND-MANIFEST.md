@@ -42,3 +42,13 @@ hidden API framing or server-side accounting.
 `--live-context` records compactions and rollbacks applied and labels the result
 as reconstructed. Full chronological `--mode thread` remains the authoritative
 history export.
+
+
+## v0.3 streaming manifest
+
+`stream_thread` is a separate format: it reports source SHA-256 computed during the
+read pass, source size at open and at completion, source lines, rendered records, parse
+errors, raw upstream truncation markers when recognized, and unknown event counts.
+The inline Markdown is not a byte-for-byte JSONL serialization. Use the recorded
+`source_jsonl` as the fidelity authority. Unlike the original renderer, streaming
+mode retains adjacent identical classified records and does not calculate tokens.
