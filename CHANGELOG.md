@@ -1,3 +1,8 @@
+## 0.3.3 (2026-10-22)
+- Read numbered `conversations-NNN.json` from ZIP or extracted account-export directory; validate gaps and duplicates.
+- Add read-only `--chatgpt-audit` and per-shard provenance. Require optional ijson for shards >64 MiB.
+- Preserve local Codex export behavior and existing commands.
+
 # Changelog
 
 ## 0.3.2 (proposed; audited Codex desktop event coverage)

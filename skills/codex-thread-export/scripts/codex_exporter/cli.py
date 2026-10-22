@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -3237,7 +3237,8 @@ def main() -> int:
     ap.add_argument("--full-session-titles", action="store_true", help="Show complete single-line titles in session listings (may be very large)")
     ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
     ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
-    ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_OR_JSON", help="Convert user-supplied official ChatGPT conversations.json or account export ZIP")
+    ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_DIR_OR_JSON", help="Convert account-export ZIP, extracted directory, conversations.json or numbered shards")
+    ap.add_argument("--chatgpt-audit", action="store_true", help="Read-only inventory of account-export conversation shards; no Markdown written")
     ap.add_argument("--chatgpt-id", action="append", default=[], help="Filter account export by conversation ID (repeatable)")
     ap.add_argument("--chatgpt-title-regex", default="", help="Filter account export by conversation title regex")
     ap.add_argument("--chatgpt-project-id", default="", help="Exact project ID; matches only records with an explicit project_id field")
@@ -3366,7 +3367,14 @@ def main() -> int:
     if args.chatgpt_export:
         if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
             ap.error('--chatgpt-export cannot be combined with Codex source selectors')
-        from codex_exporter.chatgpt_archive import export_chatgpt
+        from codex_exporter.chatgpt_archive import export_chatgpt, audit_chatgpt
+        if args.chatgpt_audit:
+            report = audit_chatgpt(args.chatgpt_export.expanduser().resolve(),
+                conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
+                project_id=args.chatgpt_project_id,
+                progress=args.progress if args.progress is not None else sys.stderr.isatty())
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
         out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
         exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
             conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
@@ -3380,6 +3388,8 @@ def main() -> int:
             print('WARNING: no conversation records matched the supplied filters.', file=sys.stderr)
         return 0
 
+    if args.chatgpt_audit:
+        ap.error('--chatgpt-audit requires --chatgpt-export ZIP_OR_DIRECTORY')
     configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
     if args.tokenizer_info:
         print(json.dumps({"python": sys.executable, **token_counter_info()}, ensure_ascii=False, indent=2, sort_keys=True))

@@ -396,3 +396,15 @@ Or add `-RepairCommandPath` to a future installer invocation that also uses
 PATH and modifies only User and current-process PATH values, without deleting
 the older venv or changing Machine PATH. See
 [Windows usage notes](docs/MODERN-WINDOWS-2026.md).
+
+### Large ChatGPT account exports (numbered shards, v0.3.3)
+
+ChatGPT data backups may contain `conversations-000.json` ... `conversations-NNN.json` instead of a single `conversations.json`. The exporter accepts either the **original ZIP** or an **extracted directory**, selects shards in numeric order, and refuses missing/duplicate shards. It never extracts the ZIP or touches the original backup. For the largest shards, install the optional bounded-memory parser first: `py -3.13 -m pip install "codex-exporter[chatgpt]"`.
+
+```powershell
+$dir = Join-Path $HOME '.mychatarchive\imports\<name-of-your-extracted-backup>'
+codex-export --chatgpt-export $dir --chatgpt-audit --chatgpt-title-regex 'Codex|Full-Time|Career Application' > "$HOME\Documents\chatgpt-backup-audit.json"
+codex-export --chatgpt-export $dir --chatgpt-title-regex 'Codex|Full-Time|Career Application' --out-dir "$HOME\Documents\ChatGPT Archive Exports"
+```
+
+For `--chatgpt-audit` without filters, `matched` includes up to 1,000 inventory entries, but the aggregate count includes all records; the scan is read-only. For a targeted scan, filter by a title regex or exact exported conversation ID. Source member provenance is attached to each exported conversation. A ChatGPT backup **does not replace local Codex rollout files**; IDs are not interchangeable and there is no supported mechanism to restore cloud ChatGPT JSON as an original Codex Desktop thread.
