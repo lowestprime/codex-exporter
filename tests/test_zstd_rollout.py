@@ -55,6 +55,7 @@ def test_compressed_rollout_audit_and_fast_stream(tmp_path):
         '--out-dir',str(out),'--json'])
     assert run.returncode==0,run.stderr
     results=json.loads(run.stdout)
+    if isinstance(results, dict): results=[results]
     assert len(results)==1
     markdown=Path(results[0]['file']).read_text(encoding='utf-8')
     assert 'FIRST USER TURN' in markdown and 'SECOND ASSISTANT TURN' in markdown
