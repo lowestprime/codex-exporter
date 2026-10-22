@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -634,6 +634,17 @@ def export_stamp() -> str:
 pacific_stamp = export_stamp
 
 
+def open_rollout_text(path: Path):
+    """Open ordinary or Zstandard cold Codex rollout files without extraction."""
+    if path.name.lower().endswith('.jsonl.zst'):
+        try:
+            import zstandard as zstd
+        except ImportError as exc:
+            raise RuntimeError('Compressed Codex rollouts require: py -3.13 -m pip install zstandard') from exc
+        return zstd.open(path, mode='rt', encoding='utf-8', errors='replace')
+    return path.open('r', encoding='utf-8', errors='replace')
+
+
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
@@ -650,6 +661,7 @@ def all_session_files() -> list[Path]:
     out: list[Path] = []
     for root in session_roots():
         out.extend(root.rglob("*.jsonl"))
+        out.extend(root.rglob("*.jsonl.zst"))
     return out
 
 
@@ -2389,7 +2401,7 @@ def parse_session(
     }
     last_key: tuple[str, str, str] | None = None
 
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    with open_rollout_text(path) as f:
         for seq, line in enumerate(f, 1):
             if not line.strip():
                 continue
@@ -2516,11 +2528,11 @@ def read_jsonl_set_thread_title(session_id: str) -> str:
     home = codex_home()
     sessions_dir = home / "sessions"
     # find the JSONL for this session_id
-    for p in sessions_dir.rglob(f"*{session_id}*.jsonl"):
-        if p.suffix == ".jsonl" and not p.name.endswith(".bak"):
+    for p in list(sessions_dir.rglob(f"*{session_id}*.jsonl")) + list(sessions_dir.rglob(f"*{session_id}*.jsonl.zst")):
+        if p.name.endswith((".jsonl", ".jsonl.zst")) and not p.name.endswith(".bak"):
             last_title = ""
             try:
-                with p.open("r", encoding="utf-8", errors="replace") as f:
+                with open_rollout_text(p) as f:
                     for line in f:
                         if "set_thread_title" not in line:
                             continue
@@ -2978,7 +2990,7 @@ def human_size(size: int) -> str:
 def session_head_metadata(path: Path, max_events: int = 80) -> dict[str, Any]:
     out: dict[str, Any] = {}
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
+        with open_rollout_text(path) as handle:
             for index, line in enumerate(handle):
                 if index >= max_events:
                     break

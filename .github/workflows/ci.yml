@@ -22,7 +22,7 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[test,exact]"
+      - run: python -m pip install -e ".[test,exact,zstd]"
       - run: python tools/sync_cli.py --check
       - run: python -m pytest
       - run: codex-export --tokenizer-info --tokenizer tiktoken --token-encoding cl100k_base --require-tiktoken

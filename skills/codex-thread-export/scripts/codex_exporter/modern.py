@@ -5,6 +5,8 @@ Never writes app-owned state. Local Codex rollouts are not the same as cloud Cha
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import ExitStack
+import io
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -75,7 +77,7 @@ def discover(home: Path) -> list[dict[str, Any]]:
     for folder in (home / 'sessions', home / 'archived_sessions'):
         if not folder.is_dir():
             continue
-        for path in folder.rglob('*.jsonl'):
+        for path in list(folder.rglob('*.jsonl')) + list(folder.rglob('*.jsonl.zst')):
             match = UUID.search(path.name)
             if not match:
                 continue
@@ -85,7 +87,8 @@ def discover(home: Path) -> list[dict[str, Any]]:
             except OSError:
                 continue
             old = found.get(sid)
-            if old is None or stat.st_mtime > old['mtime']:
+            # Canonical plain JSONL takes priority if both representations exist.
+            if old is None or (not path.name.endswith('.zst') and old['path'].name.endswith('.zst')) or (path.name.endswith('.zst') == old['path'].name.endswith('.zst') and stat.st_mtime > old['mtime']):
                 found[sid] = {'session_id': sid, 'path': path, 'size': stat.st_size, 'mtime': stat.st_mtime,
                               'archived': folder.name == 'archived_sessions', 'source': 'filesystem'}
     for sid, row in catalog.items():
@@ -94,6 +97,9 @@ def discover(home: Path) -> list[dict[str, Any]]:
         if item is None and raw_path:
             # Allow catalog paths outside the two conventional session roots.
             candidate = Path(raw_path[4:] if raw_path.startswith('\\\\?\\') else raw_path)
+            # Codex cold-storage compression can retain only the .jsonl.zst sibling.
+            if not candidate.is_file() and candidate.name.endswith('.jsonl'):
+                candidate = Path(str(candidate) + '.zst')
             if candidate.is_file():
                 try:
                     stat = candidate.stat()
@@ -117,6 +123,7 @@ def discover(home: Path) -> list[dict[str, Any]]:
         item.setdefault('catalog', False)
         item['project'] = clean_path(item['cwd']).split('\\')[-1] if item['cwd'] else ''
         item['missing_rollout'] = item['path'] is None
+        item['compression'] = 'zstandard' if item['path'] is not None and item['path'].name.endswith('.jsonl.zst') else 'none'
     return sorted(found.values(), key=lambda row: row['mtime'], reverse=True)
 
 
@@ -138,6 +145,7 @@ def audit(home: Path, project: str = '') -> dict[str, Any]:
         rows = choose_project(rows, project)
     return {'codex_home': str(home), 'project': project or None, 'indexed_threads': len(rows),
             'available_rollouts': sum(not r['missing_rollout'] for r in rows),
+            'compressed_rollouts': sum(r.get('compression') == 'zstandard' for r in rows),
             'missing_rollouts': [r['session_id'] for r in rows if r['missing_rollout']],
             'unindexed_rollouts': [r['session_id'] for r in rows if not r['catalog']],
             'threads': [{k: (str(v) if isinstance(v, Path) else v) for k, v in r.items()}
@@ -192,6 +200,8 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     staged_unknown = None
     sha = hashlib.sha256()
     total = source.stat().st_size
+    is_zstd = source.name.lower().endswith('.jsonl.zst')
+    decoded_size = 0
     counts: Counter[str] = Counter()
     marker_locations: list[dict[str, int]] = []
     first = time.monotonic()
@@ -203,7 +213,18 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     old_policy = cli._SOURCE_TRUNCATION_POLICY
     cli._SOURCE_TRUNCATION_POLICY = source_truncation
     try:
-        with source.open('rb', buffering=1024 * 1024) as src, temp.open('w', encoding='utf-8', newline='\n') as output:
+        with ExitStack() as stack:
+            physical = stack.enter_context(source.open('rb', buffering=1024 * 1024))
+            if is_zstd:
+                try:
+                    import zstandard as zstd
+                except ImportError as exc:
+                    raise RuntimeError('Compressed Codex rollouts require: py -3.13 -m pip install zstandard') from exc
+                decompressed = stack.enter_context(zstd.ZstdDecompressor().stream_reader(physical, read_across_frames=True, closefd=False))
+                src = stack.enter_context(io.BufferedReader(decompressed, buffer_size=1024 * 1024))
+            else:
+                src = physical
+            output = stack.enter_context(temp.open('w', encoding='utf-8', newline='\n'))
             if sidecar:
                 unk_fd, unk_path = tempfile.mkstemp(prefix='.codex-unknown-', suffix='.partial', dir=destination.parent)
                 os.close(unk_fd)
@@ -218,17 +239,19 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                              '- Token counts: intentionally omitted in this mode; not model usage accounting\n\n'
                              '## Chronological records\n\n')
                 line_no = 0
-                while src.tell() < total:
-                    # readline is bounded to the source size captured at start.
-                    available = total - src.tell()
-                    raw = src.readline(available)
+                while True:
+                    # Plain sources are bounded to their initial size; compressed
+                    # sources are decoded incrementally until frame EOF.
+                    available = max(0, total - physical.tell())
+                    raw = src.readline() if is_zstd else (src.readline(available) if available else b'')
                     if not raw:
                         break
+                    decoded_size += len(raw)
                     now = time.monotonic()
                     if progress and now - last_progress >= 1:
-                        _progress(src.tell(), total, first, force=True)
+                        _progress(min(physical.tell(), total), total, first, force=True)
                         last_progress = now
-                    if not raw.endswith(b'\n') and src.tell() == total:
+                    if not raw.endswith(b'\n') and (is_zstd or physical.tell() == total):
                         # A final complete valid JSON object need not end with newline.
                         pass
                     sha.update(raw)
@@ -305,7 +328,9 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
         manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
                     'session_id': session_id, 'title': title, 'source': str(source),
                     'source_sha256': digest, 'source_size_bytes_at_open': total,
-                    'source_size_bytes_at_end': source.stat().st_size, 'records': dict(counts),
+                    'source_size_bytes_at_end': source.stat().st_size,
+                    'source_encoding': 'zstandard' if is_zstd else 'plain',
+                    'decoded_source_bytes': decoded_size, 'records': dict(counts),
                     'parse_error_samples': error_samples, 'truncation_marker_locations': marker_locations,
                     'upstream_truncations': upstream_truncations,
                     'source_truncation_policy': source_truncation, 'redacted': redact,

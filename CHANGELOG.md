@@ -1,3 +1,10 @@
+# v0.3.4 — Read compressed Codex rollouts (2026-10-22)
+
+- Discover `.jsonl.zst` cold-storage sessions as existing rollouts (plain `.jsonl` takes precedence when both exist).
+- Stream decompress directly into archival Markdown and retain source encoding + decoded byte totals in manifest.
+- Support both compressed and plain transcripts in ordinary/full-memory parsing and session header scanning (optional `zstandard` dependency).
+- Never modify, decompress in place, or overwrite app-owned compressed source files.
+
 ## 0.3.3 (2026-10-22)
 - Read numbered `conversations-NNN.json` from ZIP or extracted account-export directory; validate gaps and duplicates.
 - Add read-only `--chatgpt-audit` and per-shard provenance. Require optional ijson for shards >64 MiB.

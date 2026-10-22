@@ -408,3 +408,8 @@ codex-export --chatgpt-export $dir --chatgpt-title-regex 'Codex|Full-Time|Career
 ```
 
 For `--chatgpt-audit` without filters, `matched` includes up to 1,000 inventory entries, but the aggregate count includes all records; the scan is read-only. For a targeted scan, filter by a title regex or exact exported conversation ID. Source member provenance is attached to each exported conversation. A ChatGPT backup **does not replace local Codex rollout files**; IDs are not interchangeable and there is no supported mechanism to restore cloud ChatGPT JSON as an original Codex Desktop thread.
+
+
+### Compressed Codex rollouts (`.jsonl.zst`)
+
+New in v0.3.4: Codex cold-storage rollouts are discoverable and readable without modifying originals. Install the optional decoder with `py -3.13 -m pip install "codex-exporter[zstd]"` (or `py -3.13 -m pip install zstandard`), then run `cdx-audit Full-Time` and `cdx-project Full-Time -UnknownSidecar`. Plain `.jsonl` wins when both forms exist. SQLite catalogs may retain a `.jsonl` path while the compressed sibling remains available. Only a complete JSONL/codec validation establishes content integrity.
