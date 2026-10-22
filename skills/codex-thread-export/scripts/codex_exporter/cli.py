@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -1326,7 +1326,7 @@ def event_key(obj: dict[str, Any]) -> str:
 
 def extract_reasoning_summary(payload: dict[str, Any]) -> str:
     """Return only Codex's explicit summary surface, never encrypted/raw reasoning."""
-    summary = payload.get("summary")
+    summary = payload.get("summary") or payload.get("summary_text")
     if not summary:
         return ""
     return extract_text(
@@ -1340,13 +1340,15 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
 
 def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool) -> str:
     top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
-    ptype = payload_type or item_type
-    if ptype == "token_count":
+    ptype = (payload_type if payload_type not in {"item_completed", "item_started", "item_updated"} else item_type).casefold()
+    if top_type == "token_usage_record" or ptype == "token_count":
         return "telemetry_token_count"
     if ptype == "agent_reasoning":
         return "raw_reasoning_not_exported"
     if ptype == "reasoning":
         return "reasoning_summary_empty" if include_reasoning_summaries else "reasoning_summary_opt_in_disabled"
+    if top_type == "event_msg" and payload_type == "item_completed" and ptype == "contextcompaction":
+        return "context_history_event"
     if top_type in {"turn_context", "session_meta", "world_state"}:
         return "metadata_only"
     if top_type == "compacted" or ptype in {"context_compacted", "thread_rolled_back"}:
@@ -1421,8 +1423,8 @@ def classify_record(
     top_type, payload, payload_type, item, item_type = event_type_blob(obj)
     type_blob = " ".join([top_type, payload_type, item_type]).lower()
 
-    reasoning_payload = item if item_type == "reasoning" else payload
-    if include_reasoning_summaries and (item_type == "reasoning" or payload_type == "reasoning"):
+    reasoning_payload = item if item_type.casefold() == "reasoning" else payload
+    if include_reasoning_summaries and (item_type.casefold() == "reasoning" or payload_type.casefold() == "reasoning"):
         summary = extract_reasoning_summary(reasoning_payload)
         if summary:
             return Record(
@@ -1433,6 +1435,49 @@ def classify_record(
                 "reasoning_summary",
                 seq,
             )
+
+    # Newer desktop/app-server item-completed snapshots have capitalized type
+    # names and do not necessarily carry a role. Earlier releases wrongly put
+    # substantive user/agent/file-change records into the unknown-event sidecar.
+    if top_type == "event_msg" and payload_type == "item_completed" and item:
+        subtype = item_type.casefold()
+        if subtype in {"usermessage", "agentmessage"}:
+            text = extract_text(item.get("content") or item.get("text") or item.get("message"),
+                strip=strip, max_line_chars=max_line_chars, max_repeated_lines=max_repeated_lines)
+            if text:
+                return Record("message", "user" if subtype == "usermessage" else "assistant",
+                              text, timestamp, item_type, seq)
+        if subtype == "filechange" and include_actions:
+            changes = item.get("changes")
+            sections = [f"File change status: {item.get('status', 'unknown')}"]
+            if isinstance(changes, dict):
+                for pathname, change in changes.items():
+                    sections.append(f"File: {pathname}")
+                    if isinstance(change, dict):
+                        sections.append(f"Change type: {change.get('type', 'unknown')}")
+                        # The complete recorded content remains intact; no excerpt cap.
+                        for field, value in change.items():
+                            if field == "type":
+                                continue
+                            sections.append(f"{field}:\n" + (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)))
+                    else:
+                        sections.append(change if isinstance(change, str) else json.dumps(change, ensure_ascii=False))
+            for field in ("stdout", "stderr"):
+                if item.get(field):
+                    sections.append(f"{field}:\n" + str(item[field]))
+            return Record("action", "tool", "\n\n".join(sections), timestamp, item_type, seq)
+        if subtype == "extension" and include_actions:
+            # Query/action/result data are meaningful even when no conventional
+            # action text keys are present. Preserve all values with their keys.
+            body = json.dumps(item, ensure_ascii=False, indent=2)
+            return Record("action", "tool", "Extension activity\n\n" + body, timestamp, item_type, seq)
+        if subtype == "imageview" and include_actions and item.get("path"):
+            return Record("note", "tool", "Image viewed (external file reference, image bytes not embedded): " + str(item["path"]),
+                          timestamp, item_type, seq)
+        if subtype == "mcptoolcall" and include_actions:
+            # Fallback for MCP items lacking the usual command/output text.
+            return Record("action", "tool", "MCP tool item\n\n" + json.dumps(item, ensure_ascii=False, indent=2),
+                          timestamp, item_type, seq)
 
     if any(h in type_blob for h in NOISY_TYPE_HINTS):
         return None
@@ -1451,7 +1496,7 @@ def classify_record(
                 return Record("message", item_role, text, timestamp, item_type, seq)
 
         if include_actions and any(h in item_type.lower() for h in ACTION_HINTS):
-            return extract_action_record(
+            parsed_action = extract_action_record(
                 item,
                 timestamp=timestamp,
                 source_type=item_type,
@@ -1462,6 +1507,8 @@ def classify_record(
                 tool_outputs=tool_outputs,
                 max_tool_chars=max_tool_chars,
             )
+            if parsed_action is not None:
+                return parsed_action
 
     # Codex app/CLI message shapes.
     if payload_type in {"user_message", "agent_message", "assistant_message"}:
@@ -1502,6 +1549,11 @@ def classify_record(
         )
         if rec:
             return rec
+
+    if (top_type == "event_msg" and payload_type == "item_completed" and
+            item_type.casefold() == "mcptoolcall" and include_actions):
+        return Record("action", "tool", "MCP tool completion\n\n" +
+                      json.dumps(item, ensure_ascii=False, indent=2), timestamp, item_type, seq)
 
     return None
 

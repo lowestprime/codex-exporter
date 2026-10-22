@@ -1,6 +1,10 @@
-# Codex Exporter 0.3
+# Codex Exporter 0.3.2
 
 Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.
+
+## Source-event coverage fix in 0.3.2
+
+Streaming export now recognizes current capitalized desktop `item_completed` records for user/agent messages, file changes, extensions, image paths and MCP completions. Known reasoning-status and token-usage records are no longer misreported as unknown schemas; only explicit reasoning summaries are opt-in. Original JSONL remains authoritative.
 
 ## Windows hotfix in 0.3.1
 

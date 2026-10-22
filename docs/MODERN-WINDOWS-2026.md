@@ -165,3 +165,9 @@ Five Full-Time sessions in the test log were indexed in SQLite but had no
 accessible corresponding JSONL in the two expected rollout roots or their
 indexed paths. This is a separate source-availability limitation, not a claim
 that their contents have been recovered.
+
+## 0.3.2 integrity note: capitalized item-completed events
+
+An audit of one 176,523-line (6,017,864,127-byte) source rollout's earlier v0.3.1 exported archive found 24,007 events in an “unknown” sidecar: 1,145 FileChange events (some with full file content), 1,243 AgentMessage, 127 UserMessage, 597 Extension, 124 ImageView, 67 McpToolCall; plus 10,607 Reasoning status events, 9,999 token-usage records, and 98 compaction boundaries. The v0.3.2 parser now distinguishes and renders the substantive types, while suppressing raw model reasoning and treating known metadata types as known ignored. The figures describe that one archived validation sample and are not universal Codex statistics.
+
+For preservation, maintain the v0.3.1 original Markdown + unknown-event sidecar and re-export source JSONL with v0.3.2 into new filenames using collision policy `rename`. The original source JSONL must be retained for independent SHA-256 verification and replay of possible source truncation. A large Markdown file may be unsuitable for direct LLM ingestion; use a separate bounded, event-aware chunking process, not naive line-level truncation.

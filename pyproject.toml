@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-exporter"
-version = "0.3.1"
+version = "0.3.2"
 description = "Fidelity-oriented Markdown exports of local OpenAI Codex session JSONL"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 (proposed; audited Codex desktop event coverage)
+
+- Recognize capitalized `event_msg/item_completed` UserMessage, AgentMessage, FileChange, Extension, ImageView, and McpToolCall items; preserve the complete recorded text, file-change content, tool results, and source-line provenance in streaming output rather than silently relegating them to an unknown-event sidecar.
+- Distinguish known telemetry (`token_usage_record`), empty reasoning-status events, and context-compaction boundaries from truly unknown schemas. The raw unknown-event sidecar now only contains genuinely unrecognized record types.
+- Support opt-in explicit `summary_text` from Reasoning events, excluding `raw_content` even when summary inclusion is requested.
+- Add regression tests for actual 2026 source shapes and an audit showing 24,007 previously unknown events in the provided user archive, including 1,145 previously omitted FileChange records.
+- The original source JSONL is still required for total fidelity, and official source-size/manifest checks do not prove that an export includes all original source bytes unless the input JSONL is independently available.
+
 ## 0.3.1 (proposed; Windows filename/listing hotfix)
 
 - Prevent Windows `WinError 123` in streaming project/single-session exports when session titles contain pasted-text attachment paths or other Windows-reserved filename characters. Sanitize both default and user-template filename substitutions, retain compact unique session IDs, and prohibit explicit subfolder templates.
