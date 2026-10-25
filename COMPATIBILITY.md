@@ -11,3 +11,7 @@
 | Tokenization | regex fallback; optional `tiktoken` encoding | Exact only for selected encoding and output text |
 
 Update this table for each tagged release with the newest Codex app/CLI versions exercised by CI or manual regression runs.
+
+| Windows ChatGPT/Codex 26.1013.40934 | User-reported target, not end-to-end validated | Local Codex `state_5.sqlite` catalog and JSONL; cloud ChatGPT/Work requires separately supplied eligible data export |
+| Large full-thread streaming | Synthetic regression verified | One JSONL event in memory at a time; runtime and peak RSS vary by event size |
+| Official ChatGPT data export ZIP/JSON | Synthetic fixture | Supports recorded conversation mapping branches; `ijson` optional/required beyond 64 MiB |

@@ -1,5 +1,5 @@
 # >>> Codex Thread Exporter helpers >>>
-# Codex Thread Exporter PowerShell 7+ helpers (v8 / exporter 0.2+).
+# Codex Thread Exporter PowerShell 7+ helpers (v8 / exporter 0.3+).
 # The Python exporter owns persistent output-directory and filename-template state.
 
 $script:CodexThreadExporter = if ($env:CODEX_THREAD_EXPORTER) {
@@ -254,4 +254,39 @@ function cdx-range {
     param([Parameter(Mandatory, Position = 0)] [string]$SessionId, [Parameter(Mandatory, Position = 1)] [int]$FromMessage, [Parameter(Mandatory, Position = 2)] [int]$ToMessage, [switch]$NoFile)
     Invoke-CodexThreadExport -SessionId $SessionId -Mode range -FromMessage $FromMessage -ToMessage $ToMessage -Plain -Clipboard -NoFile:$NoFile
 }
+# v0.3+: new non-breaking convenience functions. Existing cdx-* helpers are unchanged.
+function cdx-project {
+    param([Parameter(Mandatory, Position=0)][string]$Project, [string]$OutDir,
+          [switch]$NoProgress, [switch]$UnknownSidecar)
+    $arguments = @('--project', $Project, '--mode', 'thread')
+    if ($OutDir) { $arguments += @('--out-dir', $OutDir) }
+    $arguments += $(if ($NoProgress) { '--no-progress' } else { '--progress' })
+    if ($UnknownSidecar) { $arguments += @('--unknown-events', 'sidecar') }
+    Invoke-CodexExporterRaw -ArgumentList $arguments
+}
+function cdx-audit {
+    param([Parameter(Position=0)][string]$Project)
+    $arguments = @('--audit-sessions')
+    if ($Project) { $arguments += @('--project', $Project) }
+    Invoke-CodexExporterRaw -ArgumentList $arguments
+}
+function cdx-fast {
+    param([Parameter(Mandatory, Position=0)][string]$SessionId, [string]$OutDir,
+          [switch]$NoProgress)
+    $arguments = @('--session-id', $SessionId, '--mode', 'thread', '--fast')
+    if ($OutDir) { $arguments += @('--out-dir', $OutDir) }
+    $arguments += $(if ($NoProgress) { '--no-progress' } else { '--progress' })
+    Invoke-CodexExporterRaw -ArgumentList $arguments
+}
+function cdx-chatgpt {
+    param([Parameter(Mandatory, Position=0)][string]$Archive, [string]$TitleRegex,
+          [string]$ConversationId, [string]$ProjectId, [string]$OutDir)
+    $arguments = @('--chatgpt-export', $Archive)
+    if ($TitleRegex) { $arguments += @('--chatgpt-title-regex', $TitleRegex) }
+    if ($ConversationId) { $arguments += @('--chatgpt-id', $ConversationId) }
+    if ($ProjectId) { $arguments += @('--chatgpt-project-id', $ProjectId) }
+    if ($OutDir) { $arguments += @('--out-dir', $OutDir) }
+    Invoke-CodexExporterRaw -ArgumentList $arguments
+}
 # <<< Codex Thread Exporter helpers <<<
+

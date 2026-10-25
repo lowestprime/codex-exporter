@@ -15,3 +15,6 @@ prune dist
 # recursively included self-contained skill directories during validation.
 global-exclude *.py[cod]
 global-exclude __pycache__
+
+recursive-include codex_exporter *.py
+include docs/MODERN-WINDOWS-2026.md
