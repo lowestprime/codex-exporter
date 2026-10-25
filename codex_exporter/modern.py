@@ -117,7 +117,34 @@ def discover(home: Path) -> list[dict[str, Any]]:
                     project_id=str(row.get('project_id') or ''),
                     archived=bool(row.get('archived', item['archived'])), catalog=True,
                     db_rollout_path=raw_path)
+    # Latest deliberate rename in append-only session_index.jsonl overrides the
+    # older, sometimes stale threads.title. This does not modify app-owned state.
+    index_titles: dict[str, str] = {}
+    for index_path in (home / 'session_index.jsonl', home / 'sessions' / 'session_index.jsonl'):
+        if not index_path.is_file():
+            continue
+        try:
+            with index_path.open(encoding='utf-8', errors='replace') as index_stream:
+                for line in index_stream:
+                    try:
+                        entry = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    sid = str(entry.get('id') or entry.get('session_id') or entry.get('thread_id') or '').lower()
+                    title = next((entry[k].strip() for k in ('thread_name', 'thread_title', 'title', 'name')
+                        if isinstance(entry.get(k), str) and entry[k].strip()), '')
+                    if UUID.fullmatch(sid) and title:
+                        index_titles[sid] = title
+        except OSError:
+            pass
+    for sid, title in index_titles.items():
+        if sid in found:
+            found[sid]['title'] = title
+            found[sid]['title_source'] = 'session_index'
     for item in found.values():
+        item.setdefault('title_source', 'sqlite' if item.get('catalog') else 'source')
         item.setdefault('cwd', '')
         item.setdefault('title', '')
         item.setdefault('catalog', False)
@@ -161,7 +188,7 @@ def _progress(done: int, total: int, begin: float, *, force: bool = False) -> No
     print(msg, end='\n' if done >= total else '', file=sys.stderr, flush=True)
 
 
-def stream_export(source: Path, destination: Path, *, session_id: str, title: str,
+def stream_export(source: Path, destination: Path, *, session_id: str, title: str, title_source: str = "",
                   include_reasoning_summaries: bool = False, tool_outputs: str = 'full',
                   max_tool_chars: int = 20_000, strip: bool = False,
                   max_line_chars: int = 20_000, max_repeated_lines: int = 25,
@@ -231,13 +258,28 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                 staged_unknown = Path(unk_path)
             unknown = staged_unknown.open('wb') if staged_unknown else None
             try:
+                from .cli import yaml_quote
+                created = datetime.now().astimezone().isoformat(timespec='seconds')
+                output.write('---\n' + f'title: {yaml_quote(title)}\n'
+                             + f'session_id: {yaml_quote(session_id)}\n'
+                             + f'source_jsonl: {yaml_quote(str(source))}\n'
+                             + f'title_source: {yaml_quote(title_source or "unavailable")}\n'
+                             + f'exported_at: {yaml_quote(created)}\n'
+                             + 'mode: "thread"\n'
+                             + 'history_semantics: "chronological_source_history"\n'
+                             + f'source_encoding: {yaml_quote("zstandard" if is_zstd else "plain")}\n'
+                             + 'token_count_method: "not_computed_streaming"\n---\n\n')
                 output.write(f'# {title}\n\n')
-                output.write('> Local chronological rollout export. This is NOT reconstructed hidden model context. '
-                             'The original JSONL is the authoritative source for event fidelity.\n\n')
-                output.write(f'- Session ID: `{session_id}`\n- Source: `{source}`\n'
-                             '- Export mode: streaming, without full-memory materialization\n'
-                             '- Token counts: intentionally omitted in this mode; not model usage accounting\n\n'
-                             '## Chronological records\n\n')
+                output.write('> Local chronological rollout export. The original JSONL remains the authoritative source. '
+                             'This streaming layout cannot provide exact output token counts or the classic turn-level map.\n\n')
+                output.write('## Thread export map\n\n'
+                             '| Metric | Value |\n|---|---|\n'
+                             + f'| Thread title | {title.replace(chr(124), chr(92)+chr(124))} |\n'
+                             + f'| Session ID | `{session_id}` |\n'
+                             + f'| Source encoding | {"Zstandard" if is_zstd else "plain JSONL"} |\n'
+                             + '| Structure | Chronological source events |\n'
+                             + '| Token counts | Not computed (streaming) |\n\n'
+                             + '## Chronological records\n\n')
                 line_no = 0
                 while True:
                     # Plain sources are bounded to their initial size; compressed
@@ -314,9 +356,22 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                     output.write(f'Event schema: `{key}`  \nSource JSONL line: `{line_no}`\n\n')
                     output.write(cli.redact(rec.text, redact).rstrip() + '\n\n')
                 output.write('\n## Export integrity and truncation notes\n\n')
+                ignored_total = sum(value for key, value in counts.items() if key.startswith('ignored_'))
                 output.write('Tool-output truncation occurring *inside Codex* cannot be reversed. '
                              'Rendered content is an interpretation of locally recorded events. '
-                             'Unrecognized schemas and unparsable source lines are recorded in the sibling manifest.\n')
+                             'Unrecognized schemas and unparsable source lines are recorded in the sibling manifest.\n\n'
+                             '### Source coverage and integrity\n\n'
+                             '| Metric | Recorded value |\n|---|---:|\n'
+                             f'| Source JSONL records | {counts["source_lines"]:,} |\n'
+                             f'| Rendered chronological records | {counts["rendered_records"]:,} |\n'
+                             f'| Classified non-rendered records | {ignored_total:,} |\n'
+                             f'| Unrecognized event schemas | {counts["unknown_events"]:,} |\n'
+                             f'| JSON parse errors | {counts["parse_errors"]:,} |\n'
+                             f'| Source truncation markers | {counts["raw_truncation_markers"]:,} |\n'
+                             f'| Decoded source bytes | {decoded_size:,} |\n'
+                             f'| Decoded source SHA-256 | `{sha.hexdigest()}` |\n\n'
+                             'Counts describe recorded events, not unique conversation turns. '
+                             'This audit is derived from the original source, not a guarantee of semantic completeness.\n')
                 output.flush()
                 os.fsync(output.fileno())
             finally:
@@ -326,7 +381,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
             raise RuntimeError(f"Strict event audit failed: {counts['unknown_events']} unknown event schemas")
         digest = sha.hexdigest()
         manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
-                    'session_id': session_id, 'title': title, 'source': str(source),
+                    'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(source),
                     'source_sha256': digest, 'source_size_bytes_at_open': total,
                     'source_size_bytes_at_end': source.stat().st_size,
                     'source_encoding': 'zstandard' if is_zstd else 'plain',

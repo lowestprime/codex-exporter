@@ -413,3 +413,12 @@ For `--chatgpt-audit` without filters, `matched` includes up to 1,000 inventory 
 ### Compressed Codex rollouts (`.jsonl.zst`)
 
 New in v0.3.4: Codex cold-storage rollouts are discoverable and readable without modifying originals. Install the optional decoder with `py -3.13 -m pip install "codex-exporter[zstd]"` (or `py -3.13 -m pip install zstandard`), then run `cdx-audit Full-Time` and `cdx-project Full-Time -UnknownSidecar`. Plain `.jsonl` wins when both forms exist. SQLite catalogs may retain a `.jsonl` path while the compressed sibling remains available. Only a complete JSONL/codec validation establishes content integrity.
+
+
+### v0.3.5 title and streaming behavior
+
+The latest valid `thread_name` in `session_index.jsonl` takes precedence over stale SQLite thread titles; titles and filenames therefore reflect durable renames when available. The original SQLite/JSONL files are never changed. Stream-mode exports now include YAML frontmatter and a compact export map; full turn grouping and exact output token/line counts remain exclusive to classic mode. Filename templates are honored where the fields are computable before a stream; `{counts}` is left blank and the short session UUID is always appended if absent. Use `Update-CodexExporter-ProfileRouting.ps1` (supplied separately) to route `cdx-*` via the currently installed Python package rather than a potentially stale copied script.
+
+### v0.3.6 streaming provenance
+
+Full-thread streaming now records the title source in its Markdown frontmatter and manifest. An end-of-document summary contains the source event count, rendered/ignored/unknown counts, truncation-marker occurrences, decoded byte count, and a SHA-256 of **decoded JSONL** (not compressed `.zst` file bytes). Explicit `response_item/additional_tools` tool-catalog metadata is a recognized non-rendered event, not an unknown message. The original JSONL remains the preservation-quality record.

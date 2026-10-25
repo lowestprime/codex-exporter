@@ -1,3 +1,16 @@
+## v0.3.6 — 2026-10-25
+
+- Classify Codex Desktop `response_item/additional_tools` as known tool-catalog metadata instead of incorrectly reporting an unknown schema. No catalog definitions are emitted into user-facing transcript text.
+- Expose `title_source` in streaming Markdown frontmatter and its manifest (explicit overrides and durable sidebar rename have priority).
+- Add honest end-of-document streaming source coverage statistics and decoded source SHA-256, with no in-memory whole-transcript buffering.
+- Preserve all previous v0.3.5 filename, title, and PowerShell routing improvements; metadata reflects only validated source evidence.
+
+## 0.3.5
+- Latest append-only session-index rename overrides stale SQLite `threads.title` throughout discovery and export.
+- Stream-mode Markdown gains YAML frontmatter and compact export map.
+- Stream filename generation honors persisted templates and includes unique UUID suffix, omitting unavailable precomputed counts.
+- Optional conservative PowerShell helper-routing patch tracks the latest installed Python package.
+
 # v0.3.4 — Read compressed Codex rollouts (2026-10-22)
 
 - Discover `.jsonl.zst` cold-storage sessions as existing rollouts (plain `.jsonl` takes precedence when both exist).

@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.4"
+__version__ = "0.3.6"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -1353,6 +1353,8 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
 def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool) -> str:
     top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
     ptype = (payload_type if payload_type not in {"item_completed", "item_started", "item_updated"} else item_type).casefold()
+    if top_type == "response_item" and ptype == "additional_tools":
+        return "tool_catalog_metadata"
     if top_type == "token_usage_record" or ptype == "token_count":
         return "telemetry_token_count"
     if ptype == "agent_reasoning":
@@ -2641,7 +2643,7 @@ def discover_title(records: list[Record], meta: dict[str, Any], override: str | 
     # guesses. This prevents a long first prompt from replacing a manually renamed
     # Codex thread title.
     if session_id:
-        for fn in (read_sqlite_title, read_session_index_title, read_jsonl_set_thread_title):
+        for fn in (read_session_index_title, read_sqlite_title, read_jsonl_set_thread_title):
             title = fn(session_id)
             if title:
                 return normalize_title(title)
@@ -3020,8 +3022,8 @@ def session_descriptor(path: Path, title_map: dict[str, str] | None = None) -> d
     if sid:
         title = (
             (title_map or {}).get(sid.lower(), "")
-            or read_sqlite_title(sid)
             or read_session_index_title(sid)
+            or read_sqlite_title(sid)
             or str(head.get("title") or "")
         )
     cwd = str(head.get("cwd") or head.get("working_directory") or head.get("workspace") or "")
@@ -3045,8 +3047,8 @@ def list_session_descriptors() -> list[dict[str, Any]]:
     rows = discover(codex_home())
     titles = read_all_session_index_titles()
     for row in rows:
-        if not row.get('title'):
-            row['title'] = titles.get(row['session_id'], '')
+        # Append-only session index carries the latest deliberate rename.
+        row['title'] = titles.get(row['session_id'], '') or row.get('title', '')
         if row['path'] is not None and (not row.get('title') or not row.get('cwd')):
             head = session_head_metadata(row['path'], max_events=8)
             row['title'] = row.get('title') or str(head.get('title') or '')
@@ -3453,23 +3455,32 @@ def main() -> int:
                 fast_catalog = {r['session_id']: r for r in discover(codex_home())}
             row = fast_catalog.get(supplied_sid)
             sid = supplied_sid or parse_session_id_from_name(source_path)
-            title = normalize_title(args.name or (row or {}).get('title') or read_session_index_title(sid) or sid or source_path.stem)
+            index_title = read_session_index_title(sid) if not args.name else ''
+            title = normalize_title(args.name or index_title or (row or {}).get('title') or sid or source_path.stem)
+            title_source = ('user_override' if args.name else 'session_index' if index_title else
+                            (row or {}).get('title_source') or 'catalog_fallback')
             fast_out = out_dir
-            # Stable, collision-safe regardless of current title or clock.
-            filename = safe_export_filename('codex_' + safe_slug(title, max_len=70) + '_thread_' + sid.replace('-', '')[-8:] + '.md')
-            if args.filename_template:
-                from string import Formatter
-                accepted = {'title': safe_slug(title, max_len=70),
-                    'session_id': sid, 'session_short': sid[-8:], 'mode': 'thread', 'stamp': export_stamp()}
-                invalid = {field for _, field, _, _ in Formatter().parse(args.filename_template) if field not in accepted and field is not None}
-                if invalid:
-                    ap.error(f'--fast supports filename placeholders {sorted(accepted)} only; unsupported: {sorted(invalid)}')
-                # Reject explicit directory templates; sanitize substituted fields
-                # and any literal Windows-reserved characters without inventing subdirs.
-                if '/' in args.filename_template or '\\' in args.filename_template:
-                    ap.error('--filename-template must specify a basename, not a directory')
-                filename = safe_export_filename(args.filename_template.format(**accepted))
+            # Apply the same persisted naming preference as the classic renderer.
+            # Stream mode cannot honestly compute exact full-output token counts
+            # before writing; leave {counts} blank and record this in the manifest.
+            from string import Formatter
+            stream_template = template
+            accepted = {'title': safe_slug(title, max_len=70), 'session_id': sid,
+                'session_short': sid[-8:], 'session_short_part': '_' + sid[-8:],
+                'mode': 'thread', 'stamp': export_stamp(), 'counts': ''}
+            invalid = {field for _, field, _, _ in Formatter().parse(stream_template)
+                if field not in accepted and field is not None}
+            if invalid:
+                ap.error('Streaming filename template cannot use precomputed output metrics: '
+                         + ', '.join(sorted(invalid)))
+            if '/' in stream_template or '\\' in stream_template:
+                ap.error('--filename-template must specify a basename, not a directory')
+            filename = safe_export_filename(stream_template.format(**accepted))
+            # A short UUID is essential to avoid collisions between identically titled threads.
+            if sid[-8:].lower() not in filename.lower():
+                filename = safe_export_filename(Path(filename).stem + '_' + sid[-8:] + '.md')
             result = stream_export(source_path, fast_out / filename, session_id=sid, title=title,
+                title_source=title_source,
                 include_reasoning_summaries=args.reasoning_summaries,
                 tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
                 strip=False,  # preserve every recorded printable character in stream mode

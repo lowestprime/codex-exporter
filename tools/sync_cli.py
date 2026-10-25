@@ -10,6 +10,7 @@ SOURCE = ROOT / "Export-CodexThread.py"
 TARGETS = (
     ROOT / "codex_exporter" / "cli.py",
     ROOT / "skills" / "codex-thread-export" / "scripts" / "Export-CodexThread.py",
+    ROOT / "skills" / "codex-thread-export" / "scripts" / "codex_exporter" / "cli.py",
 )
 
 
