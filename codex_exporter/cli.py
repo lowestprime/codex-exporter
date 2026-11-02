@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.6"
+__version__ = "0.3.8"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -3244,6 +3244,7 @@ def main() -> int:
     )
     ap.add_argument("--version", action="version", version=f"codex-export {__version__}")
     ap.add_argument("--session-id", action="append", help="Session UUID; repeat for batch export")
+    ap.add_argument("session_ids", nargs="*", help="Optional positional session UUID(s)")
     ap.add_argument("--jsonl", action="append", type=Path, help="Direct JSONL path; repeat for batch export")
     ap.add_argument("--sessions-file", type=Path, help="Text file containing one session UUID or JSONL path per line")
     ap.add_argument("--latest-session", action="store_true")
@@ -3316,6 +3317,23 @@ def main() -> int:
     ap.add_argument("--no-manifest", dest="manifest", action="store_false")
     ap.add_argument("--manifest-path", type=Path)
 
+    # Safe archive pipeline: persisted defaults are overridden only for this invocation.
+    pipeline = ap.add_argument_group('verified export archive')
+    pipeline.add_argument('--archive', dest='archive_enabled', action='store_true', default=None)
+    pipeline.add_argument('--no-archive', dest='archive_enabled', action='store_false')
+    pipeline.add_argument('--source-copy', dest='copy_source', action='store_true', default=None)
+    pipeline.add_argument('--no-source-copy', dest='copy_source', action='store_false')
+    pipeline.add_argument('--archive-cleanup', dest='archive_cleanup', action='store_true', default=None)
+    pipeline.add_argument('--no-archive-cleanup', dest='archive_cleanup', action='store_false')
+    pipeline.add_argument('--archiver-path', help='Exact 7-Zip-compatible CLI executable; auto-discovered otherwise')
+    pipeline.add_argument('--archive-level', type=int)
+    pipeline.add_argument('--archive-method', choices=['LZMA', 'Deflate'])
+    pipeline.add_argument('--archive-dictionary', help='LZMA dictionary size, e.g. 256m')
+    pipeline.add_argument('--archive-word-size', type=int)
+    pipeline.add_argument('--archive-threads', type=int)
+    pipeline.add_argument('--show-archive-config', action='store_true')
+    pipeline.add_argument('--set-archive-default', action='append', metavar='KEY=VALUE',
+                          help='Persist a default (archive, copy_source, cleanup, archiver, level, method, dictionary, word_size, threads)')
     ap.add_argument("--tokenizer", choices=["auto", "tiktoken", "regex"], default="auto")
     ap.add_argument("--token-encoding", default=DEFAULT_TOKEN_ENCODING)
     ap.add_argument("--require-tiktoken", action="store_true")
@@ -3331,8 +3349,61 @@ def main() -> int:
     ap.add_argument("--max-tool-chars", type=int, default=20_000)
     ap.add_argument("--json", dest="json_result", action="store_true")
     args = ap.parse_args()
+    if args.session_ids:
+        args.session_id = list(args.session_id or []) + args.session_ids
+
+    from dataclasses import asdict
+    from codex_exporter.archive_pipeline import ArchiveSettings, package_export
 
     cfg = load_config()
+    if args.set_archive_default:
+        defaults = dict(cfg.get('archive_defaults') or {})
+        conversions = {'archive': ('archive', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
+                       'copy_source': ('copy_source', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
+                       'cleanup': ('cleanup', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
+                       'archiver': ('archiver', str), 'level': ('level', int),
+                       'method': ('method', str), 'dictionary': ('dictionary', str),
+                       'word_size': ('word_size', int), 'threads': ('threads', int)}
+        for setting in args.set_archive_default:
+            if '=' not in setting:
+                ap.error('--set-archive-default must use KEY=VALUE')
+            key, raw = setting.split('=', 1)
+            if key not in conversions:
+                ap.error(f'Unsupported archive default: {key}')
+            if key in ('archive', 'copy_source', 'cleanup') and raw.lower() not in ('true','false','yes','no','on','off','1','0'):
+                ap.error(f'Expected boolean value for {key}')
+            field, convert = conversions[key]
+            try:
+                defaults[field] = convert(raw)
+            except ValueError as exc:
+                ap.error(f'Bad value for {key}: {exc}')
+        try:
+            ArchiveSettings(**defaults).validate()
+        except (TypeError, ValueError) as exc:
+            ap.error(str(exc))
+        cfg['archive_defaults'] = defaults
+        save_config(cfg)
+        print(json.dumps(defaults, indent=2, sort_keys=True))
+        return 0
+    if args.show_archive_config:
+        print(json.dumps(asdict(ArchiveSettings(**(cfg.get('archive_defaults') or {}))), indent=2, sort_keys=True))
+        return 0
+
+    archive_options = dict(cfg.get('archive_defaults') or {})
+    for argument, field in (('archive_enabled', 'archive'), ('copy_source', 'copy_source'),
+                            ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'),
+                            ('archive_level', 'level'), ('archive_method', 'method'),
+                            ('archive_dictionary', 'dictionary'), ('archive_word_size', 'word_size'),
+                            ('archive_threads', 'threads')):
+        value = getattr(args, argument)
+        if value is not None:
+            archive_options[field] = value
+    try:
+        archive_settings = ArchiveSettings(**archive_options)
+        archive_settings.validate()
+    except (TypeError, ValueError) as exc:
+        ap.error(f'Invalid archive configuration: {exc}')
+
     if args.reset_config:
         config_path().unlink(missing_ok=True)
         print(config_path())
@@ -3412,7 +3483,14 @@ def main() -> int:
 
     global _SOURCE_TRUNCATION_POLICY
     _SOURCE_TRUNCATION_POLICY = args.source_truncation
+    if args.redact and archive_settings.copy_source and not args.no_file:
+        ap.error('--redact does not redact the native JSONL; use --no-source-copy or --no-archive --no-source-copy')
     sources = resolve_source_paths(args, ap)
+    if archive_settings.archive and not args.no_file and not args.list and not args.list_responses:
+        if not args.manifest:
+            ap.error('Default archive needs a manifest; pass --manifest or --no-archive')
+        from codex_exporter.archive_pipeline import find_archiver
+        find_archiver(archive_settings.archiver)  # Fail before generating output if unavailable.
     if args.save_as and len(sources) != 1:
         ap.error("--save-as is only valid for a single source")
     if args.manifest_path and len(sources) != 1:
@@ -3439,6 +3517,7 @@ def main() -> int:
     clipboard_parts: list[str] = []
     fast_catalog = None
     for source_path, supplied_sid in sources:
+        source_stat_at_start = source_path.stat()
         auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
             args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
             args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
@@ -3479,7 +3558,9 @@ def main() -> int:
             # A short UUID is essential to avoid collisions between identically titled threads.
             if sid[-8:].lower() not in filename.lower():
                 filename = safe_export_filename(Path(filename).stem + '_' + sid[-8:] + '.md')
-            result = stream_export(source_path, fast_out / filename, session_id=sid, title=title,
+            from codex_exporter.archive_pipeline import avoid_existing_archive
+            stream_path = avoid_existing_archive(fast_out / filename, args.collision) if archive_settings.archive else fast_out / filename
+            result = stream_export(source_path, stream_path, session_id=sid, title=title,
                 title_source=title_source,
                 include_reasoning_summaries=args.reasoning_summaries,
                 tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
@@ -3488,14 +3569,21 @@ def main() -> int:
                 source_truncation=args.source_truncation, unknown_events=args.unknown_events,
                 collision=args.collision, redact=args.redact, strict_events=args.strict_events,
                 progress=args.progress if args.progress is not None else sys.stderr.isatty())
+            if result.get('source_changed_during_export'):
+                raise RuntimeError(f'Codex source changed during export: {source_path}; no archive cleanup performed')
+            if result.get('file') and not result.get('skipped'):
+                new_stat = source_path.stat()
+                if (archive_settings.archive or archive_settings.copy_source) and (new_stat.st_size, new_stat.st_mtime_ns) != (source_stat_at_start.st_size, source_stat_at_start.st_mtime_ns):
+                    raise RuntimeError('Codex source changed while exporting; refusing to archive this snapshot')
+                result = package_export(result, source_path, archive_settings)
             results.append(result)
             if args.report_events:
                 print(json.dumps({'stream_event_count': result.get('rendered_records'),
                      'unknown_event_count': result.get('unknown_event_count'),
                      'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
-            if args.open_after and result.get('file'):
-                open_in_file_manager(Path(result['file']), select=True)
-            if not args.json_result: print(result['file'])
+            if args.open_after and (result.get('archive') or result.get('file')):
+                open_in_file_manager(Path(result.get('archive') or result['file']), select=True)
+            if not args.json_result: print(result.get('archive') or result.get('file'))
             continue
         reset_runtime_audit()
         include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
@@ -3556,6 +3644,9 @@ def main() -> int:
                 if args.remember_out_dir:
                     cfg["last_out_dir"] = str(candidate.parent.resolve())
                     save_config(cfg)
+            if archive_settings.archive:
+                from codex_exporter.archive_pipeline import avoid_existing_archive
+                candidate = avoid_existing_archive(candidate, args.collision)
             output_path = resolve_collision(candidate, args.collision)
             if output_path is not None:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3582,9 +3673,14 @@ def main() -> int:
             "parse_error_count": len(meta.get("_parse_errors", [])), "repaired_json_line_count": len(meta.get("_repaired_json_lines", [])),
             "redacted": bool(args.redact), "models": collect_models(selected_records, meta),
         }
+        if output_path is not None:
+            new_stat = source_path.stat()
+            if (archive_settings.archive or archive_settings.copy_source) and (new_stat.st_size, new_stat.st_mtime_ns) != (source_stat_at_start.st_size, source_stat_at_start.st_mtime_ns):
+                raise RuntimeError('Codex source changed while exporting; refusing to archive this snapshot')
+            result = package_export(result, source_path, archive_settings)
         results.append(result)
         if not args.json_result and output_path:
-            print(output_path)
+            print(result.get('archive') or output_path)
 
     if args.clipboard and clipboard_parts:
         copy_to_clipboard("\n\n".join(clipboard_parts))

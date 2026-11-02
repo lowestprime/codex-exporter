@@ -14,7 +14,7 @@ SAMPLE = ROOT / 'tests/fixtures/sample-session.jsonl'
 
 
 def cli(args: list[str], home: Path, **opts):
-    return subprocess.run([sys.executable, str(ENTRY), *args], capture_output=True, encoding='utf-8',
+    return subprocess.run([sys.executable, str(ENTRY), '--no-archive', *args], capture_output=True, encoding='utf-8',
         text=True, timeout=40, env={**os.environ, 'CODEX_HOME': str(home),
                                   'CODEX_EXPORT_CONFIG': str(home / 'config.json'), **opts})
 

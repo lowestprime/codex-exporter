@@ -37,7 +37,7 @@ def fixture(tmp_path: Path):
 
 
 def cli(env,args):
-    return subprocess.run([sys.executable,str(ENTRY),*args],env=env,timeout=30,capture_output=True,text=True)
+    return subprocess.run([sys.executable,str(ENTRY), '--no-archive',*args],env=env,timeout=30,capture_output=True,text=True)
 
 
 def test_compressed_rollout_audit_and_fast_stream(tmp_path):

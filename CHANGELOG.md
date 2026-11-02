@@ -1,3 +1,19 @@
+## 0.3.8 — ZIP mixed Store/LZMA validation and PowerShell wrapper fix (2026-11-02)
+- Correct per-member ZIP verification: allow Store (0) when 7-Zip decides LZMA is wasteful for a short or incompressible member, while rejecting unauthorized algorithms, unexpected member paths, duplicates or corrupt content.
+- Preserve full SHA-256/size verification and fail-closed deletion semantics.
+- Reject a substantive (>=64 KiB) entirely uncompressed archive instead of incorrectly reporting LZMA success.
+- Return effective per-member methods in `archive_member_methods` and flag `archive_used_store_fallback` in JSON output.
+- Repair dictionary-key membership in all PowerShell `cdx-*` archive-option forwarders; Windows smoke tests cover ten invocations without exporting real rollouts.
+- Synchronize the packaged Codex skill archive pipeline with the installed package implementation.
+
+## 0.3.7 — Safe archival exports (2026-11-01)
+
+- Default validated three-member ZIP/LZMA/Ultra archive per Codex session export, including an identical-stem decoded JSONL copy and manifest. Original Codex source untouched.
+- Full SHA-256 member verification, no archive overwrite, per-job overrides and persistent archive defaults.
+- Auto-discovery for compatible installed 7-Zip, 7-Zip ZS and PeaZip backend CLIs; explicit --archiver-path for NanaZip/other installs.
+- Cleanup of loose export triplet only after archive verified; unknown-event sidecars remain outside by design.
+- Archive result metadata identifies the ZIP and archived members; JSON outputs no longer claim removed loose files remain present.
+
 ## v0.3.6 — 2026-10-25
 
 - Classify Codex Desktop `response_item/additional_tools` as known tool-catalog metadata instead of incorrectly reporting an unknown schema. No catalog definitions are emitted into user-facing transcript text.
