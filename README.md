@@ -1,3 +1,79 @@
+# 0.3.8 targeted hotfix (2026-11-02)
+
+7-Zip-family ZIP writers may use **Store (ZIP method 0)** for individual tiny or
+non-compressible members even when `-mm=LZMA` (method 14) is requested. The
+v0.3.7 validator incorrectly required every ZIP member to use method 14.
+0.3.8 accepts member-level Store fallback, but still validates three distinct
+flat members, no encryption, independently decompressed SHA-256 and size for
+all members, and requires the requested compression method to appear for any
+archive containing >=64 KiB of source bytes. The `--json` result reports
+`archive_member_methods` and `archive_used_store_fallback`. All original Codex
+session sources remain untouched; cleanup occurs only after verification.
+This version includes the verified 2026-11-02 Windows archive and PowerShell wrapper fixes.
+
+# Codex Exporter 0.3.8 — ZIP Store fallback verification hotfix
+
+**Archive workflow introduced in v0.3.7, finalized in v0.3.8:**
+For every file-producing local Codex session export, the exporter now writes the Markdown
+and manifest, creates a same-stem copy of the complete session source as plain `.jsonl`,
+compresses the three flat files into `<same-stem>.zip` using an installed 7-Zip-compatible
+CLI (`-tzip -mm=LZMA -mx=9 -md=256m -mfb=64 -mmt=19`), **independently reads and
+SHA-256-verifies all ZIP members**, then deletes only those three loose files. Original
+Codex `.jsonl` / `.jsonl.zst` and its SQLite data are never changed. A compressed
+original is streamed into decoded plain `.jsonl` for the archive. The ZIP stores
+exactly `.md`, `.manifest.json` and `.jsonl`, with no directory entries. Unknown-event
+sidecars (if requested) are intentionally *not* included or deleted.
+
+## Windows upgrade (same CPython 3.13 interpreter as v0.3.6)
+
+```powershell
+$repo = "$HOME\Downloads\codex-exporter-v0.3.8"
+$py = (& py -3.13 -c 'import sys; print(sys.executable)').Trim()
+& $py -m pip install --upgrade "$repo[zstd]"
+& $py -m codex_exporter --version
+& "$repo\Install-CodexExporter-ArchiveOverrides.ps1" -WhatIf
+& "$repo\Install-CodexExporter-ArchiveOverrides.ps1"
+# Start a new PowerShell 7 terminal, then:
+cdx-archive-config
+cdx-thread '01a0fecf-02ee-77d2-99a2-59e86e27cc9e' -NoArchiveCleanup
+```
+
+**First test with `--no-archive-cleanup`** to retain all three original exported files,
+until you confirm the archiver binary and settings on your actual Windows installation.
+Use `--archiver-path 'C:\path\to\7z.exe'` if autodetection cannot find the installed
+7-Zip, 7-Zip ZS or PeaZip backend. NanaZip desktop GUI executables are not guaranteed
+to provide an equivalent noninteractive CLI.
+
+```powershell
+# Individual job switches (no persistent config changes):
+codex-export --mode thread --session-id UUID --no-archive
+codex-export --mode thread --session-id UUID --no-source-copy
+codex-export --mode thread --session-id UUID --no-archive-cleanup
+codex-export --mode thread --session-id UUID --archive-level 7 --archive-threads 8
+cdx-thread UUID -NoArchive
+cdx-project 'Full-Time' -NoArchiveCleanup
+cdx-batch @('UUID1', 'UUID2') -NoSourceCopy
+
+# Persistent defaults (stored in existing exporter config.json):
+codex-export --show-archive-config
+codex-export --set-archive-default cleanup=false
+codex-export --set-archive-default level=9 --set-archive-default threads=19
+codex-export --set-archive-default archiver='C:\Program Files\7-Zip\7z.exe'
+```
+
+**Safety:** archive failure preserves the loose files and app-owned source. A successful
+archive is not visible as a loose `.md`; `--json` returns `archive` and
+`archive_members`, with `file` and `manifest` set to null after cleanup. `--redact`
+refuses to package an unredacted JSONL copy unless `--no-source-copy` is specified.
+For no-file / clipboard-only operations, no ZIP is produced. Archive creation does
+not guarantee byte-for-byte simultaneous snapshots of actively changing Codex sessions;
+the exporter detects changed size/mtime and source SHA mismatches, then declines cleanup.
+ZIP LZMA is method 14 and has lower extraction compatibility than standard DEFLATE.
+Default compression settings may need a backend-specific adjustment on older 7z binaries;
+failed commands leave originals intact.
+
+---
+
 # Codex Exporter 0.3.2
 
 Fidelity-oriented Markdown exports of local OpenAI Codex app/CLI session JSONL. The exporter remains noninteractive and automation-first by default, with optional native dialogs and a terminal browser when they are useful.

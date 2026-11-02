@@ -15,7 +15,7 @@ def conv(cid,title,project=None):
     return c
 
 def execute(tmp_path,*args):
-    return subprocess.run([sys.executable,str(ROOT/'Export-CodexThread.py'),*map(str,args)],
+    return subprocess.run([sys.executable,str(ROOT/'Export-CodexThread.py'), '--no-archive',*map(str,args)],
         cwd=tmp_path,text=True,capture_output=True,timeout=30,
         env={**os.environ,'CODEX_HOME':str(tmp_path/'.codex'),
              'CODEX_EXPORT_CONFIG':str(tmp_path/'config.json')})

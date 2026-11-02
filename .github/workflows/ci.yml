@@ -26,7 +26,7 @@ jobs:
       - run: python tools/sync_cli.py --check
       - run: python -m pytest
       - run: codex-export --tokenizer-info --tokenizer tiktoken --token-encoding cl100k_base --require-tiktoken
-      - run: codex-export --jsonl tests/fixtures/sample-session.jsonl --mode thread --out-dir .ci-output --tokenizer tiktoken --token-encoding cl100k_base --json
+      - run: codex-export --no-archive --jsonl tests/fixtures/sample-session.jsonl --mode thread --out-dir .ci-output --tokenizer tiktoken --token-encoding cl100k_base --json
 
       - name: Validate PowerShell syntax
         if: runner.os == 'Windows'
@@ -36,7 +36,9 @@ jobs:
           foreach ($path in @(
               'Install-CodexThreadExporter.ps1',
               'powershell/CodexThreadExport-profile-block.v8.ps1',
-              'powershell/Repair-CodexExporterPath.ps1'
+              'powershell/Repair-CodexExporterPath.ps1',
+              'Install-CodexExporter-ArchiveOverrides.ps1',
+              'powershell/CodexExporter-ArchiveOverrides.ps1'
           )) {
               $tokens = $null
               $errors = $null
@@ -47,6 +49,11 @@ jobs:
               )
               if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }
           }
+
+      - name: Exercise PowerShell archive wrapper forwarding (no real Codex exports)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./powershell/Test-CodexExporterArchiveOverrides.ps1
 
       - name: Exercise process-only command PATH reconciliation
         if: runner.os == 'Windows'

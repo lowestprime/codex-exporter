@@ -20,7 +20,7 @@ def run(args: list[str], tmp_path: Path, *, source: Path = SAMPLE, check: bool =
     env["CODEX_EXPORT_CONFIG"] = str(tmp_path / "config.json")
     if extra_env:
         env.update(extra_env)
-    cmd = [sys.executable, str(SCRIPT), "--jsonl", str(source), *args]
+    cmd = [sys.executable, str(SCRIPT), '--no-archive', "--jsonl", str(source), *args]
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env, check=check, timeout=45)
 
 
@@ -85,7 +85,7 @@ def test_batch_collision_and_short_ids(tmp_path: Path) -> None:
     out = tmp_path / "out"
     env = os.environ.copy()
     env["CODEX_EXPORT_CONFIG"] = str(tmp_path / "config.json")
-    cmd = [sys.executable, str(SCRIPT), "--jsonl", str(SAMPLE), "--jsonl", str(copy), "--mode", "thread", "--out-dir", str(out), "--tokenizer", "regex", "--json"]
+    cmd = [sys.executable, str(SCRIPT), '--no-archive', "--jsonl", str(SAMPLE), "--jsonl", str(copy), "--mode", "thread", "--out-dir", str(out), "--tokenizer", "regex", "--json"]
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env, check=True, timeout=45)
     rows = json.loads(result.stdout.strip().splitlines()[-1])
     assert len(rows) == 2
@@ -99,8 +99,8 @@ def test_persistent_directory(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["CODEX_EXPORT_CONFIG"] = str(config)
     target = tmp_path / "remembered"
-    subprocess.run([sys.executable, str(SCRIPT), "--set-default-out-dir", str(target)], env=env, check=True, capture_output=True, text=True, timeout=45)
-    result = subprocess.run([sys.executable, str(SCRIPT), "--print-out-dir"], env=env, check=True, capture_output=True, text=True, timeout=45)
+    subprocess.run([sys.executable, str(SCRIPT), '--no-archive', "--set-default-out-dir", str(target)], env=env, check=True, capture_output=True, text=True, timeout=45)
+    result = subprocess.run([sys.executable, str(SCRIPT), '--no-archive', "--print-out-dir"], env=env, check=True, capture_output=True, text=True, timeout=45)
     assert Path(result.stdout.strip()) == target.resolve()
 
 
@@ -113,7 +113,7 @@ def test_archived_session_discovery(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
     env["CODEX_EXPORT_CONFIG"] = str(tmp_path / "config.json")
-    result = subprocess.run([sys.executable, str(SCRIPT), "--list-sessions"], env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
+    result = subprocess.run([sys.executable, str(SCRIPT), '--no-archive', "--list-sessions"], env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
     assert "44444444-4444-7444-8444-444444444444" in result.stdout
 
 
@@ -179,7 +179,7 @@ def test_all_export_modes_in_one_process(tmp_path: Path, monkeypatch: pytest.Mon
     for mode, extra in modes:
         out = tmp_path / mode
         monkeypatch.setattr(sys, "argv", [
-            "codex-export", "--jsonl", str(SAMPLE), "--mode", mode, *extra,
+            "codex-export", "--no-archive", "--jsonl", str(SAMPLE), "--mode", mode, *extra,
             "--out-dir", str(out), "--tokenizer", "regex", "--json",
         ])
         assert cli.main() == 0
@@ -238,7 +238,7 @@ def test_sessions_file_batch_input(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["CODEX_EXPORT_CONFIG"] = str(tmp_path / "config.json")
     result = subprocess.run([
-        sys.executable, str(SCRIPT), "--sessions-file", str(inputs), "--mode", "thread",
+        sys.executable, str(SCRIPT), '--no-archive', "--sessions-file", str(inputs), "--mode", "thread",
         "--out-dir", str(tmp_path / "out"), "--tokenizer", "regex", "--json",
     ], env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
     assert len(json.loads(result.stdout.strip().splitlines()[-1])) == 2
@@ -257,7 +257,7 @@ def test_browser_single_selection(tmp_path: Path) -> None:
     # The CLI must override it so terminal-browser and --json output stay UTF-8.
     env["PYTHONIOENCODING"] = "cp1252"
     result = subprocess.run([
-        sys.executable, str(SCRIPT), "--browse", "--mode", "thread", "--out-dir", str(tmp_path / "out"),
+        sys.executable, str(SCRIPT), '--no-archive', "--browse", "--mode", "thread", "--out-dir", str(tmp_path / "out"),
         "--tokenizer", "regex", "--json",
     ], input="1\n", env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
     assert "Codex session browser —" in result.stdout
@@ -280,11 +280,11 @@ def test_stable_filename_and_template_config_commands(tmp_path: Path) -> None:
     env = os.environ.copy()
     env["CODEX_EXPORT_CONFIG"] = str(tmp_path / "config.json")
     custom = "archive_{title}_{mode}{session_short_part}.md"
-    subprocess.run([sys.executable, str(SCRIPT), "--set-filename-template", custom], env=env, check=True, capture_output=True, text=True, timeout=45)
-    shown = subprocess.run([sys.executable, str(SCRIPT), "--print-filename-template"], env=env, check=True, capture_output=True, text=True, timeout=45)
+    subprocess.run([sys.executable, str(SCRIPT), '--no-archive', "--set-filename-template", custom], env=env, check=True, capture_output=True, text=True, timeout=45)
+    shown = subprocess.run([sys.executable, str(SCRIPT), '--no-archive', "--print-filename-template"], env=env, check=True, capture_output=True, text=True, timeout=45)
     assert shown.stdout.strip() == custom
     result = subprocess.run([
-        sys.executable, str(SCRIPT), "--jsonl", str(SAMPLE), "--mode", "thread", "--stable-filenames",
+        sys.executable, str(SCRIPT), '--no-archive', "--jsonl", str(SAMPLE), "--mode", "thread", "--stable-filenames",
         "--out-dir", str(tmp_path / "out"), "--tokenizer", "regex", "--json",
     ], env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
     name = Path(json.loads(result.stdout.strip().splitlines()[-1])["file"]).name

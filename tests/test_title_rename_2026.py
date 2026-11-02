@@ -32,7 +32,7 @@ def test_stream_title_and_headers_end_to_end(tmp_path, monkeypatch):
     cx.execute('insert into threads values (?,?,?,?,?)',(SID,'C:/work/Full-Time','/goal stale title',0,str(raw)));cx.commit();cx.close()
     (home/'session_index.jsonl').write_text(json.dumps({'id':SID,'thread_name':'ORCHESTRATOR'})+'\n')
     dest=tmp_path/'out';env={**os.environ,'CODEX_HOME':str(home),'PYTHONPATH':str(Path(__file__).resolve().parents[1])}
-    run=subprocess.run([sys.executable,'-m','codex_exporter','--mode','thread','--session-id',SID,'--fast','--no-progress','--out-dir',str(dest)],env=env,text=True,capture_output=True,timeout=15)
+    run=subprocess.run([sys.executable,'-m','codex_exporter', '--no-archive','--mode','thread','--session-id',SID,'--fast','--no-progress','--out-dir',str(dest)],env=env,text=True,capture_output=True,timeout=15)
     assert run.returncode==0,run.stderr
     output=next(dest.glob('*.md'));md=output.read_text()
     assert 'orchestrator' in output.name.lower() and SID[-8:] in output.name
