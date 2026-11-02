@@ -3,12 +3,15 @@ name: release
 on:
   push:
     tags: ['v*']
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
+    # Preserve tag releases; a deliberately named squash-merge can publish a new version once.
+    if: "${{ github.ref_type == 'tag' || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: publish v0.3.8')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,9 +21,26 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install --upgrade build twine
+      - name: Resolve release tag
+        id: release_tag
+        env:
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+          tag = os.environ['REF_NAME'] if os.environ['IS_TAG'] == 'true' else f'v{version}'
+          if tag != f'v{version}':
+              raise SystemExit(f'Tag {tag} disagrees with package version {version}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write(f'tag={tag}\n')
+          PY
       - name: Verify tag matches package and CLI versions
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           python - <<'PY'
           import os, pathlib, re, tomllib
@@ -65,11 +85,24 @@ jobs:
       - run: python -m twine check dist/*
       - run: python -m pip install --force-reinstall dist/*.whl
       - run: codex-export --version
+      - name: Compute release artifact SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: distributions-${{ github.ref_name }}
+          name: distributions-${{ steps.release_tag.outputs.tag }}
           path: dist/*
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: Codex Exporter ${{ steps.release_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
           generate_release_notes: true
+          previous_tag: ${{ github.ref_type == 'branch' && 'v0.2.0' || '' }}
+          body_path: ${{ github.ref_type == 'branch' && 'docs/releases/v0.3.8.md' || '' }}
+          fail_on_unmatched_files: true
           files: dist/*
