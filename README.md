@@ -35,7 +35,7 @@ $py = (& py -3.13 -c 'import sys; print(sys.executable)').Trim()
 & "$repo\Install-CodexExporter-ArchiveOverrides.ps1"
 # Start a new PowerShell 7 terminal, then:
 cdx-archive-config
-cdx-thread '01a0fecf-02ee-77d2-99a2-59e86e27cc9e' -NoArchiveCleanup
+cdx-thread '11111111-2222-4333-8444-555555555555' -NoArchiveCleanup
 ```
 
 **First test with `--no-archive-cleanup`** to retain all three original exported files,
@@ -95,7 +95,7 @@ are condensed to one listing row, at most 140 characters by default:
 cdx-sessions                                    # compact, valid Markdown table
 codex-export --list-sessions --full-session-titles  # expanded one-line titles
 cdx-project 'Full-Time' -UnknownSidecar
-cdx-fast 01a0fecf-02ee-77d2-99a2-59e86e27cc9e
+cdx-fast 11111111-2222-4333-8444-555555555555
 ```
 
 Missing rollout JSONL files listed by `cdx-audit` are **not** repaired or
