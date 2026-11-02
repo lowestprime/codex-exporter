@@ -33,7 +33,7 @@ function Assert-Call {
     Write-Host "PASS: $Name"
 }
 
-$id = '019db64d-c0d1-7140-95a5-2ba248ee69e7'
+$id = '11111111-2222-4333-8444-555555555555'
 $binary = 'C:\Program Files\7-Zip-Zstandard\7z.exe'
 Assert-Call 'cdx-thread + named archive overrides' {
     cdx-thread $id -NoArchiveCleanup -ArchiveLevel 7 -ArchiveThreads 8 -ArchiverPath $binary
