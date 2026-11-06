@@ -1,12 +1,17 @@
-# Codex Exporter 0.3.7 CLI archive controls for existing PowerShell helpers.
+# Codex Exporter 0.3.10 archive and review controls for existing PowerShell helpers.
 # This file is dot-sourced AFTER existing profile. Existing Invoker is retained.
 function Get-CodexArchiveCliArgs {
     param([System.Collections.IDictionary]$Bound)
+    if ((@($Bound.Keys) -contains 'Review') -and [bool]$Bound['Review'] -and
+        (@($Bound.Keys) -contains 'NoReview') -and [bool]$Bound['NoReview']) {
+        throw 'Choose either -Review or -NoReview.'
+    }
     $items = [System.Collections.Generic.List[string]]::new()
     $switches = @{
         NoArchive='--no-archive'; NoSourceCopy='--no-source-copy';
         NoArchiveCleanup='--no-archive-cleanup'; Archive='--archive';
-        SourceCopy='--source-copy'; ArchiveCleanup='--archive-cleanup'
+        SourceCopy='--source-copy'; ArchiveCleanup='--archive-cleanup';
+        Review='--review'; NoReview='--no-review'
     }
     foreach ($key in $switches.Keys) {
         if ((@($Bound.Keys) -contains $key) -and [bool]$Bound[$key]) {
@@ -16,11 +21,14 @@ function Get-CodexArchiveCliArgs {
     $values = @{
         ArchiverPath='--archiver-path'; ArchiveLevel='--archive-level';
         ArchiveMethod='--archive-method'; ArchiveDictionary='--archive-dictionary';
-        ArchiveWordSize='--archive-word-size'; ArchiveThreads='--archive-threads'
+        ArchiveWordSize='--archive-word-size'; ArchiveThreads='--archive-threads';
+        ArchiveBackend='--archive-backend'; ReviewChunkBytes='--review-chunk-bytes'
     }
     foreach ($key in $values.Keys) {
         if ((@($Bound.Keys) -contains $key)) {
-            $items.Add($values[$key]); $items.Add([string]$Bound[$key])
+            $value = [string]$Bound[$key]
+            if ($key -eq 'ArchiveBackend') { $value = $value.ToLowerInvariant() }
+            $items.Add($values[$key]); $items.Add($value)
         }
     }
     return $items.ToArray()
@@ -48,6 +56,10 @@ function cdx-thread {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -71,6 +83,10 @@ function cdx-response {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -92,6 +108,10 @@ function cdx-project {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -116,6 +136,10 @@ function cdx-range {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -137,6 +161,10 @@ function cdx-batch {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -160,6 +188,10 @@ function cdx-turn {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -183,6 +215,10 @@ function cdx-last {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -204,6 +240,10 @@ function cdx-final {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,
@@ -225,6 +265,10 @@ function cdx-fast {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$Review,
+        [switch]$NoReview,
+        [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
         [ValidateSet('LZMA','Deflate')][string]$ArchiveMethod,

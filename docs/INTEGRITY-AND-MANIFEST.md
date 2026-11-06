@@ -40,8 +40,9 @@ hidden API framing or server-side accounting.
 ## Reconstructed history
 
 `--live-context` records compactions and rollbacks applied and labels the result
-as reconstructed. Full chronological `--mode thread` remains the authoritative
-history export.
+as reconstructed. Full chronological `--mode thread` exports recorded history
+without that reconstruction; the captured native JSONL remains the fidelity
+authority.
 
 
 ## v0.3 streaming manifest
@@ -94,7 +95,7 @@ tail is deferred with a stderr note; that tail may be unfinished or invalid, and
 the metadata does not claim which. Newline-terminated malformed records remain in
 the JSONL snapshot and count as parse errors. No missing content is reconstructed.
 
-All 0.3.9 CLI source hashes refer to the captured **decoded** JSONL in both render
+From 0.3.9 onward, CLI source hashes refer to the captured **decoded** JSONL in both render
 paths. This intentionally makes buffered compressed exports agree with streaming
 exports; `physical_prefix_sha256` preserves the separate compressed-byte identity.
 Compressed frames must be complete, including checksums where present.
@@ -105,3 +106,87 @@ as `snapshot_hardlink` or `snapshot_copy`. Every ZIP member is independently rea
 and compared by hash and length before the usual loose-output cleanup. Staging
 files are removed on ordinary success and exceptions; the native copy remains
 with other loose outputs if archive creation or verification fails.
+
+## 0.3.10 review companion contract
+
+The review companion is derived from the **rendered Markdown for the selected
+export**, after the caller's rendering and redaction choices. It adds no content
+suppression, deduplication, summarization, or redaction. Long lines and embedded
+payload text remain present. Byte-exact reconstruction of the Markdown does not
+imply that Markdown contains every native event or external attachment.
+
+The `.review` directory is retained alongside a Deflate `.review.zip`. It contains
+`START_HERE.txt`, `RECENT.txt`, numbered TXT parts, `review-index.json`, and
+`original-export.manifest.json` when an export manifest is available. The review
+ZIP is independently decoded and checked against the generated files' SHA-256
+hashes. A same-stem existing review directory or ZIP triggers a new numbered
+basename; existing outputs are not replaced.
+
+### Review index
+
+| Field | Meaning |
+|---|---|
+| `markdown.filename`, `markdown.bytes`, `markdown.sha256` | Identity of the complete original rendered Markdown |
+| `text_policy`, `omitted_rendered_bytes` | Lossless rendered-Markdown policy; zero Markdown bytes omitted |
+| `source_sha256`, `source_snapshot` | Native-source provenance copied from the export manifest, if available |
+| `native_source_verification` | Explicitly states that the review builder did not reverify native source bytes |
+| `input_verification` | Whether the input was a directly read text file or CRC-checked selected members of an existing ZIP |
+| `chunk_bytes_limit` | Maximum complete numbered TXT part size, including its header |
+| `parts[].filename`, `header_bytes`, `body_bytes`, `file_bytes` | Part inventory and exact separation of navigation header from transcript bytes |
+| `parts[].source_byte_start`, `source_byte_end` | Half-open byte range `[start, end)` within the original UTF-8 Markdown |
+| `parts[].source_line_start`, `source_line_end` | One-based inclusive source line range; ranges can overlap when a long line spans parts |
+| `parts[].sha256`, `body_sha256` | SHA-256 of the complete TXT file and its transcript body, respectively |
+| `recent` | Explicit byte range, size, and hash of `RECENT.txt`, which is an excerpt rather than complete history |
+| `original_manifest_sha256` | SHA-256 of the unchanged manifest bytes included with the review, if present |
+
+Remove exactly `header_bytes` from each part and concatenate the bodies in index
+order. The result must have exactly `markdown.bytes` bytes and the recorded
+`markdown.sha256`. Part boundaries preserve UTF-8 characters; CRLF, BOM, blank
+lines, and a final line without a newline are preserved. Byte ranges are offsets
+in the Markdown, not in the native JSONL. Source-event references already present
+in the Markdown retain their original meaning.
+
+The default size cap is 1,000,000 bytes per complete part, configurable with
+`--review-chunk-bytes` from 4,096 to 1,500,000. `RECENT.txt` contains at most 200,000
+transcript bytes and stays within the selected cap with its header included. The
+index sets its own token count to `null`: neither byte sizing nor an old
+manifest's tokenizer report establishes the receiving model's remaining context.
+
+### Old exports and verification scope
+
+`--review-from EXPORT.zip` requires one Markdown member and at most one matching
+manifest. It rejects duplicate, ambiguous, unsafe, encrypted, or symlink member
+inventories. Only the selected Markdown and manifest are decoded and CRC-checked;
+the native JSONL is not opened. Thus conversion can repair delivery compatibility
+without repeatedly decompressing a large native snapshot. The original ZIP is
+retained, and its source hash is carried forward as provenance.
+
+For a newly generated export, full-archive verification completes before the
+review is built and before loose-file cleanup. The review's manifest copy matches
+the final manifest included in that full ZIP. If review creation fails, the full
+archive and loose exports are retained. With `--no-archive`, review files are
+still generated unless `--no-review` is also supplied. `--no-file` produces no
+review companion.
+
+Ordinary path output and `--open-after` prefer the review ZIP. JSON reports
+`review_archive`, `review_directory`, `review_index`, `review_recent`,
+`review_part_count`, and `review_verified` alongside the full archival result.
+`archive` remains the full ZIP path, while `file`, `manifest`, and `source_copy`
+become `null` when archival cleanup removes those loose files. The retained
+review directory is outside that cleanup set.
+
+## Archive backend and publication verification
+
+New full-archive defaults are Deflate level 6 and `backend=auto`. Auto selects
+Python for Deflate without a configured archiver, and selects a compatible
+external CLI when a path is configured or LZMA is requested. The `python` backend
+supports Deflate only; `7zip` explicitly selects an external CLI. Saved settings
+are not migrated silently. Review ZIPs always use built-in Deflate level 6.
+
+The full archive's `archive_plan` and CLI result record the effective backend,
+method, level, and worker count; LZMA-only settings are `null` for Deflate. Each
+member is fully decoded and compared to its loose source by SHA-256 and size.
+Detected changes to loose-member file signatures before publication or cleanup
+abort cleanup. Publication uses exclusive creation, with a verified copy fallback
+when hard links are unavailable. These checks do not create an atomic transaction
+against arbitrary concurrent replacement of output files.

@@ -25,10 +25,10 @@ def prepare(tmp_path, broken=False):
     ]
     source.write_text(''.join(json.dumps(x)+'\n' for x in rows))
     original_hash=hashlib.sha256(source.read_bytes()).hexdigest()
-    # Synthetic 7z-compatible stub: constructs a real ZIP method 14 archive.
+    # Synthetic 7z-compatible stub: honors the requested ZIP compression method.
     archiver=tmp_path/('7z-test.cmd' if os.name == 'nt' else '7z-test')
     stub=tmp_path/'mock-seven-zip.py'
-    stub.write_text("#!/usr/bin/env python3\nimport sys,zipfile\nargv=sys.argv[1:]; out=next(a for a in argv if a.endswith('.zip'))\nfiles=argv[argv.index(out)+1:]\nwith zipfile.ZipFile(out,'w',compression=zipfile.ZIP_LZMA) as z:\n    for f in files:\n        if BROKEN: z.writestr(f,'tampered')\n        else: z.write(f,arcname=f)\n".replace('BROKEN', 'True' if broken else 'False'))
+    stub.write_text("#!/usr/bin/env python3\nimport sys,zipfile\nargv=sys.argv[1:]; out=next(a for a in argv if a.endswith('.zip'))\nfiles=argv[argv.index(out)+1:]\nmethod=zipfile.ZIP_LZMA if '-mm=LZMA' in argv else zipfile.ZIP_DEFLATED\nwith zipfile.ZipFile(out,'w',compression=method) as z:\n    for f in files:\n        if BROKEN: z.writestr(f,'tampered')\n        else: z.write(f,arcname=f)\n".replace('BROKEN', 'True' if broken else 'False'))
     if os.name == 'nt':
         archiver.write_text('@echo off\n"' + sys.executable + '" "' + str(stub) + '" %*\n', encoding='utf-8')
     else:
@@ -67,7 +67,7 @@ def test_full_pipeline_and_positional_uuid(tmp_path):
         assert hashlib.sha256(srcdata).hexdigest()==digest
         assert b'Hello UCLA original' in srcdata
         assert z.read(zp.stem+'.md').startswith(b'---')
-        assert zipfile.ZIP_LZMA==z.getinfo(zp.stem+'.md').compress_type
+        assert zipfile.ZIP_DEFLATED==z.getinfo(zp.stem+'.md').compress_type
     assert src.exists() and hashlib.sha256(src.read_bytes()).hexdigest()==digest
 
 
@@ -101,7 +101,8 @@ def test_failure_keeps_export_triplet(tmp_path):
     assert len(list((tmp_path/'out').glob('*.md')))==1
     assert len(list((tmp_path/'out').glob('*.jsonl')))==1
     assert len(list((tmp_path/'out').glob('*.manifest.json')))==1
-    assert len(list((tmp_path/'out').glob('*.zip')))==0
+    assert not [path for path in (tmp_path/'out').glob('*.zip')
+                if not path.name.endswith('.review.zip')]
     assert src.exists()
 
 
@@ -165,3 +166,40 @@ def test_repeat_export_never_overwrites_existing_zip(tmp_path):
     assert first != second
     assert Path(first).exists() and Path(second).exists()
     assert Path(second).stem.endswith('-1')
+
+
+def test_default_cli_prints_review_zip_and_keeps_uploadable_text(tmp_path):
+    source, digest, archiver, env = prepare(tmp_path)
+    output = tmp_path / 'out'
+    completed = run(env, '--mode', 'thread', SID, '--fast', '--no-progress',
+                    '--out-dir', str(output))
+    assert completed.returncode == 0, completed.stderr
+    review = Path(completed.stdout.strip())
+    assert review.is_file() and review.name.endswith('.review.zip')
+    text_directory = review.with_suffix('')
+    assert (text_directory / 'START_HERE.txt').is_file()
+    assert (text_directory / 'RECENT.txt').is_file()
+    assert list(text_directory.glob('part-*.txt'))
+    assert 'Full archival export:' in completed.stderr
+    full_archives = [path for path in output.glob('*.zip') if not path.name.endswith('.review.zip')]
+    assert len(full_archives) == 1
+    with zipfile.ZipFile(review) as archive:
+        assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_DEFLATED}
+        assert not any(name.endswith('.jsonl') for name in archive.namelist())
+    with zipfile.ZipFile(full_archives[0]) as archive:
+        assert archive.read(full_archives[0].stem + '.jsonl') == source.read_bytes()
+
+
+def test_no_review_cli_preserves_full_archive_output(tmp_path):
+    source, digest, archiver, env = prepare(tmp_path)
+    output = tmp_path / 'out'
+    completed = run(env, '--mode', 'thread', SID, '--fast', '--no-progress',
+                    '--no-review', '--out-dir', str(output))
+    assert completed.returncode == 0, completed.stderr
+    archive_path = Path(completed.stdout.strip())
+    assert archive_path.is_file() and archive_path.suffix == '.zip'
+    assert not archive_path.name.endswith('.review.zip')
+    assert not list(output.glob('*.review*'))
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.read(archive_path.stem + '.jsonl') == source.read_bytes()
+    assert source.is_file()

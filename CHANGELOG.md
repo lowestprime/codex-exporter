@@ -1,3 +1,14 @@
+## 0.3.10 — Portable review companions and Deflate archives (2026-11-06)
+
+- Create a verified `.review.zip` and retained `.review` text directory for ordinary local Codex file exports by default. Printed/opened output prefers the review ZIP; JSON retains both archive paths. `--no-review` opts out.
+- Split rendered Markdown into UTF-8 TXT parts without changing any source bytes. Index original byte/line ranges, whole-part/body SHA-256 hashes, and source provenance; retain a bounded, explicitly labeled recent excerpt and upload guide.
+- Bound each complete TXT part, including its header, to 1,000,000 bytes by default; expose `--review-chunk-bytes` for 4,096–1,500,000 bytes. Long lines can span parts without Unicode corruption or content trimming.
+- Add `--review-from` for existing ZIP/MD/TXT exports. Convert legacy LZMA ZIPs by reading only the selected Markdown and matching manifest, retaining the input and explicitly distinguishing CRC checks from native-source provenance.
+- Default new full archives to Deflate level 6. Add `--archive-backend auto/python/7zip` and a persisted backend option. Auto uses built-in Deflate unless an external archiver is configured; Python can be forced without erasing the saved path. Preserve saved LZMA preferences until explicitly changed.
+- Verify review ZIPs independently with method, CRC, and SHA-256 checks. Keep loose TXT parts after archival cleanup, reject unsafe/ambiguous input inventories, and choose new names on collisions.
+- Support verified archive publication when hard links are unavailable and recheck loose-member signatures before cleanup. Preserve the live-prefix snapshot behavior introduced in 0.3.9.
+- Extend synthetic regression coverage for exact review reconstruction, size and Unicode boundaries, archive backends, legacy conversion, collision handling, and native-source isolation.
+
 ## 0.3.9 — Verified snapshots of running threads (2026-11-06)
 
 - Make bounded, verified snapshots the default for all local Codex export modes. Ordinary appends after the capture boundary no longer abort rendering or archival cleanup.

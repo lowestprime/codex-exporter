@@ -1,4 +1,4 @@
-# Isolated no-export smoke test of the nine corrected cdx-* archive wrappers.
+# Isolated no-export smoke test of the nine cdx-* archive and review wrappers.
 # Run using: & pwsh -NoProfile -File <this-script> -Overrides <installed override file>
 # It creates no archives, modifies no profile files, and calls no Python executable.
 [CmdletBinding()]
@@ -41,7 +41,8 @@ Assert-Call 'cdx-thread + named archive overrides' {
     '--archive-threads','8','--archiver-path',$binary) @('--archive-cleanup','--no-source-copy')
 Assert-Call 'cdx-thread with no overrides' {
     cdx-thread $id
-} @('--session-id',$id,'--mode','thread') @('--no-archive','--no-archive-cleanup','--archive-level')
+} @('--session-id',$id,'--mode','thread') @('--no-archive','--no-archive-cleanup','--archive-level',
+    '--review','--no-review','--review-chunk-bytes','--archive-backend')
 Assert-Call 'cdx-response' {
     cdx-response $id -NoArchive
 } @('--mode','last-response','--no-archive') @('--archive')
@@ -66,4 +67,43 @@ Assert-Call 'cdx-final' {
 Assert-Call 'cdx-fast' {
     cdx-fast $id -NoProgress -ArchiverPath $binary
 } @('--fast','--no-progress','--archiver-path',$binary) @('--no-archive')
-Write-Host 'PASS: All ten wrapper invocations forwarded expected arguments without executing Codex.'
+
+# Every wrapper accepts the same review controls without replacing its mode options.
+$reviewCases = @(
+    @{ Name='cdx-thread'; Call={ param($Options) cdx-thread $id @Options } },
+    @{ Name='cdx-response'; Call={ param($Options) cdx-response $id @Options } },
+    @{ Name='cdx-project'; Call={ param($Options) cdx-project 'Full-Time' @Options } },
+    @{ Name='cdx-range'; Call={ param($Options) cdx-range $id 1 2 @Options } },
+    @{ Name='cdx-batch'; Call={ param($Options) cdx-batch @($id) @Options } },
+    @{ Name='cdx-turn'; Call={ param($Options) cdx-turn $id 1 @Options } },
+    @{ Name='cdx-last'; Call={ param($Options) cdx-last $id 2 @Options } },
+    @{ Name='cdx-final'; Call={ param($Options) cdx-final $id @Options } },
+    @{ Name='cdx-fast'; Call={ param($Options) cdx-fast $id @Options } }
+)
+foreach ($case in $reviewCases) {
+    $invokeCase = $case.Call
+    Assert-Call "$($case.Name) review controls" {
+        & $invokeCase @{ Review=$true; ReviewChunkBytes=4096; ArchiveBackend='PYTHON' }
+    } @('--review','--review-chunk-bytes','4096','--archive-backend','python') @('--no-review')
+    Assert-Call "$($case.Name) no-review controls" {
+        & $invokeCase @{ NoReview=$true; ReviewChunkBytes=1500000; ArchiveBackend='7zip' }
+    } @('--no-review','--review-chunk-bytes','1500000','--archive-backend','7zip') @('--review')
+}
+Assert-Call 'False review switches leave Python defaults in force' {
+    cdx-thread $id -Review:$false -NoReview:$false -ArchiveBackend auto
+} @('--session-id',$id,'--archive-backend','auto') @('--review','--no-review','--review-chunk-bytes')
+
+function Assert-Rejected {
+    param([string]$Name, [scriptblock]$Call)
+    $script:Seen = @()
+    $rejected = $false
+    try { & $Call } catch { $rejected = $true }
+    if (-not $rejected) { throw "$Name should have failed validation." }
+    if ($script:Seen.Count -ne 0) { throw "$Name reached the invoker despite invalid arguments." }
+    Write-Host "PASS: $Name"
+}
+Assert-Rejected 'Review part size below minimum' { cdx-thread $id -ReviewChunkBytes 4095 }
+Assert-Rejected 'Review part size above maximum' { cdx-thread $id -ReviewChunkBytes 1500001 }
+Assert-Rejected 'Unknown archive backend' { cdx-thread $id -ArchiveBackend unsupported }
+Assert-Rejected 'Conflicting review switches' { cdx-thread $id -Review -NoReview }
+Write-Host 'PASS: All archive and review wrapper checks completed without executing Codex.'

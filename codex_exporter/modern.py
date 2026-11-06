@@ -420,6 +420,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
         if progress:
             _progress(total, total, first, force=True)
         return {'file': str(destination), 'manifest': str(manifest_path), 'session_id': session_id,
+                'redacted': bool(redact),
                 'source_jsonl': str(original_source), 'source_sha256': digest,
                 **({'source_snapshot': snapshot.metadata, 'decoded_source_bytes': snapshot.size_bytes} if snapshot else {}),
                 'source_lines': counts['source_lines'], 'rendered_records': counts['rendered_records'],
