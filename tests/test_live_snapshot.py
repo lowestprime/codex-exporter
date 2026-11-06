@@ -53,7 +53,9 @@ def archiver(tmp_path: Path) -> Path:
         "args = sys.argv[1:]\n"
         "archive = next(arg for arg in args if arg.endswith('.zip'))\n"
         "members = args[args.index(archive) + 1:]\n"
-        "with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_LZMA) as output:\n"
+        "method = next((arg.split('=', 1)[1].upper() for arg in args if arg.startswith('-mm=')), 'LZMA')\n"
+        "compression = {'LZMA': zipfile.ZIP_LZMA, 'DEFLATE': zipfile.ZIP_DEFLATED}[method]\n"
+        "with zipfile.ZipFile(archive, 'w', compression=compression) as output:\n"
         "    for member in members:\n"
         "        output.write(member, arcname=member)\n",
         encoding="utf-8",

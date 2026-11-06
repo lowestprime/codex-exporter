@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.9"
+__version__ = "0.3.10"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -3304,7 +3304,7 @@ def main() -> int:
     config_group.add_argument("--reset-filename-template", action="store_true")
     config_group.add_argument("--reset-config", action="store_true")
 
-    ap.add_argument("--mode", choices=["thread", "response", "turn", "last-response", "last-assistant", "last-substantial", "message", "range", "chat", "chat-actions", "actions"], default="last-response")
+    ap.add_argument("--mode", choices=["thread", "response", "turn", "last-response", "last-assistant", "last-substantial", "message", "range", "chat", "chat-actions", "actions"], default=None)
     ap.add_argument("--message", type=int)
     ap.add_argument("--response", type=int)
     ap.add_argument("--from-message", type=int)
@@ -3355,6 +3355,8 @@ def main() -> int:
     pipeline.add_argument('--archive-cleanup', dest='archive_cleanup', action='store_true', default=None)
     pipeline.add_argument('--no-archive-cleanup', dest='archive_cleanup', action='store_false')
     pipeline.add_argument('--archiver-path', help='Exact 7-Zip-compatible CLI executable; auto-discovered otherwise')
+    pipeline.add_argument('--archive-backend', choices=['auto', 'python', '7zip'],
+                          help='auto selects built-in Deflate unless an external archiver is configured')
     pipeline.add_argument('--archive-level', type=int)
     pipeline.add_argument('--archive-method', choices=['LZMA', 'Deflate'])
     pipeline.add_argument('--archive-dictionary', help='LZMA dictionary size, e.g. 256m')
@@ -3362,7 +3364,16 @@ def main() -> int:
     pipeline.add_argument('--archive-threads', type=int)
     pipeline.add_argument('--show-archive-config', action='store_true')
     pipeline.add_argument('--set-archive-default', action='append', metavar='KEY=VALUE',
-                          help='Persist a default (archive, copy_source, cleanup, archiver, level, method, dictionary, word_size, threads)')
+                          help='Persist a default (archive, copy_source, cleanup, archiver, backend, level, method, dictionary, word_size, threads)')
+    review = ap.add_argument_group('portable text review')
+    review.add_argument('--review', dest='review', action='store_true', default=True,
+                        help='Create a verified Deflate review ZIP plus retained text parts (default)')
+    review.add_argument('--no-review', dest='review', action='store_false',
+                        help='Produce only the ordinary export/archive')
+    review.add_argument('--review-chunk-bytes', type=int, default=1_000_000,
+                        help='Maximum UTF-8 bytes per review part including header (4096..1500000)')
+    review.add_argument('--review-from', type=Path, metavar='EXPORT_ZIP_OR_TEXT',
+                        help='Create review files from an existing .zip/.md/.txt without accessing Codex')
     ap.add_argument("--tokenizer", choices=["auto", "tiktoken", "regex"], default="auto")
     ap.add_argument("--token-encoding", default=DEFAULT_TOKEN_ENCODING)
     ap.add_argument("--require-tiktoken", action="store_true")
@@ -3390,7 +3401,7 @@ def main() -> int:
         conversions = {'archive': ('archive', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
                        'copy_source': ('copy_source', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
                        'cleanup': ('cleanup', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
-                       'archiver': ('archiver', str), 'level': ('level', int),
+                       'archiver': ('archiver', str), 'backend': ('backend', str), 'level': ('level', int),
                        'method': ('method', str), 'dictionary': ('dictionary', str),
                        'word_size': ('word_size', int), 'threads': ('threads', int)}
         for setting in args.set_archive_default:
@@ -3421,7 +3432,7 @@ def main() -> int:
     archive_options = dict(cfg.get('archive_defaults') or {})
     for argument, field in (('archive_enabled', 'archive'), ('copy_source', 'copy_source'),
                             ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'),
-                            ('archive_level', 'level'), ('archive_method', 'method'),
+                            ('archive_backend', 'backend'), ('archive_level', 'level'), ('archive_method', 'method'),
                             ('archive_dictionary', 'dictionary'), ('archive_word_size', 'word_size'),
                             ('archive_threads', 'threads')):
         value = getattr(args, argument)
@@ -3478,6 +3489,63 @@ def main() -> int:
         from codex_exporter.modern import audit
         print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
         return 0
+    from codex_exporter.review import review_existing_export, _validate_chunk_bytes
+    try:
+        _validate_chunk_bytes(args.review_chunk_bytes)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    def preferred_output(result: dict[str, Any]) -> str | None:
+        return result.get('review_archive') or result.get('archive') or result.get('file')
+
+    def report_output(result: dict[str, Any]) -> None:
+        if not args.json_result:
+            if result.get('review_directory'):
+                print(f"Review text files: {result['review_directory']}", file=sys.stderr)
+            if result.get('archive') and result.get('review_archive'):
+                print(f"Full archival export: {result['archive']}", file=sys.stderr)
+            print(preferred_output(result))
+
+    def finish_export(result: dict[str, Any], snapshot: Any) -> dict[str, Any]:
+        if result.get('file') and not result.get('skipped'):
+            result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot,
+                                    review=args.review, review_chunk_bytes=args.review_chunk_bytes)
+        return result
+
+    if args.review_from:
+        if not args.review:
+            ap.error('--review-from cannot be combined with --no-review')
+        if any((args.project, args.session_id, args.jsonl, args.sessions_file,
+                args.latest_session, args.browse, args.chatgpt_export)):
+            ap.error('--review-from cannot be combined with another source selector')
+        if any((args.redact, args.no_file, args.stdout, args.clipboard, args.list,
+                args.list_responses, args.message is not None, args.response is not None,
+                args.from_message is not None, args.to_message is not None,
+                args.last_n_turns is not None, args.live_context, args.chatgpt_audit)):
+            ap.error('--review-from preserves existing text; redaction, no-file, stdout/clipboard, and record selectors are unsupported')
+        if args.mode is not None:
+            ap.error('--review-from preserves the existing export mode; --mode is unsupported')
+        if any((args.reasoning_summaries, args.plain, args.wrap_md, args.no_frontmatter,
+                args.no_map, args.fence_turns, args.keep_hogs, args.tool_outputs != 'full',
+                args.source_truncation != 'annotate', args.max_line_chars != 20_000,
+                args.max_repeated_lines != 25, args.max_tool_chars != 20_000,
+                not args.manifest, args.manifest_path is not None, args.save_as,
+                args.choose_out_dir, args.name, args.filename_template,
+                args.collision != 'rename')):
+            ap.error('--review-from preserves existing rendered content and uses rename collisions; rendering and selection overrides are unsupported')
+        source = args.review_from.expanduser().resolve()
+        output = args.out_dir.expanduser().resolve() if args.out_dir else source.parent
+        result = review_existing_export(source, output, chunk_bytes=args.review_chunk_bytes)
+        if args.json_result:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            report_output(result)
+        if args.open_after:
+            open_in_file_manager(Path(result['review_archive']), select=True)
+        return 0
+
+    args.mode = args.mode or 'last-response'
+
     if args.chatgpt_export:
         if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
             ap.error('--chatgpt-export cannot be combined with Codex source selectors')
@@ -3519,7 +3587,8 @@ def main() -> int:
         if not args.manifest:
             ap.error('Default archive needs a manifest; pass --manifest or --no-archive')
         from codex_exporter.archive_pipeline import find_archiver
-        find_archiver(archive_settings.archiver)  # Fail before generating output if unavailable.
+        if archive_settings.effective_backend() == '7zip':
+            find_archiver(archive_settings.archiver)  # Fail before generating output if unavailable.
     if args.save_as and len(sources) != 1:
         ap.error("--save-as is only valid for a single source")
     if args.manifest_path and len(sources) != 1:
@@ -3603,16 +3672,15 @@ def main() -> int:
                     source_truncation=args.source_truncation, unknown_events=args.unknown_events,
                     collision=args.collision, redact=args.redact, strict_events=args.strict_events,
                     progress=args.progress if args.progress is not None else sys.stderr.isatty())
-                if result.get('file') and not result.get('skipped'):
-                    result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot)
+                result = finish_export(result, snapshot)
                 results.append(result)
                 if args.report_events:
                     print(json.dumps({'stream_event_count': result.get('rendered_records'),
                          'unknown_event_count': result.get('unknown_event_count'),
                          'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
-                if args.open_after and (result.get('archive') or result.get('file')):
-                    open_in_file_manager(Path(result.get('archive') or result['file']), select=True)
-                if not args.json_result: print(result.get('archive') or result.get('file'))
+                if args.open_after and preferred_output(result):
+                    open_in_file_manager(Path(preferred_output(result)), select=True)
+                report_output(result)
                 continue
             reset_runtime_audit()
             include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
@@ -3702,12 +3770,12 @@ def main() -> int:
                 "redacted": bool(args.redact), "models": collect_models(selected_records, meta),
             }
             if output_path is not None:
-                result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot)
+                result = finish_export(result, snapshot)
             results.append(result)
-            if args.open_after and (result.get('archive') or result.get('file')):
-                open_in_file_manager(Path(result.get('archive') or result['file']), select=True)
-            if not args.json_result and output_path:
-                print(result.get('archive') or output_path)
+            if args.open_after and preferred_output(result):
+                open_in_file_manager(Path(preferred_output(result)), select=True)
+            if output_path:
+                report_output(result)
 
     if args.clipboard and clipboard_parts:
         copy_to_clipboard("\n\n".join(clipboard_parts))

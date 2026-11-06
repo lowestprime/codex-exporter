@@ -101,7 +101,8 @@ def test_full_cli_archive_with_stored_manifest(tmp_path):
     stub.write_text(text.replace('z.write(f,arcname=f)',
         "z.write(f,arcname=f,compress_type=zipfile.ZIP_STORED if f.endswith('.manifest.json') else zipfile.ZIP_LZMA)"))
     result = legacy.run(env, '--mode', 'thread', legacy.SID, '--fast', '--no-progress',
-        '--archiver-path', str(archiver), '--out-dir', str(tmp_path/'out'), '--json')
+        '--archiver-path', str(archiver), '--archive-method', 'LZMA',
+        '--out-dir', str(tmp_path/'out'), '--json')
     assert result.returncode == 0, result.stderr
     val = json.loads(result.stdout)
     assert val['archive_verified'] is True
