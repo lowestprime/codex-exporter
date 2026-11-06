@@ -1,3 +1,15 @@
+## 0.3.9 — Verified snapshots of running threads (2026-11-06)
+
+- Make bounded, verified snapshots the default for all local Codex export modes. Ordinary appends after the capture boundary no longer abort rendering or archival cleanup.
+- Detect truncation, replacement, and prefix rewriting during capture using a fixed-length copy and second SHA-256 read from the same open handle.
+- Keep complete EOF records, including narrowly repairable JSON; record and defer an invalid or unfinished unterminated tail. Preserve malformed completed records in the native snapshot and parse audit.
+- Use one decoded snapshot for rendered content, manifests, and native JSONL archives; retain original-path provenance and expose exact capture metadata.
+- Decode compressed rollouts once, support concatenated Zstandard frames, and reject incomplete frames/checksums.
+- Reuse owned snapshots through exclusive hard links with a verified copy fallback, avoiding a redundant large source copy. Replace buffered whole-file hashing allocations with the captured digest.
+- Open the final archived result after packaging in buffered mode; reject incompatible explicit fast options before capture.
+- Synchronize and check every bundled Python module, including the new snapshot module, across package and standalone distributions.
+- Add 36 deterministic live-export tests covering both renderers, all archive layouts, partial-record recovery, captured hashes, and source changes before/after capture.
+
 ## 0.3.8 — ZIP mixed Store/LZMA validation and PowerShell wrapper fix (2026-11-02)
 - Correct per-member ZIP verification: allow Store (0) when 7-Zip decides LZMA is wasteful for a short or incompressible member, while rejecting unauthorized algorithms, unexpected member paths, duplicates or corrupt content.
 - Preserve full SHA-256/size verification and fail-closed deletion semantics.

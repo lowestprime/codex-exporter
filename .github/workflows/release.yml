@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-and-release:
     # Preserve tag releases; a deliberately named squash-merge can publish a new version once.
-    if: "${{ github.ref_type == 'tag' || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: publish v0.3.8')) }}"
+    if: "${{ github.ref_type == 'tag' || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release: publish v')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,15 +26,23 @@ jobs:
         env:
           IS_TAG: ${{ github.ref_type == 'tag' }}
           REF_NAME: ${{ github.ref_name }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           python - <<'PY'
-          import os
+          import os, re
           from pathlib import Path
           import tomllib
           version = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version']
           tag = os.environ['REF_NAME'] if os.environ['IS_TAG'] == 'true' else f'v{version}'
           if tag != f'v{version}':
               raise SystemExit(f'Tag {tag} disagrees with package version {version}')
+          if os.environ['IS_TAG'] != 'true':
+              subject = os.environ['HEAD_MESSAGE'].splitlines()[0]
+              if not re.fullmatch(r'release: publish ' + re.escape(tag) + r'(?: \(#\d+\))?', subject):
+                  raise SystemExit(f'Release subject {subject!r} disagrees with package version')
+          notes = Path('docs/releases') / f'{tag}.md'
+          if not notes.is_file():
+              raise SystemExit(f'Missing release notes: {notes}')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
               out.write(f'tag={tag}\n')
           PY
@@ -102,7 +110,6 @@ jobs:
           prerelease: false
           make_latest: true
           generate_release_notes: true
-          previous_tag: ${{ github.ref_type == 'branch' && 'v0.2.0' || '' }}
-          body_path: ${{ github.ref_type == 'branch' && 'docs/releases/v0.3.8.md' || '' }}
+          body_path: docs/releases/${{ steps.release_tag.outputs.tag }}.md
           fail_on_unmatched_files: true
           files: dist/*

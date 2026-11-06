@@ -9,7 +9,7 @@ from contextlib import ExitStack
 import io
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import hashlib
 import json
 import os
@@ -17,6 +17,9 @@ import re
 import sqlite3
 import sys
 import time
+
+if TYPE_CHECKING:
+    from .snapshot import SourceSnapshot
 
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
@@ -193,7 +196,8 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                   max_tool_chars: int = 20_000, strip: bool = False,
                   max_line_chars: int = 20_000, max_repeated_lines: int = 25,
                   collision: str = 'rename', progress: bool = True, redact: bool = False, strict_events: bool = False,
-                  source_truncation: str = 'annotate', unknown_events: str = 'report') -> dict[str, Any]:
+                  source_truncation: str = 'annotate', unknown_events: str = 'report',
+                  snapshot: SourceSnapshot | None = None) -> dict[str, Any]:
     """Bounded-memory one-pass export; stable readable headings, provenance and audit.
 
     The original event JSONL remains the fidelity authority. No assembled giant
@@ -228,6 +232,8 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     sha = hashlib.sha256()
     total = source.stat().st_size
     is_zstd = source.name.lower().endswith('.jsonl.zst')
+    original_source = snapshot.original_path if snapshot else source
+    source_encoding = snapshot.metadata['source_encoding'] if snapshot else ('zstandard' if is_zstd else 'plain')
     decoded_size = 0
     counts: Counter[str] = Counter()
     marker_locations: list[dict[str, int]] = []
@@ -262,13 +268,17 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                 created = datetime.now().astimezone().isoformat(timespec='seconds')
                 output.write('---\n' + f'title: {yaml_quote(title)}\n'
                              + f'session_id: {yaml_quote(session_id)}\n'
-                             + f'source_jsonl: {yaml_quote(str(source))}\n'
+                             + f'source_jsonl: {yaml_quote(str(original_source))}\n'
                              + f'title_source: {yaml_quote(title_source or "unavailable")}\n'
                              + f'exported_at: {yaml_quote(created)}\n'
                              + 'mode: "thread"\n'
                              + 'history_semantics: "chronological_source_history"\n'
-                             + f'source_encoding: {yaml_quote("zstandard" if is_zstd else "plain")}\n'
+                             + f'source_encoding: {yaml_quote(source_encoding)}\n'
                              + 'token_count_method: "not_computed_streaming"\n---\n\n')
+                if snapshot:
+                    output.write('> Captured a verified prefix of the live rollout. Later writes are included in the next export. '
+                                 f'Captured bytes: {snapshot.size_bytes:,}; deferred trailing bytes: '
+                                 f'{snapshot.metadata["deferred_tail_bytes"]:,}.\n\n')
                 output.write(f'# {title}\n\n')
                 output.write('> Local chronological rollout export. The original JSONL remains the authoritative source. '
                              'This streaming layout cannot provide exact output token counts or the classic turn-level map.\n\n')
@@ -276,7 +286,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                              '| Metric | Value |\n|---|---|\n'
                              + f'| Thread title | {title.replace(chr(124), chr(92)+chr(124))} |\n'
                              + f'| Session ID | `{session_id}` |\n'
-                             + f'| Source encoding | {"Zstandard" if is_zstd else "plain JSONL"} |\n'
+                             + f'| Source encoding | {"Zstandard" if source_encoding == "zstandard" else "plain JSONL"} |\n'
                              + '| Structure | Chronological source events |\n'
                              + '| Token counts | Not computed (streaming) |\n\n'
                              + '## Chronological records\n\n')
@@ -380,11 +390,13 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
         if strict_events and counts['unknown_events']:
             raise RuntimeError(f"Strict event audit failed: {counts['unknown_events']} unknown event schemas")
         digest = sha.hexdigest()
+        if snapshot and (digest != snapshot.sha256 or decoded_size != snapshot.size_bytes):
+            raise RuntimeError('Captured source snapshot changed during rendering; refusing to publish this export')
         manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
-                    'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(source),
+                    'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(original_source),
                     'source_sha256': digest, 'source_size_bytes_at_open': total,
                     'source_size_bytes_at_end': source.stat().st_size,
-                    'source_encoding': 'zstandard' if is_zstd else 'plain',
+                    'source_encoding': source_encoding,
                     'decoded_source_bytes': decoded_size, 'records': dict(counts),
                     'parse_error_samples': error_samples, 'truncation_marker_locations': marker_locations,
                     'upstream_truncations': upstream_truncations,
@@ -392,6 +404,12 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                     'unknown_events_policy': unknown_events, 'unknown_sidecar': str(sidecar) if sidecar else None,
                     'text_fidelity': 'rendered_text_only; original JSONL remains authoritative',
                     'partial_final_line_possible': counts['parse_errors'] > 0}
+        if snapshot:
+            manifest['source_snapshot'] = snapshot.metadata
+            manifest['source_size_bytes_at_open'] = snapshot.metadata['source_size_bytes_at_open']
+            manifest['source_size_bytes_at_end'] = snapshot.metadata['source_size_bytes_after_capture']
+            manifest['source_sha256_scope'] = 'captured_decoded_jsonl'
+            manifest['partial_final_line_possible'] = bool(snapshot.metadata['deferred_tail_bytes'])
         if source.stat().st_size != total:
             manifest['source_changed_during_export'] = True
         os.replace(temp, destination)
@@ -402,7 +420,8 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
         if progress:
             _progress(total, total, first, force=True)
         return {'file': str(destination), 'manifest': str(manifest_path), 'session_id': session_id,
-                'source_jsonl': str(source), 'source_sha256': digest,
+                'source_jsonl': str(original_source), 'source_sha256': digest,
+                **({'source_snapshot': snapshot.metadata, 'decoded_source_bytes': snapshot.size_bytes} if snapshot else {}),
                 'source_lines': counts['source_lines'], 'rendered_records': counts['rendered_records'],
                 'parse_error_count': counts['parse_errors'], 'unknown_event_count': counts['unknown_events'],
                 'source_changed_during_export': bool(manifest.get('source_changed_during_export'))}
