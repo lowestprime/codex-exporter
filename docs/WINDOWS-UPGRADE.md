@@ -1,119 +1,100 @@
-# Windows 11 upgrade guide: 0.1.x to 0.2.0
+# Windows upgrade to Codex Exporter 0.3.9
 
-This guide assumes the repository is cloned at
-`C:\projects\CodexTools\CodexThreadExporter` and the standalone installed script
-is `C:\projects\CodexTools\Export-CodexThread.py`.
+## Existing package-routed 0.3.8 installation
 
-## 1. Update the repository safely
+If the failing traceback points to
+`Python313\Lib\site-packages\codex_exporter\cli.py`, update that same interpreter.
+The live snapshot behavior is automatic; no new helper switch or profile edit is
+required. Existing PowerShell archive overrides remain compatible.
 
-```powershell
-$ErrorActionPreference = 'Stop'
-Set-Location 'C:\projects\CodexTools\CodexThreadExporter'
-
-git status --short
-git fetch --prune --tags origin
-git switch main
-git pull --ff-only origin main
-```
-
-Stop if `git status --short` is not empty; preserve or commit unrelated local
-work before upgrading.
-
-## 2. Install the new standalone script, package, helpers, and skill
+The following example uses a standard per-user CPython 3.13 installation. Select
+your existing interpreter explicitly if it resides elsewhere.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$py = (Get-Command python -ErrorAction Stop).Source
+$py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
+if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
+    throw 'Set $py to the Python interpreter used by your existing exporter.'
+}
 
-.\Install-CodexThreadExporter.ps1 `
-    -InstallDir 'C:\projects\CodexTools' `
-    -PythonPath $py `
-    -AppendProfile `
-    -InstallSkill `
-    -InstallPackage `
-    -InstallTiktoken `
-    -Force
+# Record existing preferences; the package upgrade must not change them.
+$before = (& $py -m codex_exporter --show-archive-config | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Could not read the current exporter configuration.' }
+
+$wheel = 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.9/codex_exporter-0.3.9-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps $wheel
+if ($LASTEXITCODE -ne 0) { throw 'Exporter package upgrade failed.' }
+
+$version = (& $py -m codex_exporter --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $version -ne 'codex-export 0.3.9') {
+    throw "Unexpected exporter version: $version"
+}
+$after = (& $py -m codex_exporter --show-archive-config | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Could not verify archive preferences after the upgrade.' }
+if ($before -cne $after) { throw 'Archive preferences changed unexpectedly; inspect before exporting.' }
+
+$version
+$after
 ```
 
-The installer replaces the legacy exporter helper region in `$PROFILE`, keeps
-all unrelated profile content, pins the exact Python interpreter, and creates a
-profile backup only when content changes.
+`--no-deps` preserves the working optional packages; 0.3.9 introduces no new
+required dependency. A fresh installation that needs compressed rollouts or exact
+token counts can install the `zstd` and `exact` extras from the source distribution.
+The GitHub Release also supplies `SHA256SUMS.txt` for downloaded distributions.
 
-Reload the profile:
+Run the existing command while the target thread remains active:
 
 ```powershell
-. $PROFILE
+cdx-thread '11111111-2222-4333-8444-555555555555'
 ```
 
-## 3. Validate the installation
+Or bypass any unqualified command/PATH ambiguity with the selected interpreter:
 
 ```powershell
-Get-Command cdx-sessions, cdx-thread, cdx-turn, cdx-response, cdx-last, cdx-live, cdx-batch
-cdx-tokenizer -Tokenizer tiktoken -Encoding cl100k_base -Require
-cdx-config
-cdx-sessions
-
-python 'C:\projects\CodexTools\Export-CodexThread.py' --version
-codex-export --version
+& $py -m codex_exporter --session-id '11111111-2222-4333-8444-555555555555' --mode thread
+if ($LASTEXITCODE -ne 0) { throw 'Export failed; inspect the diagnostic above.' }
 ```
 
-Expected version: `codex-export 0.2.0`.
+The default successful result is a verified ZIP containing Markdown, a manifest,
+and the captured native JSONL. Events appended after the capture boundary are
+available to the next export. The live Codex thread continues uninterrupted.
 
-Run a small functional export before a full large thread:
+## Inspect snapshot evidence
+
+For a machine-readable result, use the direct CLI:
 
 ```powershell
-cdx-responses <SESSION_ID>
-cdx-turn <SESSION_ID> 1
+$json = & $py -m codex_exporter --session-id '11111111-2222-4333-8444-555555555555' --mode thread --json
+if ($LASTEXITCODE -ne 0) { throw 'Export failed.' }
+$result = $json | ConvertFrom-Json
+$result | Select-Object archive, archive_verified, source_copy_strategy, loose_files_removed, parse_error_count
+$result.source_snapshot | Format-List
 ```
 
-Then verify the new full-thread path:
+The ZIP manifest also includes `source_snapshot`. `captured_sha256` identifies
+its native JSONL member. A nonzero `deferred_tail_bytes` means the initial cutoff
+ended in an unfinished or invalid unterminated record. It does not mean a completed
+newline-terminated record was silently dropped.
+
+## Standalone-script installations
+
+If a helper invokes an old `Export-CodexThread.py` directly, updating a wheel alone
+does not update that separate script. Extract the 0.3.9 source distribution and run
+its installer with the same existing installation directory and interpreter:
 
 ```powershell
-cdx-thread <SESSION_ID>
+# Run from the extracted 0.3.9 source directory.
+.\Install-CodexThreadExporter.ps1 -InstallDir 'C:\projects\CodexTools' -PythonPath $py -InstallPackage
 ```
 
-The output filename should include `_thread_`, and a sibling
-`.manifest.json` should be created.
+Omitting `-AppendProfile` preserves the existing profile. The installer backs up
+its previous script/package directory. Only use `-AppendProfile` when deliberately
+updating helper routing; existing package-routed 0.3.8 helpers do not require it.
 
-## 4. Choose the persistent default output directory
+## Existing files from failed attempts
 
-```powershell
-cdx-set-dir                         # native folder chooser
-cdx-set-dir 'D:\Codex Exports'     # explicit path
-cdx-open
-```
-
-The environment variable `CODEX_THREAD_EXPORT_DIR` overrides persisted state.
-Remove or update that variable when testing `cdx-set-dir` behavior.
-
-## 5. Optional cleanup after validation
-
-The 0.2 installer no longer needs the old root-level helper copies. After all
-commands above succeed:
-
-```powershell
-Remove-Item -LiteralPath 'C:\projects\CodexTools\CodexThreadExport-profile-block.ps1' -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath 'C:\projects\CodexTools\CodexThreadExport-profile-block.v7.ps1' -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath 'C:\projects\CodexTools\__pycache__' -Recurse -Force -ErrorAction SilentlyContinue
-```
-
-Keep existing export directories unless you have reviewed and intentionally
-archived or deleted their contents.
-
-## Testing a pull request before merge
-
-```powershell
-Set-Location 'C:\projects\CodexTools\CodexThreadExporter'
-gh pr checkout <PR_NUMBER>
-python -m pip install -e '.[test,exact]'
-python tools\sync_cli.py
-python -m pytest
-```
-
-Run the installer from that branch using the command in section 2. Return to
-`main` after the PR is merged:
-
-```powershell
-git switch main
-git pull --ff-only origin main
-```
+Previous failed attempts may have left loose `.md` and `.manifest.json` files.
+They are not automatically deleted by this upgrade. New exports use the existing
+collision policy and never silently replace a completed ZIP. Keep older exports
+until their contents are reviewed; no regeneration is required for already valid
+archives.

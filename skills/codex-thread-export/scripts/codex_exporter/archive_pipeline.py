@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import hashlib
 import json
 import os
@@ -15,6 +15,9 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+
+if TYPE_CHECKING:
+    from .snapshot import SourceSnapshot
 
 
 def _hash_file(path: Path) -> tuple[str, int]:
@@ -172,8 +175,37 @@ def avoid_existing_archive(md_path: Path, collision: str) -> Path:
             return candidate
         n += 1
 
+def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path) -> tuple[str, int, str]:
+    """Reuse only an owned, verified staging inode; never link app-owned input."""
+    from .snapshot import SourceSnapshot
+    if not isinstance(snapshot, SourceSnapshot) or not snapshot.owns_staged_path():
+        raise ValueError('Source-copy promotion requires an owned private snapshot')
+    before = snapshot.path.stat()
+    digest, size = _hash_file(snapshot.path)
+    if (digest, size) != (snapshot.sha256, snapshot.size_bytes):
+        raise RuntimeError('Snapshot content changed before source-copy staging')
+    try:
+        os.link(snapshot.path, destination)
+        strategy = 'snapshot_hardlink'
+    except FileExistsError:
+        raise
+    except OSError:
+        # FAT/exFAT, different volumes and some network filesystems cannot link.
+        # Exclusive create still protects an existing destination in the fallback.
+        if shutil.disk_usage(destination.parent).free < size + 8 * 1024 * 1024:
+            raise OSError('Insufficient free disk space to stage source copy')
+        digest, size = _copy_decoded(snapshot.path, destination)
+        strategy = 'snapshot_copy'
+    after = snapshot.path.stat()
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (digest, size) != (snapshot.sha256, snapshot.size_bytes)):
+        raise RuntimeError('Snapshot changed during source-copy staging; no cleanup performed')
+    return digest, size, strategy
+
+
 def package_export(result: dict[str, Any], original_source: Path,
-                   settings: ArchiveSettings) -> dict[str, Any]:
+                   settings: ArchiveSettings, *, snapshot: SourceSnapshot | None = None) -> dict[str, Any]:
     """Copy source; build/test a new flat ZIP; only then unlink three loose outputs.
 
     On an exception, originals are never touched, existing exports are kept,
@@ -184,6 +216,12 @@ def package_export(result: dict[str, Any], original_source: Path,
         return result
     if result.get('source_changed_during_export'):
         raise RuntimeError('Codex source changed during export; refusing archival cleanup')
+    if snapshot is not None:
+        from .snapshot import SourceSnapshot
+        if (not isinstance(snapshot, SourceSnapshot) or not snapshot.owns_staged_path()
+                or original_source.resolve() != snapshot.path.resolve()
+                or result.get('source_sha256') != snapshot.sha256):
+            raise ValueError('Archive input must match the owned source snapshot and its rendered digest')
     if not result.get('file'):
         return result
     md = Path(result['file']).resolve()
@@ -199,52 +237,62 @@ def package_export(result: dict[str, Any], original_source: Path,
             raise RuntimeError('Export manifest must be in Markdown output directory for flat ZIP')
         members[manifest.name] = manifest
     source_copy: Path | None = None
-    # Conservative free-space preflight for the additional loose source copy.
-    # For compressed sources, the streaming manifest supplies the decoded size.
-    if settings.copy_source:
-        expected_bytes = original_source.stat().st_size
-        if original_source.name.lower().endswith('.jsonl.zst'):
-            try:
-                detail = __import__('json').loads(manifest.read_text(encoding='utf-8')) if manifest else {}
-                expected_bytes = int(detail.get('decoded_source_bytes') or expected_bytes)
-            except (ValueError, OSError, TypeError):
-                pass
-        if shutil.disk_usage(md.parent).free < expected_bytes + 8 * 1024 * 1024:
-            raise OSError('Insufficient free disk space to stage decoded source copy')
-    source_stat_before_copy = original_source.stat()
-    # Classic .zst manifests identify the physical compressed bytes; streamed
-    # sources identify the decoded bytes. Hash the physical file only when
-    # needed for that classic compressed-manifest check.
-    if (original_source.name.lower().endswith('.jsonl.zst')
-            and 'source_lines' not in result and result.get('source_sha256')
-            and _hash_file(original_source)[0] != result['source_sha256']):
-        raise RuntimeError('Compressed Codex source changed since classic export')
-    if settings.copy_source:
-        source_copy = md.with_suffix('.jsonl')
-        if source_copy.exists():
-            raise FileExistsError(f'Refusing to overwrite source copy: {source_copy}')
-        try:
-            decoded_sha, decoded_bytes = _copy_decoded(original_source, source_copy)
-            if not source_copy.is_file() or decoded_bytes == 0:
-                raise RuntimeError('Copied source was empty')
-            if result.get('source_sha256') and (not original_source.name.endswith('.zst') or 'source_lines' in result) and decoded_sha != result['source_sha256']:
-                raise RuntimeError('Source changed since export; copy hash does not match transcript source')
-            # Streaming exports hash decoded bytes; classic compressed exports may hash physical .zst bytes.
-            if original_source.name.endswith('.zst') and result.get('decoded_source_bytes') is not None:
-                if decoded_bytes != int(result['decoded_source_bytes']):
-                    raise RuntimeError('Decoded source byte count mismatch')
-                if result.get('source_sha256') and decoded_sha != result['source_sha256']:
-                    raise RuntimeError('Decoded source SHA-256 mismatch')
-            after_copy = original_source.stat()
-            if (after_copy.st_size, after_copy.st_mtime_ns) != (source_stat_before_copy.st_size, source_stat_before_copy.st_mtime_ns):
-                raise RuntimeError('Codex rollout changed during source copy; no cleanup performed')
+    if snapshot is not None:
+        if settings.copy_source:
+            source_copy = md.with_suffix('.jsonl')
+            decoded_sha, decoded_bytes, strategy = _stage_snapshot_copy(snapshot, source_copy)
             members[source_copy.name] = source_copy
-        except Exception:
-            # Preserve the copied bytes for diagnosis, rather than assert success.
-            raise
-        result['source_copy'] = str(source_copy)
-        result['source_copy_sha256'] = decoded_sha
-        result['source_copy_bytes'] = decoded_bytes
+            result['source_copy'] = str(source_copy)
+            result['source_copy_sha256'] = decoded_sha
+            result['source_copy_bytes'] = decoded_bytes
+            result['source_copy_strategy'] = strategy
+    else:
+        # Conservative free-space preflight for the additional loose source copy.
+        # For compressed sources, the streaming manifest supplies the decoded size.
+        if settings.copy_source:
+            expected_bytes = original_source.stat().st_size
+            if original_source.name.lower().endswith('.jsonl.zst'):
+                try:
+                    detail = __import__('json').loads(manifest.read_text(encoding='utf-8')) if manifest else {}
+                    expected_bytes = int(detail.get('decoded_source_bytes') or expected_bytes)
+                except (ValueError, OSError, TypeError):
+                    pass
+            if shutil.disk_usage(md.parent).free < expected_bytes + 8 * 1024 * 1024:
+                raise OSError('Insufficient free disk space to stage decoded source copy')
+        source_stat_before_copy = original_source.stat()
+        # Classic .zst manifests identify the physical compressed bytes; streamed
+        # sources identify the decoded bytes. Hash the physical file only when
+        # needed for that classic compressed-manifest check.
+        if (original_source.name.lower().endswith('.jsonl.zst')
+                and 'source_lines' not in result and result.get('source_sha256')
+                and _hash_file(original_source)[0] != result['source_sha256']):
+            raise RuntimeError('Compressed Codex source changed since classic export')
+        if settings.copy_source:
+            source_copy = md.with_suffix('.jsonl')
+            if source_copy.exists():
+                raise FileExistsError(f'Refusing to overwrite source copy: {source_copy}')
+            try:
+                decoded_sha, decoded_bytes = _copy_decoded(original_source, source_copy)
+                if not source_copy.is_file() or decoded_bytes == 0:
+                    raise RuntimeError('Copied source was empty')
+                if result.get('source_sha256') and (not original_source.name.endswith('.zst') or 'source_lines' in result) and decoded_sha != result['source_sha256']:
+                    raise RuntimeError('Source changed since export; copy hash does not match transcript source')
+                # Streaming exports hash decoded bytes; classic compressed exports may hash physical .zst bytes.
+                if original_source.name.endswith('.zst') and result.get('decoded_source_bytes') is not None:
+                    if decoded_bytes != int(result['decoded_source_bytes']):
+                        raise RuntimeError('Decoded source byte count mismatch')
+                    if result.get('source_sha256') and decoded_sha != result['source_sha256']:
+                        raise RuntimeError('Decoded source SHA-256 mismatch')
+                after_copy = original_source.stat()
+                if (after_copy.st_size, after_copy.st_mtime_ns) != (source_stat_before_copy.st_size, source_stat_before_copy.st_mtime_ns):
+                    raise RuntimeError('Codex rollout changed during source copy; no cleanup performed')
+                members[source_copy.name] = source_copy
+            except Exception:
+                # Preserve the copied bytes for diagnosis, rather than assert success.
+                raise
+            result['source_copy'] = str(source_copy)
+            result['source_copy_sha256'] = decoded_sha
+            result['source_copy_bytes'] = decoded_bytes
     if not settings.archive:
         return result
     if any(p.parent != md.parent for p in members.values()):
@@ -263,6 +311,7 @@ def package_export(result: dict[str, Any], original_source: Path,
             'archive_filename': archive.name, 'members': sorted(members),
             'source_copy_sha256': result.get('source_copy_sha256'),
             'source_copy_bytes': result.get('source_copy_bytes'),
+            'source_copy_strategy': result.get('source_copy_strategy'),
             'cleanup_after_full_archive_verification': settings.cleanup,
         }
         with manifest.open('w', encoding='utf-8', newline='\n') as f:
