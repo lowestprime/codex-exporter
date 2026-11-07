@@ -12,6 +12,7 @@ import zipfile
 import pytest
 
 from codex_exporter import archive_pipeline as pipeline
+from codex_exporter import file_access, progress
 
 
 @pytest.fixture
@@ -33,12 +34,12 @@ def _no_links(*args, **kwargs):
     raise OSError(errno.EXDEV, 'Synthetic filesystem without hardlink support')
 
 
-def test_default_deflate_roundtrips_without_external_archiver(export, monkeypatch):
+def test_explicit_deflate_roundtrips_without_external_archiver(export, monkeypatch):
     source, markdown, manifest, result = export
     expected_markdown = markdown.read_bytes()
     original = source.read_bytes()
     monkeypatch.setattr(pipeline, 'find_archiver', lambda *args: pytest.fail('External archiver used'))
-    settings = pipeline.ArchiveSettings()
+    settings = pipeline.ArchiveSettings(method='Deflate', level=6, backend='python')
     assert settings.method == 'Deflate' and settings.level == 6
     result = pipeline.package_export(result, source, settings)
     assert result['archive_verified'] and result['archive_backend'] == 'python'
@@ -66,7 +67,7 @@ def test_default_deflate_roundtrips_without_external_archiver(export, monkeypatc
 def test_python_backend_overrides_retained_external_path(export, monkeypatch):
     source, markdown, manifest, result = export
     monkeypatch.setattr(pipeline, 'find_archiver', lambda *args: pytest.fail('Stale path consulted'))
-    settings = pipeline.ArchiveSettings(backend='python', archiver='missing-seven-zip')
+    settings = pipeline.ArchiveSettings(backend='python', method='Deflate', level=6, archiver='missing-seven-zip')
     result = pipeline.package_export(result, source, settings)
     assert result['archive_backend'] == 'python'
 
@@ -100,7 +101,7 @@ def test_compression_level_is_respected_without_changing_content(tmp_path):
 def test_archive_publication_without_hardlinks_is_verified(export, monkeypatch):
     source, markdown, manifest, result = export
     monkeypatch.setattr(pipeline.os, 'link', _no_links)
-    result = pipeline.package_export(result, source, pipeline.ArchiveSettings())
+    result = pipeline.package_export(result, source, pipeline.ArchiveSettings(method='Deflate', level=6, backend='python'))
     assert result['archive_publication'] == 'verified_copy'
     assert result['archive_verified'] and result['loose_files_removed']
     with zipfile.ZipFile(result['archive']) as archive:
@@ -116,9 +117,10 @@ def test_publication_race_preserves_existing_archive_and_loose_files(export, mon
         destination.write_bytes(other)
         raise OSError(errno.EXDEV, 'Synthetic link failure after a competing publication')
 
+    monkeypatch.setattr(file_access, 'hardlink_publication_allowed', lambda: True)
     monkeypatch.setattr(pipeline.os, 'link', competing_link)
     with pytest.raises(FileExistsError):
-        pipeline.package_export(result, source, pipeline.ArchiveSettings())
+        pipeline.package_export(result, source, pipeline.ArchiveSettings(method='Deflate', level=6, backend='python'))
     assert markdown.with_suffix('.zip').read_bytes() == other
     assert markdown.exists() and manifest.exists() and markdown.with_suffix('.jsonl').exists()
     assert source.exists()
@@ -129,13 +131,15 @@ def test_copy_verification_failure_removes_only_new_partial_destination(tmp_path
     source = tmp_path / 'stage.zip'
     source.write_bytes(b'Previously verified staging bytes')
     destination = tmp_path / 'published.zip'
-    original_hash = pipeline._hash_file
+    original_digest = file_access._digest
 
-    def wrong_readback(path):
-        return ('wrong hash', 0) if path == destination else original_hash(path)
+    def wrong_readback(stream, **kwargs):
+        if Path(stream.name) == destination:
+            return ('wrong hash', 0)
+        return original_digest(stream, **kwargs)
 
     monkeypatch.setattr(pipeline.os, 'link', _no_links)
-    monkeypatch.setattr(pipeline, '_hash_file', wrong_readback)
+    monkeypatch.setattr(file_access, '_digest', wrong_readback)
     with pytest.raises(RuntimeError, match='copy verification failed'):
         pipeline._publish_archive(source, destination)
     assert source.read_bytes() == b'Previously verified staging bytes'
@@ -154,7 +158,7 @@ def test_changed_member_after_verification_prevents_publication_and_cleanup(expo
 
     monkeypatch.setattr(pipeline, '_verify_members', verify_then_change)
     with pytest.raises(RuntimeError, match='member changed during packaging'):
-        pipeline.package_export(result, source, pipeline.ArchiveSettings())
+        pipeline.package_export(result, source, pipeline.ArchiveSettings(method='Deflate', level=6, backend='python'))
     assert markdown.read_bytes().endswith(b'Newer export data')
     assert manifest.exists() and markdown.with_suffix('.jsonl').exists()
     assert not markdown.with_suffix('.zip').exists()
@@ -174,7 +178,7 @@ def test_changed_member_after_publication_preserves_all_loose_files(export, monk
 
     monkeypatch.setattr(pipeline, '_publish_archive', publish_then_change)
     with pytest.raises(RuntimeError, match='member changed during packaging'):
-        pipeline.package_export(result, source, pipeline.ArchiveSettings())
+        pipeline.package_export(result, source, pipeline.ArchiveSettings(method='Deflate', level=6, backend='python'))
     assert markdown.read_bytes() == expected + b'Newer export data'
     assert manifest.exists() and markdown.with_suffix('.jsonl').exists()
     with zipfile.ZipFile(markdown.with_suffix('.zip')) as archive:
@@ -185,13 +189,13 @@ def test_changed_member_after_publication_preserves_all_loose_files(export, monk
 def test_failed_python_writer_retains_export_files(export, monkeypatch):
     source, markdown, manifest, result = export
 
-    def fail(staged, members, level):
+    def fail(staged, members, level, **kwargs):
         staged.write_bytes(b'Incomplete archive')
         raise OSError('Synthetic write failure')
 
     monkeypatch.setattr(pipeline, '_write_python_archive', fail)
     with pytest.raises(OSError, match='Synthetic write failure'):
-        pipeline.package_export(result, source, pipeline.ArchiveSettings())
+        pipeline.package_export(result, source, pipeline.ArchiveSettings(method='Deflate', level=6, backend='python'))
     assert markdown.exists() and manifest.exists() and markdown.with_suffix('.jsonl').exists()
     assert not markdown.with_suffix('.zip').exists()
     assert not list(markdown.parent.glob('.*.zip'))
@@ -215,7 +219,7 @@ def test_explicit_lzma_keeps_external_dictionary_controls(export, monkeypatch):
                 archive.write(Path(cwd) / name, arcname=name)
         return SimpleNamespace(returncode=0, stdout='', stderr='')
 
-    monkeypatch.setattr(pipeline.subprocess, 'run', external)
+    monkeypatch.setattr(progress, 'run_seven_zip', external)
     result = pipeline.package_export(result, source, pipeline.ArchiveSettings(method='LZMA', level=9))
     assert result['archive_backend'] == '7zip'
     assert result['archive_method'] == 'LZMA'

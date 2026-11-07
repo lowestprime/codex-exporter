@@ -1,4 +1,4 @@
-# Codex Exporter 0.3.10 archive and review controls for existing PowerShell helpers.
+# Codex Exporter 0.3.11 archive, review and progress controls for existing PowerShell helpers.
 # This file is dot-sourced AFTER existing profile. Existing Invoker is retained.
 function Get-CodexArchiveCliArgs {
     param([System.Collections.IDictionary]$Bound)
@@ -11,7 +11,7 @@ function Get-CodexArchiveCliArgs {
         NoArchive='--no-archive'; NoSourceCopy='--no-source-copy';
         NoArchiveCleanup='--no-archive-cleanup'; Archive='--archive';
         SourceCopy='--source-copy'; ArchiveCleanup='--archive-cleanup';
-        Review='--review'; NoReview='--no-review'
+        Review='--review'; NoReview='--no-review'; NoProgress='--no-progress'
     }
     foreach ($key in $switches.Keys) {
         if ((@($Bound.Keys) -contains $key) -and [bool]$Bound[$key]) {
@@ -22,12 +22,13 @@ function Get-CodexArchiveCliArgs {
         ArchiverPath='--archiver-path'; ArchiveLevel='--archive-level';
         ArchiveMethod='--archive-method'; ArchiveDictionary='--archive-dictionary';
         ArchiveWordSize='--archive-word-size'; ArchiveThreads='--archive-threads';
-        ArchiveBackend='--archive-backend'; ReviewChunkBytes='--review-chunk-bytes'
+        ArchiveBackend='--archive-backend'; ReviewChunkBytes='--review-chunk-bytes';
+        ProgressStyle='--progress-style'
     }
     foreach ($key in $values.Keys) {
         if ((@($Bound.Keys) -contains $key)) {
             $value = [string]$Bound[$key]
-            if ($key -eq 'ArchiveBackend') { $value = $value.ToLowerInvariant() }
+            if ($key -in @('ArchiveBackend', 'ProgressStyle')) { $value = $value.ToLowerInvariant() }
             $items.Add($values[$key]); $items.Add($value)
         }
     }
@@ -56,9 +57,11 @@ function cdx-thread {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -83,9 +86,11 @@ function cdx-response {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -111,6 +116,7 @@ function cdx-project {
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -120,7 +126,7 @@ function cdx-project {
         [ValidateRange(1,128)][int]$ArchiveThreads)
     $o = @('--project', $Project)
     if ($OutDir) { $o += @('--out-dir', $OutDir) }
-    if ($NoProgress) { $o += '--no-progress' } else { $o += '--progress' }
+    if (-not $NoProgress) { $o += '--progress' }
     if ($UnknownSidecar) { $o += @('--unknown-events', 'sidecar') }
     Invoke-CodexArchiveWrapper -SessionId @() -Mode thread -Options $o -Bound $PSBoundParameters
 }
@@ -136,9 +142,11 @@ function cdx-range {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -161,9 +169,11 @@ function cdx-batch {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -188,9 +198,11 @@ function cdx-turn {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -215,9 +227,11 @@ function cdx-last {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -240,9 +254,11 @@ function cdx-final {
         [switch]$Archive,
         [switch]$SourceCopy,
         [switch]$ArchiveCleanup,
+        [switch]$NoProgress,
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -268,6 +284,7 @@ function cdx-fast {
         [switch]$Review,
         [switch]$NoReview,
         [ValidateRange(4096,1500000)][int]$ReviewChunkBytes,
+        [ValidateSet('auto','rich','plain','json','off')][string]$ProgressStyle,
         [ValidateSet('auto','python','7zip')][string]$ArchiveBackend,
         [string]$ArchiverPath,
         [ValidateRange(1,9)][int]$ArchiveLevel,
@@ -277,7 +294,7 @@ function cdx-fast {
         [ValidateRange(1,128)][int]$ArchiveThreads)
     $o = @('--fast')
     if ($OutDir) { $o += @('--out-dir', $OutDir) }
-    if ($NoProgress) { $o += '--no-progress' } else { $o += '--progress' }
+    if (-not $NoProgress) { $o += '--progress' }
     Invoke-CodexArchiveWrapper -SessionId @($SessionId) -Mode thread -Options $o -Bound $PSBoundParameters
 }
 

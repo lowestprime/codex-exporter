@@ -106,4 +106,12 @@ Assert-Rejected 'Review part size below minimum' { cdx-thread $id -ReviewChunkBy
 Assert-Rejected 'Review part size above maximum' { cdx-thread $id -ReviewChunkBytes 1500001 }
 Assert-Rejected 'Unknown archive backend' { cdx-thread $id -ArchiveBackend unsupported }
 Assert-Rejected 'Conflicting review switches' { cdx-thread $id -Review -NoReview }
-Write-Host 'PASS: All archive and review wrapper checks completed without executing Codex.'
+
+Assert-Rejected 'Unknown progress style' { cdx-thread $id -ProgressStyle unsupported }
+foreach ($case in $reviewCases) {
+    $invokeCase = $case.Call
+    Assert-Call "$($case.Name) progress controls" {
+        & $invokeCase @{ ProgressStyle='JSON'; NoProgress=$true }
+    } @('--progress-style','json','--no-progress') @('--progress')
+}
+Write-Host 'PASS: All archive, review and progress wrapper checks completed without executing Codex.'

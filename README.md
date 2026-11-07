@@ -1,10 +1,10 @@
-# Codex Exporter 0.3.10 — portable review files and live exports
+# Codex Exporter 0.3.11 — live exports, one LZMA ZIP, readable Windows files
 
-Export a running Codex thread into a verified archive and a portable text review
-companion. Ordinary `cdx-*` file exports now also produce a `.review.zip` and a
-retained `.review` directory containing bounded TXT parts, an index, and a clearly
-labeled recent excerpt. The review parts preserve every byte of the rendered
-Markdown, including code, long lines, and embedded payload text.
+Export a running Codex thread into **one verified ZIP containing the original
+three files**: rendered Markdown, its JSON manifest, and the captured native
+JSONL. Ordinary exports leave no `.review.zip` or `.review` directory. Maximum
+configured LZMA settings are restored: level 9, a 256 MiB dictionary, word size
+64, and 19 requested threads, using a compatible external 7-Zip CLI.
 
 ```powershell
 cdx-thread '11111111-2222-4333-8444-555555555555'
@@ -12,126 +12,212 @@ cdx-thread '11111111-2222-4333-8444-555555555555'
 codex-export --session-id '11111111-2222-4333-8444-555555555555' --mode thread
 ```
 
-The printed path and `--open-after` prefer the review ZIP. Use `--json` when a
-script needs both `review_archive` and `archive`; `archive` still identifies the
-full archival ZIP. `--no-review` restores the ordinary export/archive output.
+The printed path and `--open-after` select the final ZIP. Exporting continues to
+work while Codex appends new events: each export captures a verified, fixed
+prefix, and later events appear in the next export. The app-owned rollout is
+never moved, deleted, or modified.
 
-## Choose the appropriate output
+## Default output and optional review text
 
-| Output | Contents and use |
+| Selection | Generated output after successful cleanup |
 |---|---|
-| `<stem>.review.zip` | Standard Deflate ZIP containing the review text files and metadata; no native JSONL member |
-| `<stem>.review/START_HERE.txt` | Review instructions, scope, and reconstruction guidance |
-| `<stem>.review/RECENT.txt` | Recent excerpt with an explicit source byte range; not the complete thread |
-| `<stem>.review/part-0001.txt`, etc. | Numbered chronological parts of the exact rendered Markdown |
-| `<stem>.review/review-index.json` | Per-part sizes, SHA-256 hashes, original Markdown byte/line ranges, and source provenance |
-| `<stem>.zip` | Full Markdown, export manifest, and native decoded JSONL snapshot when source-copy is enabled |
+| Default export | One `<stem>.zip` with `<stem>.md`, `<stem>.manifest.json`, and `<stem>.jsonl` |
+| `--review` | The same ZIP, additionally containing bounded review TXT files, index, and guide |
+| `--no-review` | The original three-file ZIP; this is the default |
+| `--no-archive` | Loose export files; explicitly requested review adds a text directory, never a ZIP |
+| `--no-archive-cleanup` | Verified ZIP plus retained loose export files |
+| `--no-source-copy` | Omit native JSONL, for example when using rendered-content redaction |
+| `--review-from PATH` | Explicit standalone conversion to a `.review.zip` and retained `.review` directory |
 
-If a receiving chat cannot access or extract a ZIP, attach `START_HERE.txt`,
-`RECENT.txt`, and the relevant numbered TXT files directly. Use the index to select
-additional history and upload manageable batches. File accessibility and model
-context limits are separate: a successful upload does not establish that the
-model has read the whole thread.
+Additional review content is opt-in and goes inside the existing archive during
+an ordinary archived export. `--review-from` remains available when a receiving
+application needs individual TXT files or a Deflate review ZIP. Choosing that
+standalone converter explicitly requests its separate outputs. With
+`--no-archive`, an explicit review request creates verified text in one `.review`
+directory and no ZIP. `--no-archive` alone creates only the loose ordinary export.
 
-Each numbered part is at most **1,000,000 UTF-8 bytes including its header** by
-default. `--review-chunk-bytes` accepts 4,096 through 1,500,000 bytes. Unicode
-characters remain intact; a long line may span parts. The recent excerpt contains
-at most 200,000 transcript bytes and also fits within the selected part-size cap,
-including its header. These are byte bounds, not exact token counts.
-
-Review creation does not summarize, trim, deduplicate, or redact the rendered
-Markdown again. It preserves the selected mode and existing rendering/redaction
-choices. The native source remains the authority for records that the renderer
-omitted, transformed, or could not interpret. See [integrity semantics](docs/INTEGRITY-AND-MANIFEST.md).
-
-## Make an existing export reviewable
-
-No live Codex installation or session lookup is needed to convert an existing
-export ZIP, Markdown, or TXT file:
+Review parts preserve every byte of the rendered Markdown, including code, long
+lines, and embedded payload text. Each numbered TXT part is at most **1,000,000
+UTF-8 bytes including its header** by default. `--review-chunk-bytes` accepts
+4,096 through 1,500,000 bytes. Unicode characters remain intact; long lines may
+span parts. The index records original byte/line ranges and hashes. `RECENT.txt`
+is a labeled excerpt, not the complete thread. These are byte bounds, not exact
+token counts or a promise that a receiving model has read the complete export.
 
 ```powershell
-codex-export --review-from 'C:\Exports\previous-export.zip'
-codex-export --review-from 'C:\Exports\previous-export.md' --out-dir 'C:\Exports\Review'
-codex-export --review-from 'C:\Exports\previous-export.zip' --review-chunk-bytes 500000 --json
+# Add review text inside the ordinary archive for this export.
+codex-export --session-id UUID --mode thread --review --review-chunk-bytes 1000000
+# Persist the opt-in setting, or restore the three-file default.
+codex-export --set-archive-default review=true
+codex-export --set-archive-default review=false
 ```
 
-A legacy LZMA ZIP is decoded using Python's ZIP reader. Only its Markdown and
-matching manifest are read and CRC-checked; its potentially large native JSONL
-member is not opened. The input archive is preserved. The review index records
-this verification scope and carries forward the manifest's native-source hash as
-provenance, not as a newly verified hash of native bytes. Ambiguous, duplicate,
-encrypted, or unsafe archive member inventories are rejected.
+Review creation preserves the selected mode and rendering/redaction choices; it
+does not summarize or truncate the rendered Markdown again. Native JSONL remains
+the authority for records omitted, transformed, or unrecognized by a renderer.
+See [integrity semantics](docs/INTEGRITY-AND-MANIFEST.md).
 
-## Upgrade an existing installation
+## Upgrade and restore the requested compression settings
 
-Use the interpreter that runs your existing exporter. A standard per-user
-CPython 3.13 installation can be updated with:
+Use the interpreter that runs your existing exporter. Installing a release does
+not erase explicitly saved preferences, so installations that selected Deflate
+in 0.3.10 should restore LZMA explicitly:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
+$archiver = 'C:\Program Files\7-Zip-Zstandard\7z.exe'
 if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
     throw 'Select the Python interpreter used by your existing exporter.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.10/codex_exporter-0.3.10-py3-none-any.whl'
+if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
+    throw 'Select the installed compatible 7-Zip CLI.'
+}
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.11/codex_exporter-0.3.11-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
-& $py -m codex_exporter --show-archive-config
-```
-
-Review companions are enabled automatically for existing package-routed helpers.
-**Previously saved LZMA/level settings remain in effect for the full archive**;
-installing the new version does not rewrite those preferences. To select portable
-Deflate level 6 with the built-in backend explicitly:
-
-```powershell
-& $py -m codex_exporter --set-archive-default method=Deflate --set-archive-default level=6 --set-archive-default backend=python
+if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }
+& $py -m codex_exporter `
+    --set-archive-default archive=true `
+    --set-archive-default "archiver=$archiver" `
+    --set-archive-default method=LZMA `
+    --set-archive-default level=9 `
+    --set-archive-default backend=auto `
+    --set-archive-default dictionary=256m `
+    --set-archive-default word_size=64 `
+    --set-archive-default threads=19 `
+    --set-archive-default copy_source=true `
+    --set-archive-default cleanup=true `
+    --set-archive-default review=false
 if ($LASTEXITCODE -ne 0) { throw 'Archive configuration update failed.' }
 & $py -m codex_exporter --show-archive-config
 ```
 
-This retains a saved external-archiver path but bypasses it while `backend=python`.
-Set `backend=auto` to honor that path again. Existing output locations, filename
-preferences, and source-copy/cleanup choices remain available. No profile
-replacement is required for package-routed commands. See the [Windows upgrade
-guide](docs/WINDOWS-UPGRADE.md) for checks and standalone-script installations.
+The example selects the quoted installed archiver path explicitly. Other saved
+paths remain supported. When no path is saved, the
+exporter searches for a compatible CLI. `backend=auto` selects an external
+backend for LZMA; `backend=python` supports Deflate and must be changed when
+selecting LZMA. A configured executable is checked before a large snapshot is
+captured. Existing output locations, filenames, and other saved preferences
+remain available. Package-routed `cdx-*` helpers use the updated package; copied
+standalone scripts must also be updated. See the [Windows upgrade guide](docs/WINDOWS-UPGRADE.md).
 
-## Archive compression and cleanup
+The release assets include checksums. Compare the actual downloaded wheel with
+its published SHA-256 before installation when using a pinned deployment; a
+checksum is tied to those exact built bytes, not to the version string alone.
 
-New configurations default to **ZIP/Deflate level 6**. With `backend=auto`,
-Deflate uses Python's built-in ZIP writer when no archiver path is configured;
-a configured path is honored. `--archive-backend python` explicitly selects the
-built-in Deflate writer, and `--archive-backend 7zip` selects a compatible external
-CLI. LZMA remains opt-in with the `auto` or `7zip` backend.
+## Archive compression, verification, and performance
+
+The default settings are `method=LZMA`, `level=9`, `dictionary=256m`,
+`word_size=64`, `threads=19`, `backend=auto`, `archive=true`, `copy_source=true`,
+`cleanup=true`, and `review=false`. The thread value is the requested backend
+limit, not a guarantee that every compression phase uses 19 CPU threads. Ratio,
+memory consumption, and runtime depend on the source, encoder, and machine.
+These settings preserve the requested compression policy; no universal best
+ratio or fixed speedup is claimed.
 
 ```powershell
-# Per-export controls do not change stored preferences.
+# One-export overrides do not change persisted preferences.
+codex-export --mode thread --session-id UUID --archive-method LZMA --archive-level 9
+# Optional compatibility choice, only when explicitly requested:
 codex-export --mode thread --session-id UUID --archive-backend python --archive-method Deflate --archive-level 6
-codex-export --mode thread --session-id UUID --archive-backend 7zip --archive-method LZMA --archive-level 9
-codex-export --mode thread --session-id UUID --no-review
-codex-export --mode thread --session-id UUID --no-archive
 codex-export --mode thread --session-id UUID --no-archive-cleanup
 codex-export --show-archive-config
 ```
 
-Review ZIPs always use built-in Deflate level 6, independently of full-archive
-compression. Full archival ZIPs are independently decompressed and SHA-256/size
-verified before loose Markdown, manifest, and source-copy cleanup. The retained
-review directory and review ZIP survive that cleanup. `--no-archive` still creates
-review files unless `--no-review` is also supplied. `--no-file` creates neither.
-Unknown-event sidecars remain outside the full ZIP and are retained.
+The exporter independently decompresses the final member inventory and compares
+SHA-256 hashes and byte lengths before removing loose exports. Existing archives
+are never overwritten. Detected changes to loose members stop cleanup. Failure
+preserves recoverable loose outputs; cleanup applies only after successful
+verification and publication. Export output paths are checked for source and
+output aliases, including existing hard links, before writing. An explicit
+manifest path cannot overwrite the live source or the rendered Markdown.
+Explicit unknown-event sidecars remain separate
+and are retained; they are not part of the default three-file layout.
 
-The private source snapshot can be reused through an exclusive hard link, with a
-verified copy fallback. Archive publication also supports filesystems without
-hard links. Existing archives are never overwritten. Detected changes to loose
-export members stop cleanup, and archive failure preserves those loose exports.
-ZIP Store is accepted for individual members when an external archiver elects
-not to compress them; unrequested methods and substantive all-Store output are
-rejected. The Python Deflate writer does not use that fallback.
+An external archiver may use Store for a short or incompressible member. The
+validator accepts that method-0 fallback while rejecting unrequested compression
+methods and a substantive entirely uncompressed archive. LZMA is ZIP method 14;
+Python supports decoding it, but [some other extractors do not](https://docs.python.org/3.13/library/zipfile.html#zipfile.ZIP_LZMA).
+Windows file access, successful ZIP decoding, and receiving-model ingestion are
+separate checks. Restoring access permissions does not alter the compression
+method or imply that a model has consumed every archived token.
 
-LZMA uses ZIP method 14, which [some extractors do not support](https://docs.python.org/3.13/library/zipfile.html#zipfile.ZIP_LZMA); Deflate uses method 8. The review companion removes that compression dependency while retaining
-ordinary TXT files for environments without ZIP ingestion. A rendered redaction
-does not redact native JSONL: `--redact` requires `--no-source-copy`.
+## Windows access permissions and existing exports
+
+Version 0.3.11 publishes files on Windows by creating fresh destination files and
+streaming verified bytes into them. The new file inherits the selected output
+folder's ACL. It does not retain private staging permissions, change source
+permissions, grant access to Everyone, or change ownership. Private staging
+remains private. POSIX systems retain inexpensive hard-link publication when
+available, with a verified-copy fallback.
+
+This addresses a code path matching [CPython issue #157876](https://github.com/python/cpython/issues/157876):
+`mkdir(mode=0o700)` and temporary directories can receive a protected OWNER
+RIGHTS ACL that excludes an ordinary interactive token when created by an
+elevated process. Microsoft's documentation confirms that [newly created files
+inherit parent permissions, while moves do not](https://learn.microsoft.com/en-us/windows/win32/fileio/file-security-and-access-rights),
+and that [hard links share the underlying file's security descriptor](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createhardlinkw).
+This mechanism explains a possible access-denied regression; a screenshot alone
+does not establish a particular file's owner, ACL, or corruption. Diagnose the
+actual file and parent ACL before attributing a local failure.
+
+```powershell
+& $py -m codex_exporter --diagnose-access 'C:\Exports\codex_example.zip'
+& $py -m codex_exporter --diagnose-access 'C:\Exports\codex_example.review'
+# Explicit repair of selected previous exporter artifacts:
+& $py -m codex_exporter --repair-access 'C:\Exports\codex_example.zip'
+& $py -m codex_exporter --repair-access 'C:\Exports\codex_example.review'
+if ($LASTEXITCODE -ne 0) { throw 'Review the reported access-repair failures.' }
+```
+
+Both options are repeatable and return JSON. Diagnostics attempt actual reading
+and report owner SID, protected/inherited/explicit DACL entries, and the parent
+ACL. Repair uses the Windows system `icacls` to [reset an explicit artifact to
+its parent-inherited ACL](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls).
+Only recognized `codex_` export files and a validated flat `codex_*.review` tree
+are accepted. Custom-named exports can be diagnosed but are deliberately outside
+this repair scope. Broad output roots, app-owned `.codex` paths, wildcards,
+symlinks, junctions, multiply linked files, and unexpected review entries are
+rejected before repair starts.
+
+Repair needs existing permission to change the selected DACL. It never takes
+ownership or elevates itself. A protected export may therefore require the same
+account/token that created it. The output parent must already grant access to
+the intended user; resetting a child cannot repair a restrictive parent. Before
+and after diagnostics and each result are returned, with a failing exit status
+if a repair remains unsuccessful.
+
+## Measured progress for each stage
+
+Progress is sent to **stderr** so stdout remains the final path or `--json`
+result. Interactive terminals receive a compact colored bar, icons, elapsed
+time, measured throughput, and ETA when the stage has a meaningful denominator.
+Compression displays the percentages actually reported by 7-Zip; it does not
+turn those percentages into invented byte throughput or a guessed overall job
+percentage. Unknown-duration work displays activity and elapsed time.
+
+```powershell
+codex-export --session-id UUID --mode thread --progress-style auto
+codex-export --session-id UUID --mode thread --progress-style rich
+codex-export --session-id UUID --mode thread --progress-style plain
+codex-export --session-id UUID --mode thread --progress-style json 2> progress.jsonl
+codex-export --session-id UUID --mode thread --no-progress
+```
+
+`auto` uses the terminal display when supported and sparse plain events when
+redirected. `rich` requests the built-in terminal display, with no extra package
+dependency. `NO_COLOR`, narrow terminals, non-Unicode encodings, redirection, and
+`TERM=dumb` are handled. `json` emits machine-readable stage events; `off` and
+`--no-progress` disable progress output. Updates are throttled to limit overhead.
+
+Snapshot copying, prefix verification, source-copy checks, rendering, optional
+review generation, compression, independent member verification,
+publication, and cleanup receive distinct stages. Windows publication separates
+its source checksum, copy, and readback verification, so a completed copy is not
+presented as the end of archive verification. The 7-Zip runner drains output
+continuously, retains bounded diagnostic text, and cancels its child process if
+interrupted.
 
 ## How a live export is defined
 
@@ -143,31 +229,51 @@ does not redact native JSONL: `--redact` requires `--no-source-copy`.
    newlines are retained. Invalid or unfinished unterminated tails are deferred
    with byte/hash metadata. Completed malformed records remain in the native copy
    and parse audit.
-4. Render, review, and archive that capture. Later events appear in the next export;
+4. Render and archive that capture. Later events appear in the next export;
    each source in a batch has its own boundary.
 
-The 0.3.9 live snapshot contract is unchanged. Both renderers retain original-path
+The 0.3.9 live snapshot contract is preserved. Both renderers retain original-path
 provenance, record `source_snapshot`, and hash the captured decoded JSONL.
 Compressed rollouts are decoded once with complete-frame verification. This is a
 verified append-only prefix, not an atomic filesystem snapshot against arbitrary
-in-place writers. Codex is not paused and its source files are not modified.
+in-place writers. Codex is not paused.
+
+## Make an existing export reviewable
+
+No live Codex installation or session lookup is needed:
+
+```powershell
+codex-export --review-from 'C:\Exports\previous-export.zip'
+codex-export --review-from 'C:\Exports\previous-export.md' --out-dir 'C:\Exports\Review'
+```
+
+The explicit standalone converter creates a Deflate `.review.zip` and retained
+TXT directory. Add `--no-archive` to request only the verified TXT directory. A legacy LZMA ZIP is decoded with Python's ZIP reader; only its
+Markdown and matching manifest are read and CRC-checked. The native JSONL member
+is not opened. The original remains intact, and the index distinguishes checked
+members from inherited source-hash provenance. Ambiguous, duplicate, encrypted,
+or unsafe member inventories are rejected.
+
+If a receiving chat cannot access a ZIP, attach the guide, recent excerpt, and
+relevant numbered TXT parts directly. The index identifies additional history.
+An upload's success does not establish complete model ingestion.
 
 ## Validation scope
 
-Regression tests cover byte-exact review reconstruction, Unicode and line
-boundaries, size caps, actual Deflate decoding, CRC/hash checks, collisions,
-legacy LZMA conversion without native JSONL access, unsafe inventories, both
-renderers, and live-source growth. The CI matrix targets Windows/macOS/Linux on
-Python 3.10 and 3.13, plus package and mirrored-script validation. Consult the
-release's Actions runs for their results.
+Regression coverage includes live-source growth, snapshot boundaries, default
+three-member archives, optional embedded review text, exact review reconstruction,
+Unicode and size caps, LZMA/Deflate decoding, CRC/hash failures, collisions, copy
+failures, progress framing, and child-process cancellation. Windows-specific
+tests construct distinct private staging and destination DACLs, verify inherited
+permissions on published files, read back a LZMA ZIP, and exercise scoped repair
+without changing original or parent ACLs. Those tests run on Windows rather than
+being simulated with POSIX mode bits.
 
-Deflate avoids the previous large LZMA dictionary and reduces compression work for
-the default configuration. Review creation adds bounded reads, text copies, and a
-second ZIP; disk space and runtime depend on the actual transcript. No fixed
-speedup, memory bound for individual renderer records, or end-to-end ChatGPT
-attachment-access guarantee is implied.
+The CI matrix targets Windows/macOS/Linux on Python 3.10 and 3.13, plus package,
+PowerShell, and mirrored-script validation. Consult the release's Actions runs
+for actual results. No private archive is required by or included in the tests.
 
-[0.3.10 release notes](docs/releases/v0.3.10.md) · [Changelog](CHANGELOG.md)
+[0.3.11 release notes](docs/releases/v0.3.11.md) · [Changelog](CHANGELOG.md)
 
 ---
 

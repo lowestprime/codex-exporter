@@ -6,7 +6,7 @@ snapshot or protection against a hostile writer changing bytes between checks.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -17,8 +17,9 @@ import shutil
 import stat
 import sys
 import tempfile
-import time
 from typing import Any, BinaryIO, Iterator
+
+from .progress import ProgressReporter, StageProgress
 
 CHUNK_BYTES = 4 * 1024 * 1024
 
@@ -59,55 +60,43 @@ class SourceSnapshot:
                 and not self.path.is_symlink())
 
 
-def _progress(label: str, done: int, total: int, begin: float) -> None:
-    elapsed = max(time.monotonic() - begin, .001)
-    print(f'\rCodex {label}: {100 * done / total if total else 100:5.1f}%  '
-          f'{done / 1048576:,.1f}/{total / 1048576:,.1f} MiB  '
-          f'{done / elapsed / 1048576:,.1f} MiB/s',
-          end='\n' if done >= total else '', file=sys.stderr, flush=True)
-
-
-def _copy_prefix(source: BinaryIO, target: BinaryIO, size: int, *, progress: bool = False) -> _Digest:
+def _copy_prefix(source: BinaryIO, target: BinaryIO, size: int, *,
+                 progress: bool | StageProgress = False) -> _Digest:
     """Never chase a moving EOF, including while the caller keeps appending."""
     state = _Digest()
-    begin = last = time.monotonic()
-    while state.size < size:
-        data = source.read(min(CHUNK_BYTES, size - state.size))
-        if not data:
-            raise RuntimeError('Codex source was truncated during snapshot capture; retry the export')
-        target.write(data)
-        state.update(data)
-        now = time.monotonic()
-        if progress and now - last >= 1:
-            _progress('snapshot', state.size, size, begin)
-            last = now
-    if progress:
-        _progress('snapshot', state.size, size, begin)
+    context = (nullcontext(progress) if hasattr(progress, 'update') else
+               ProgressReporter(enabled=bool(progress)).stage('Capture snapshot', total=size))
+    with context as task:
+        while state.size < size:
+            data = source.read(min(CHUNK_BYTES, size - state.size))
+            if not data:
+                raise RuntimeError('Codex source was truncated during snapshot capture; retry the export')
+            target.write(data)
+            state.update(data)
+            task.update(state.size)
     return state
 
 
-def _verify_prefix(source: BinaryIO, size: int, expected: str, *, progress: bool = False) -> None:
+def _verify_prefix(source: BinaryIO, size: int, expected: str, *,
+                   progress: bool | StageProgress = False) -> None:
     source.seek(0)
     digest = hashlib.sha256()
     done = 0
-    begin = last = time.monotonic()
-    while done < size:
-        data = source.read(min(CHUNK_BYTES, size - done))
-        if not data:
-            raise RuntimeError('Codex source was truncated during snapshot verification; retry the export')
-        digest.update(data)
-        done += len(data)
-        now = time.monotonic()
-        if progress and now - last >= 1:
-            _progress('verify', done, size, begin)
-            last = now
-    if digest.hexdigest() != expected:
-        raise RuntimeError('Codex source prefix was rewritten during snapshot capture; retry the export')
-    if progress:
-        _progress('verify', done, size, begin)
+    context = (nullcontext(progress) if hasattr(progress, 'update') else
+               ProgressReporter(enabled=bool(progress)).stage('Verify captured prefix', total=size))
+    with context as task:
+        while done < size:
+            data = source.read(min(CHUNK_BYTES, size - done))
+            if not data:
+                raise RuntimeError('Codex source was truncated during snapshot verification; retry the export')
+            digest.update(data)
+            done += len(data)
+            task.update(done)
+        if digest.hexdigest() != expected:
+            raise RuntimeError('Codex source prefix was rewritten during snapshot capture; retry the export')
 
 
-def _decode_zstd(source: Path, target: Path) -> _Digest:
+def _decode_zstd(source: Path, target: Path, *, progress: StageProgress | None = None) -> _Digest:
     try:
         import zstandard as zstd
     except ImportError as exc:
@@ -115,6 +104,7 @@ def _decode_zstd(source: Path, target: Path) -> _Digest:
     state = _Digest()
     decoder = None
     frames = 0
+    reported = 0
     with source.open('rb') as physical, target.open('xb') as output:
         # Small compressed chunks bound output bursts. Unlike stream_reader,
         # decompressobj exposes EOF so incomplete frames cannot look successful.
@@ -131,10 +121,15 @@ def _decode_zstd(source: Path, target: Path) -> _Digest:
                     decoder = None
                 else:
                     data = b''
+            if progress is not None and physical.tell() - reported >= 65536:
+                reported = physical.tell()
+                progress.update(reported, detail=f'{state.size:,} decoded bytes; {frames:,} complete frames')
         if decoder is not None or not frames:
             raise RuntimeError('Incomplete Zstandard frame in captured Codex rollout; retry after compression completes')
         output.flush()
         os.fsync(output.fileno())
+        if progress is not None:
+            progress.update(physical.tell(), detail=f'{state.size:,} decoded bytes; {frames:,} complete frames')
     return state
 
 
@@ -175,7 +170,8 @@ def _finish_records(path: Path, state: _Digest) -> tuple[str, int, int, str | No
 
 @contextmanager
 def snapshot_source(source: Path, *, directory: Path | None = None,
-                    progress: bool = False) -> Iterator[SourceSnapshot]:
+                    progress: bool = False,
+                    reporter: ProgressReporter | None = None) -> Iterator[SourceSnapshot]:
     """Freeze a verified complete-record prefix; clean staging on every exit.
 
     The cutoff is the open handle's first fstat size. Later appends are left for
@@ -183,6 +179,7 @@ def snapshot_source(source: Path, *, directory: Path | None = None,
     that same handle; observed truncation, replacement and rewrites fail before
     any export is rendered. Changes after this context yields cannot affect it.
     """
+    reporter = reporter if reporter is not None else ProgressReporter(enabled=progress)
     source = source.expanduser().resolve()
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -198,26 +195,37 @@ def snapshot_source(source: Path, *, directory: Path | None = None,
                 raise ValueError('Codex rollout must be a regular file')
             if shutil.disk_usage(staging).free < before.st_size + 8 * 1024 * 1024:
                 raise OSError('Insufficient free disk space to capture the Codex snapshot')
-            with physical.open('xb') as output:
-                state = _copy_prefix(original, output, before.st_size, progress=progress)
-                output.flush()
-                os.fsync(output.fileno())
+            with reporter.stage('Capture snapshot', total=before.st_size,
+                                detail='Fixed source prefix; later appends remain for the next export') as task:
+                with physical.open('xb') as output:
+                    state = _copy_prefix(original, output, before.st_size, progress=task)
+                    task.update(detail='Flush captured bytes to disk')
+                    output.flush()
+                    os.fsync(output.fileno())
             physical_sha = state.digest.hexdigest()
-            _verify_prefix(original, before.st_size, physical_sha, progress=progress)
-            after = os.fstat(original.fileno())
-            try:
-                current = source.stat()
-            except FileNotFoundError as exc:
-                raise RuntimeError('Codex source was removed or replaced during snapshot capture; retry the export') from exc
-            if ((before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
-                    or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
-                raise RuntimeError('Codex source was replaced during snapshot capture; retry the export')
-            if after.st_size < before.st_size or current.st_size < before.st_size:
-                raise RuntimeError('Codex source was truncated during snapshot capture; retry the export')
+            with reporter.stage('Verify captured prefix', total=before.st_size,
+                                detail='Independent bounded read and SHA-256 comparison') as task:
+                _verify_prefix(original, before.st_size, physical_sha, progress=task)
+                after = os.fstat(original.fileno())
+                try:
+                    current = source.stat()
+                except FileNotFoundError as exc:
+                    raise RuntimeError('Codex source was removed or replaced during snapshot capture; retry the export') from exc
+                if ((before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
+                        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+                    raise RuntimeError('Codex source was replaced during snapshot capture; retry the export')
+                if after.st_size < before.st_size or current.st_size < before.st_size:
+                    raise RuntimeError('Codex source was truncated during snapshot capture; retry the export')
+                task.update(detail=f'Prefix verified; {max(0, after.st_size - before.st_size):,} later bytes deferred')
         if compressed:
-            state = _decode_zstd(physical, captured)
-            physical.unlink()
-        sha, included_bytes, deferred, deferred_sha = _finish_records(captured, state)
+            with reporter.stage('Decode compressed snapshot', total=physical.stat().st_size,
+                                detail='Zstandard physical input bytes') as task:
+                state = _decode_zstd(physical, captured, progress=task)
+                physical.unlink()
+        with reporter.stage('Finalize snapshot boundary', unit='records',
+                            detail='Validate the final JSONL record') as task:
+            sha, included_bytes, deferred, deferred_sha = _finish_records(captured, state)
+            task.update(detail=f'{included_bytes:,} captured bytes; {deferred:,} deferred tail bytes')
         metadata: dict[str, Any] = {
             'policy': 'verified_prefix',
             'original_source': str(source),
