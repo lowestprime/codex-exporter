@@ -37,8 +37,8 @@ def _index(result: dict) -> dict:
 def _verify_parts(result: dict, original: bytes, chunk_bytes: int = CHUNK_BYTES) -> dict:
     assert result["review_verified"] is True
     directory = Path(result["review_directory"])
-    archive = Path(result["review_archive"])
-    assert directory.is_dir() and archive.is_file()
+    archive = Path(result["review_archive"]) if result.get("review_archive") else None
+    assert directory.is_dir() and (archive is None or archive.is_file())
     assert Path(result["review_index"]).parent == directory
     assert Path(result["review_recent"]).parent == directory
     index = _index(result)
@@ -75,17 +75,18 @@ def _verify_parts(result: dict, original: bytes, chunk_bytes: int = CHUNK_BYTES)
     assert bytes(rebuilt) == original
     assert expected_start == len(original)
 
-    expected_files = {p.name for p in directory.iterdir() if p.is_file()}
-    with zipfile.ZipFile(archive) as zipped:
-        infos = zipped.infolist()
-        assert len(infos) == len(expected_files)
-        assert {info.filename for info in infos} == expected_files
-        assert all(info.compress_type == zipfile.ZIP_DEFLATED for info in infos)
-        assert not any(info.flag_bits & 1 for info in infos)
-        assert zipped.testzip() is None
-        for info in infos:
-            assert "/" not in info.filename and "\\" not in info.filename
-            assert zipped.read(info) == (directory / info.filename).read_bytes()
+    if archive is not None:
+        expected_files = {p.name for p in directory.iterdir() if p.is_file()}
+        with zipfile.ZipFile(archive) as zipped:
+            infos = zipped.infolist()
+            assert len(infos) == len(expected_files)
+            assert {info.filename for info in infos} == expected_files
+            assert all(info.compress_type == zipfile.ZIP_DEFLATED for info in infos)
+            assert not any(info.flag_bits & 1 for info in infos)
+            assert zipped.testzip() is None
+            for info in infos:
+                assert "/" not in info.filename and "\\" not in info.filename
+                assert zipped.read(info) == (directory / info.filename).read_bytes()
     return index
 
 
@@ -320,3 +321,137 @@ def test_retrofit_rejects_windows_stream_and_device_names(tmp_path: Path, name: 
         archive.writestr(name, b"This must not be extracted to a Windows device or stream.")
     with pytest.raises(ValueError):
         review.review_existing_export(source, tmp_path / "converted")
+
+
+@pytest.mark.parametrize('copy_source', [False, True], ids=['without-native', 'with-native'])
+def test_embedded_preparation_only_writes_members_and_references_same_archive_manifest(
+    tmp_path: Path, copy_source: bool,
+):
+    raw = ('# Selected transcript\r\nUnicode 🧠 中文 preserved.\r\n' * 1000).encode('utf-8')
+    markdown = _markdown(tmp_path, raw)
+    manifest = markdown.with_suffix('.manifest.json')
+    original_members = [markdown.name, manifest.name]
+    if copy_source:
+        original_members.append(markdown.with_suffix('.jsonl').name)
+    manifest_raw = (json.dumps({'source_sha256': SOURCE_DIGEST,
+                               'archive_plan': {'method': 'LZMA', 'members': original_members}}) + '\n').encode()
+    manifest.write_bytes(manifest_raw)
+    private = tmp_path / 'private-staging'
+    prepared = review.prepare_review_files(markdown, manifest, directory=private,
+                                           chunk_bytes=CHUNK_BYTES)
+    members = prepared['members']
+    assert set(members) == {path.name for path in private.iterdir()}
+    assert set(members) == {'START_HERE.txt', 'RECENT.txt', 'review-index.json',
+                            *(name for name in members if name.startswith('part-'))}
+    assert 'original-export.manifest.json' not in members
+    assert not any(path.suffix == '.zip' for path in tmp_path.rglob('*'))
+    assert not list(tmp_path.glob('*.review'))
+    assert prepared['review_verified'] is True
+    assert not prepared.get('review_archive') and not prepared.get('review_directory')
+    index = json.loads(members['review-index.json'].read_bytes())
+    assert index['archive_context'] == 'embedded_in_primary_export'
+    assert index['manifest'] == {'filename': manifest.name, 'sha256': hashlib.sha256(manifest_raw).hexdigest(),
+                                 'location': 'same_archive'}
+    assert index['original_manifest_sha256'] == hashlib.sha256(manifest_raw).hexdigest()
+    assert index['native_source_member'] == (markdown.with_suffix('.jsonl').name if copy_source else None)
+    reconstructed = b''.join(members[part['filename']].read_bytes()[part['header_bytes']:]
+                             for part in index['parts'])
+    assert reconstructed == raw
+    assert prepared['review_markdown_sha256'] == hashlib.sha256(raw).hexdigest()
+    for name, path in members.items():
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == prepared['review_member_sha256'][name]
+    guide = members['START_HERE.txt'].read_text(encoding='utf-8')
+    assert "enclosing export ZIP's selected compression method" in guide
+    assert 'Deflate' not in guide
+    assert manifest.name in guide
+    if copy_source:
+        assert 'native JSONL is in this same archive' in guide
+    else:
+        assert 'does not include a native JSONL source copy' in guide
+    assert markdown.read_bytes() == raw
+    assert manifest.read_bytes() == manifest_raw
+
+
+def test_embedded_manifest_inventory_refresh_avoids_second_transcript_pass(tmp_path, monkeypatch):
+    raw = b'# Complete transcript\n' * 3000
+    markdown = _markdown(tmp_path, raw)
+    manifest = markdown.with_suffix('.manifest.json')
+    details = {'source_sha256': SOURCE_DIGEST,
+               'archive_plan': {'method': 'LZMA', 'members': [markdown.name, manifest.name]}}
+    manifest.write_text(json.dumps(details), encoding='utf-8')
+    prepared = review.prepare_review_files(markdown, manifest, directory=tmp_path / 'private',
+                                           chunk_bytes=CHUNK_BYTES)
+    before_parts = {name: path.read_bytes() for name, path in prepared['members'].items()
+                    if name.startswith('part-')}
+    details['archive_plan']['members'] += sorted(prepared['members'])
+    manifest.write_text(json.dumps(details), encoding='utf-8')
+    manifest_raw = manifest.read_bytes()
+    original_open = Path.open
+
+    def forbid_transcript_reopen(path, *args, **kwargs):
+        assert path != markdown, 'Refreshing the inventory must not reread the transcript'
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', forbid_transcript_reopen)
+    review.refresh_embedded_manifest(prepared, manifest)
+    index_path = prepared['members']['review-index.json']
+    index_raw = index_path.read_bytes()
+    index = json.loads(index_raw)
+    assert index['manifest']['sha256'] == hashlib.sha256(manifest_raw).hexdigest()
+    assert index['original_manifest_sha256'] == hashlib.sha256(manifest_raw).hexdigest()
+    assert prepared['review_member_sha256']['review-index.json'] == hashlib.sha256(index_raw).hexdigest()
+    for name, before in before_parts.items():
+        assert prepared['members'][name].read_bytes() == before
+
+
+def test_prepared_file_readback_detects_changed_part_before_success(tmp_path, monkeypatch):
+    markdown = _markdown(tmp_path, b'Authentic rendered content.\n' * 1000)
+    write = review._write
+    changed = False
+
+    def write_then_corrupt(path, raw, hashes):
+        nonlocal changed
+        write(path, raw, hashes)
+        if path.name.startswith('part-') and not changed:
+            path.write_bytes(path.read_bytes() + b'Unexpected mutation')
+            changed = True
+
+    monkeypatch.setattr(review, '_write', write_then_corrupt)
+    with pytest.raises(RuntimeError, match='Review file content mismatch'):
+        review.prepare_review_files(markdown, directory=tmp_path / 'private', chunk_bytes=CHUNK_BYTES)
+    assert changed and markdown.read_bytes() == b'Authentic rendered content.\n' * 1000
+    assert not list(tmp_path.rglob('*.zip'))
+
+
+def test_manifest_refresh_rejects_changed_review_index(tmp_path):
+    markdown = _markdown(tmp_path, b'Original transcript\n')
+    manifest = markdown.with_suffix('.manifest.json')
+    manifest.write_text('{}', encoding='utf-8')
+    prepared = review.prepare_review_files(markdown, manifest, directory=tmp_path / 'private')
+    index_path = prepared['members']['review-index.json']
+    index_path.write_text('{"unexpected":"replacement"}', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='Review index changed'):
+        review.refresh_embedded_manifest(prepared, manifest)
+    assert index_path.read_text(encoding='utf-8') == '{"unexpected":"replacement"}'
+
+
+@pytest.mark.parametrize('input_kind', ['text', 'zip'])
+def test_no_archive_review_conversion_publishes_only_verified_text(tmp_path, input_kind):
+    raw = ('# Original text\r\nUnicode 🧠 preserved.\r\n' * 1000).encode('utf-8')
+    if input_kind == 'text':
+        source = _markdown(tmp_path, raw)
+    else:
+        source = tmp_path / 'original.zip'
+        with zipfile.ZipFile(source, 'w', compression=zipfile.ZIP_LZMA) as archive:
+            archive.writestr('original.md', raw)
+            archive.writestr('original.manifest.json', '{}')
+    before = source.read_bytes()
+    output = tmp_path / 'converted'
+    result = review.review_existing_export(source, output, chunk_bytes=CHUNK_BYTES, archive=False)
+    assert result['review_archive'] is None
+    _verify_parts(result, raw)
+    assert list(output.iterdir()) == [Path(result['review_directory'])]
+    assert not list(output.rglob('*.zip'))
+    guide = Path(result['review_start']).read_text(encoding='utf-8')
+    assert 'without a ZIP' in guide and 'uses standard Deflate' not in guide
+    assert source.read_bytes() == before

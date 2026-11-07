@@ -67,7 +67,7 @@ def test_full_pipeline_and_positional_uuid(tmp_path):
         assert hashlib.sha256(srcdata).hexdigest()==digest
         assert b'Hello UCLA original' in srcdata
         assert z.read(zp.stem+'.md').startswith(b'---')
-        assert zipfile.ZIP_DEFLATED==z.getinfo(zp.stem+'.md').compress_type
+        assert zipfile.ZIP_LZMA==z.getinfo(zp.stem+'.md').compress_type
     assert src.exists() and hashlib.sha256(src.read_bytes()).hexdigest()==digest
 
 
@@ -168,33 +168,32 @@ def test_repeat_export_never_overwrites_existing_zip(tmp_path):
     assert Path(second).stem.endswith('-1')
 
 
-def test_default_cli_prints_review_zip_and_keeps_uploadable_text(tmp_path):
+def test_default_cli_prints_only_one_lzma_archive_with_three_members(tmp_path):
     source, digest, archiver, env = prepare(tmp_path)
     output = tmp_path / 'out'
     completed = run(env, '--mode', 'thread', SID, '--fast', '--no-progress',
-                    '--out-dir', str(output))
+                    '--archiver-path', str(archiver), '--out-dir', str(output))
     assert completed.returncode == 0, completed.stderr
-    review = Path(completed.stdout.strip())
-    assert review.is_file() and review.name.endswith('.review.zip')
-    text_directory = review.with_suffix('')
-    assert (text_directory / 'START_HERE.txt').is_file()
-    assert (text_directory / 'RECENT.txt').is_file()
-    assert list(text_directory.glob('part-*.txt'))
-    assert 'Full archival export:' in completed.stderr
-    full_archives = [path for path in output.glob('*.zip') if not path.name.endswith('.review.zip')]
-    assert len(full_archives) == 1
-    with zipfile.ZipFile(review) as archive:
-        assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_DEFLATED}
-        assert not any(name.endswith('.jsonl') for name in archive.namelist())
-    with zipfile.ZipFile(full_archives[0]) as archive:
-        assert archive.read(full_archives[0].stem + '.jsonl') == source.read_bytes()
+    archive_path = Path(completed.stdout.strip())
+    assert archive_path.is_file() and archive_path.suffix == '.zip'
+    assert not archive_path.name.endswith('.review.zip')
+    assert list(output.iterdir()) == [archive_path]
+    assert 'Review text files:' not in completed.stderr
+    with zipfile.ZipFile(archive_path) as archive:
+        assert {info.compress_type for info in archive.infolist()} == {zipfile.ZIP_LZMA}
+        assert set(archive.namelist()) == {archive_path.stem + suffix
+                                          for suffix in ('.md', '.manifest.json', '.jsonl')}
+        assert archive.read(archive_path.stem + '.jsonl') == source.read_bytes()
+        details = json.loads(archive.read(archive_path.stem + '.manifest.json'))
+        assert details['archive_plan']['method'] == 'LZMA'
+        assert details['archive_plan']['level'] == 9
 
 
 def test_no_review_cli_preserves_full_archive_output(tmp_path):
     source, digest, archiver, env = prepare(tmp_path)
     output = tmp_path / 'out'
     completed = run(env, '--mode', 'thread', SID, '--fast', '--no-progress',
-                    '--no-review', '--out-dir', str(output))
+                    '--no-review', '--archiver-path', str(archiver), '--out-dir', str(output))
     assert completed.returncode == 0, completed.stderr
     archive_path = Path(completed.stdout.strip())
     assert archive_path.is_file() and archive_path.suffix == '.zip'

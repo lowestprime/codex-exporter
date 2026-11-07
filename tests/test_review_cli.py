@@ -1,4 +1,4 @@
-"""CLI review companions respect rendering scope and work without native tools."""
+"""Optional same-ZIP reviews preserve scope; explicit conversion remains portable."""
 from __future__ import annotations
 
 import hashlib
@@ -48,22 +48,35 @@ def _export(monkeypatch, capsys, source: Path, output: Path, *,
         '--jsonl', str(source), '--mode', mode, '--fast' if fast else '--no-fast',
         '--no-progress', '--tokenizer', 'regex', '--name', 'Synthetic review',
         '--out-dir', str(output), '--no-remember-out-dir', '--review-chunk-bytes', '8192',
-        '--archive-backend', 'python', *extra,
+        '--archive-backend', 'python', '--archive-method', 'Deflate',
+        '--archive-level', '6', '--review', *extra,
     ])
 
 
 def _read_review(result: dict) -> tuple[dict, bytes]:
-    directory = Path(result['review_directory'])
-    index = json.loads(Path(result['review_index']).read_text(encoding='utf-8'))
-    bodies = [(directory / part['filename']).read_bytes()[part['header_bytes']:]
-              for part in index['parts']]
+    archive_path = result.get('review_archive') or result.get('archive')
+    if archive_path:
+        with zipfile.ZipFile(archive_path) as archive:
+            index = json.loads(archive.read('review-index.json'))
+            bodies = [archive.read(part['filename'])[part['header_bytes']:]
+                      for part in index['parts']]
+            if result.get('review_directory'):
+                directory = Path(result['review_directory'])
+                for part in index['parts']:
+                    assert archive.read(part['filename']) == (directory / part['filename']).read_bytes()
+            else:
+                assert Path(archive_path) == Path(result['archive'])
+                assert index['archive_context'] == 'embedded_in_primary_export'
+                assert not Path(archive_path).name.endswith('.review.zip')
+    else:
+        directory = Path(result['review_directory'])
+        index = json.loads((directory / 'review-index.json').read_bytes())
+        bodies = [(directory / part['filename']).read_bytes()[part['header_bytes']:]
+                  for part in index['parts']]
     reconstructed = b''.join(bodies)
     assert hashlib.sha256(reconstructed).hexdigest() == index['markdown']['sha256']
     assert len(reconstructed) == index['markdown']['bytes']
     assert result['review_markdown_sha256'] == index['markdown']['sha256']
-    with zipfile.ZipFile(result['review_archive']) as archive:
-        for part in index['parts']:
-            assert archive.read(part['filename']) == (directory / part['filename']).read_bytes()
     return index, reconstructed
 
 
@@ -85,13 +98,16 @@ def test_redacted_review_matches_archival_markdown_without_native_leak(
         assert not any(name.endswith('.jsonl') for name in archive.namelist())
         assert archive.read(result['archived_markdown']) == reconstructed
         manifest_raw = archive.read(result['archived_manifest'])
-    review_manifest = Path(result['review_directory']) / 'original-export.manifest.json'
-    assert review_manifest.read_bytes() == manifest_raw
+    assert index['manifest']['filename'] == result['archived_manifest']
+    assert index['manifest']['sha256'] == hashlib.sha256(manifest_raw).hexdigest()
     assert index['original_manifest_sha256'] == hashlib.sha256(manifest_raw).hexdigest()
     assert json.loads(manifest_raw)['archive_plan']['archive_filename'] == Path(result['archive']).name
-    for path in Path(result['review_directory']).iterdir():
-        if path.is_file():
-            assert SECRET.encode() not in path.read_bytes()
+    with zipfile.ZipFile(result['archive']) as archive:
+        assert 'original-export.manifest.json' not in archive.namelist()
+        for name in archive.namelist():
+            assert SECRET.encode() not in archive.read(name)
+    assert not result.get('review_directory')
+    assert list((tmp_path / 'export').iterdir()) == [Path(result['archive'])]
     assert synthetic_source.read_bytes() == before
 
 
@@ -104,13 +120,15 @@ def test_last_response_review_uses_only_selected_rendered_content(
     assert NEW_ANSWER.encode() in reconstructed
     assert OLD_PROMPT.encode() not in reconstructed
     assert OLD_ANSWER.encode() not in reconstructed
-    for path in Path(result['review_directory']).iterdir():
-        if path.is_file():
-            assert OLD_PROMPT.encode() not in path.read_bytes()
-            assert OLD_ANSWER.encode() not in path.read_bytes()
+    with zipfile.ZipFile(result['archive']) as archive:
+        review_names = ['START_HERE.txt', 'RECENT.txt', 'review-index.json',
+                        *(part['filename'] for part in index['parts'])]
+        for name in review_names:
+            assert OLD_PROMPT.encode() not in archive.read(name)
+            assert OLD_ANSWER.encode() not in archive.read(name)
     with zipfile.ZipFile(result['archive']) as archive:
         assert archive.read(result['archived_markdown']) == reconstructed
-        # The separate archival source remains complete, independently of the
+        # The native member in the same ZIP remains complete, independently of the
         # selected rendered/review mode; it is never copied into review parts.
         assert archive.read(result['archived_source']) == before
     assert index['source_sha256'] == hashlib.sha256(before).hexdigest()
@@ -124,6 +142,7 @@ def test_no_file_creates_neither_review_nor_archival_outputs(
         raise AssertionError('--no-file attempted file packaging')
 
     monkeypatch.setattr(review, 'create_review_bundle', forbidden)
+    monkeypatch.setattr(review, 'prepare_review_files', forbidden)
     monkeypatch.setattr(archive_pipeline, 'package_export', forbidden)
     output = tmp_path / 'no-file-output'
     result = _export(monkeypatch, capsys, synthetic_source, output,
@@ -197,7 +216,7 @@ def test_retrofit_rejects_flags_that_would_misstate_scope_or_privacy(
     assert not output.exists() or not list(output.iterdir())
 
 
-def test_review_failure_retains_verified_archive_and_every_loose_export(
+def test_review_failure_retains_loose_outputs_without_publishing_incomplete_zip(
     synthetic_source: Path, tmp_path: Path, monkeypatch, capsys,
 ):
     before = synthetic_source.read_bytes()
@@ -206,21 +225,15 @@ def test_review_failure_retains_verified_archive_and_every_loose_export(
     def fail_review(*args, **kwargs):
         raise RuntimeError('Synthetic review creation failure')
 
-    monkeypatch.setattr(review, 'create_review_bundle', fail_review)
+    monkeypatch.setattr(review, 'prepare_review_files', fail_review)
     with pytest.raises(RuntimeError, match='Synthetic review creation failure'):
         _export(monkeypatch, capsys, synthetic_source, output)
-    archives = list(output.glob('*.zip'))
-    assert len(archives) == 1
-    assert not archives[0].name.endswith('.review.zip')
+    assert not list(output.glob('*.zip'))
     assert len(list(output.glob('*.md'))) == 1
     assert len(list(output.glob('*.manifest.json'))) == 1
-    assert len(list(output.glob('*.jsonl'))) == 1
-    with zipfile.ZipFile(archives[0]) as archive:
-        assert archive.testzip() is None
-        for name in archive.namelist():
-            assert archive.read(name) == (output / name).read_bytes()
-        native_name = next(name for name in archive.namelist() if name.endswith('.jsonl'))
-        assert archive.read(native_name) == before
+    source_copies = list(output.glob('*.jsonl'))
+    assert len(source_copies) == 1
+    assert source_copies[0].read_bytes() == before
     assert synthetic_source.read_bytes() == before
     assert not list(output.glob('*.review'))
 
@@ -236,3 +249,35 @@ def test_redaction_rejects_default_unredacted_native_copy(
     assert '--no-source-copy' in capsys.readouterr().err
     assert synthetic_source.read_bytes() == before
     assert not output.exists() or not list(output.iterdir())
+
+
+def test_explicit_no_archive_with_review_creates_only_loose_files(
+    synthetic_source, tmp_path, monkeypatch, capsys,
+):
+    output = tmp_path / 'loose'
+    result = _export(monkeypatch, capsys, synthetic_source, output, extra=('--no-archive',))
+    index, reconstructed = _read_review(result)
+    assert result['review_archive'] is None
+    assert not result.get('archive')
+    assert not list(output.rglob('*.zip'))
+    assert reconstructed == Path(result['file']).read_bytes()
+    assert Path(result['source_copy']).read_bytes() == synthetic_source.read_bytes()
+    assert index['archive_context'] == 'standalone_review'
+    assert (Path(result['review_directory']) / 'review-index.json').is_file()
+
+
+def test_retrofit_cli_no_archive_returns_only_review_directory(tmp_path, monkeypatch, capsys):
+    source = tmp_path / 'original.md'
+    raw = '# A prior export\nLossless Unicode 🧠.\n'.encode('utf-8')
+    source.write_bytes(raw)
+    output = tmp_path / 'converted'
+    monkeypatch.setenv('CODEX_EXPORT_CONFIG', str(tmp_path / 'config.json'))
+    result = _invoke(monkeypatch, capsys, [
+        '--review-from', str(source), '--out-dir', str(output), '--no-archive',
+    ])
+    _, reconstructed = _read_review(result)
+    assert reconstructed == raw
+    assert result['review_archive'] is None
+    assert list(output.iterdir()) == [Path(result['review_directory'])]
+    assert not list(output.rglob('*.zip'))
+    assert source.read_bytes() == raw

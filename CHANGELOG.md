@@ -1,3 +1,13 @@
+## 0.3.11 — One LZMA ZIP, inherited Windows access, measured progress (2026-11-07)
+
+- Restore LZMA level 9, a 256 MiB dictionary, word size 64, 19 requested threads, and the automatic compatible external backend. Retain explicit saved configuration until deliberately changed; document restoring earlier Deflate overrides.
+- Default to one ZIP containing the original Markdown/manifest/native-JSONL triplet. Disable review companions by default and place opt-in review TXT/index/guide content inside the same ordinary archive. Preserve explicit standalone `--review-from` conversion; honor `--no-archive` with verified review text only and no ZIP.
+- Create fresh Windows destination files with inherited parent DACLs; verify copied bytes and readback instead of carrying private staging permissions through hard links or renames. Keep private staging and live rollout permissions unchanged and retain the POSIX hard-link optimization.
+- Add repeatable JSON access diagnostics and narrowly scoped inherited-ACL repair for explicit recognized exports. Refuse source paths, broad directories, links/junctions, multiple hard links, wildcards, and unexpected review members; never take ownership or grant global access.
+- Add terminal bars/icons/colors, plain and JSON progress styles, measured per-stage rates/elapsed time/ETA, and separately reported checksum/copy/readback. Stream actual 7-Zip compression progress with bounded diagnostics and interruption handling; keep stdout machine-readable.
+- Preserve verified fixed-prefix live snapshots, original source provenance, full ZIP member hash/length checks, source-copy validation, collision protection, and cleanup only after success.
+- Extend regressions for real Windows ACL inheritance/repair, three-member defaults, embedded review, measured progress, streaming process output, cancellation, output/source path aliases, and publication failures. Platform outcomes are reported by the release's CI runs.
+
 ## 0.3.10 — Portable review companions and Deflate archives (2026-11-06)
 
 - Create a verified `.review.zip` and retained `.review` text directory for ordinary local Codex file exports by default. Printed/opened output prefers the review ZIP; JSON retains both archive paths. `--no-review` opts out.

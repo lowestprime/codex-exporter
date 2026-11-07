@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.10"
+__version__ = "0.3.11"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -2415,6 +2415,7 @@ def parse_session(
     strip: bool,
     max_line_chars: int,
     max_repeated_lines: int,
+    progress: Any = None,
 ) -> tuple[list[Record], dict[str, Any]]:
     records: list[Record] = []
     meta: dict[str, Any] = {
@@ -2434,6 +2435,8 @@ def parse_session(
 
     with open_rollout_text(path) as f:
         for seq, line in enumerate(f, 1):
+            if progress is not None:
+                progress.update(seq)
             if not line.strip():
                 continue
             meta["_source_event_count"] = int(meta.get("_source_event_count", 0)) + 1
@@ -3292,6 +3295,8 @@ def main() -> int:
     ap.add_argument("--fast-threshold-mib", type=int, default=128, help="Auto-stream full threads this size or larger (default: 128 MiB)")
     ap.add_argument("--progress", dest="progress", action="store_true", default=None, help="Show real-time progress on stderr")
     ap.add_argument("--no-progress", dest="progress", action="store_false", help="Disable progress")
+    ap.add_argument("--progress-style", choices=["auto", "rich", "plain", "json", "off"], default="auto",
+                    help="stderr progress: adaptive terminal bars, plain logs, JSON events, or off")
     ap.add_argument("--unknown-events", choices=['report', 'sidecar'], default='report', help="Report unknown schemas, or separately preserve their raw JSONL")
 
     config_group = ap.add_argument_group("persistent configuration")
@@ -3356,7 +3361,7 @@ def main() -> int:
     pipeline.add_argument('--no-archive-cleanup', dest='archive_cleanup', action='store_false')
     pipeline.add_argument('--archiver-path', help='Exact 7-Zip-compatible CLI executable; auto-discovered otherwise')
     pipeline.add_argument('--archive-backend', choices=['auto', 'python', '7zip'],
-                          help='auto selects built-in Deflate unless an external archiver is configured')
+                          help='auto uses 7-Zip for LZMA; Python supports explicit Deflate exports')
     pipeline.add_argument('--archive-level', type=int)
     pipeline.add_argument('--archive-method', choices=['LZMA', 'Deflate'])
     pipeline.add_argument('--archive-dictionary', help='LZMA dictionary size, e.g. 256m')
@@ -3364,16 +3369,21 @@ def main() -> int:
     pipeline.add_argument('--archive-threads', type=int)
     pipeline.add_argument('--show-archive-config', action='store_true')
     pipeline.add_argument('--set-archive-default', action='append', metavar='KEY=VALUE',
-                          help='Persist a default (archive, copy_source, cleanup, archiver, backend, level, method, dictionary, word_size, threads)')
-    review = ap.add_argument_group('portable text review')
-    review.add_argument('--review', dest='review', action='store_true', default=True,
-                        help='Create a verified Deflate review ZIP plus retained text parts (default)')
+                          help='Persist a default (archive, copy_source, cleanup, archiver, backend, level, method, dictionary, word_size, threads, review, review_chunk_bytes)')
+    review = ap.add_argument_group('optional text review')
+    review.add_argument('--review', dest='review', action='store_true', default=None,
+                        help='Include lossless text review parts inside the same archive (opt-in)')
     review.add_argument('--no-review', dest='review', action='store_false',
-                        help='Produce only the ordinary export/archive')
-    review.add_argument('--review-chunk-bytes', type=int, default=1_000_000,
+                        help='Only the Markdown, manifest and optional native JSONL (default)')
+    review.add_argument('--review-chunk-bytes', type=int, default=None,
                         help='Maximum UTF-8 bytes per review part including header (4096..1500000)')
     review.add_argument('--review-from', type=Path, metavar='EXPORT_ZIP_OR_TEXT',
-                        help='Create review files from an existing .zip/.md/.txt without accessing Codex')
+                        help='Explicitly create a standalone review ZIP and text folder from an existing export')
+    access = ap.add_mutually_exclusive_group()
+    access.add_argument('--diagnose-access', action='append', type=Path, metavar='PATH',
+                        help='Inspect read access and Windows ACLs for an explicit path; repeatable')
+    access.add_argument('--repair-access', action='append', type=Path, metavar='EXPORT_PATH',
+                        help='Restore inherited Windows permissions on explicit generated exports; repeatable')
     ap.add_argument("--tokenizer", choices=["auto", "tiktoken", "regex"], default="auto")
     ap.add_argument("--token-encoding", default=DEFAULT_TOKEN_ENCODING)
     ap.add_argument("--require-tiktoken", action="store_true")
@@ -3389,6 +3399,25 @@ def main() -> int:
     ap.add_argument("--max-tool-chars", type=int, default=20_000)
     ap.add_argument("--json", dest="json_result", action="store_true")
     args = ap.parse_args()
+    if args.diagnose_access or args.repair_access:
+        if any((args.session_ids, args.session_id, args.jsonl, args.project, args.sessions_file,
+                args.latest_session, args.browse, args.chatgpt_export, args.review_from)):
+            ap.error('Access inspection/repair cannot be combined with export source selectors')
+        from codex_exporter.file_access import diagnose_access, repair_export_access
+        if args.repair_access:
+            try:
+                inspected = repair_export_access(args.repair_access)
+            except (OSError, ValueError) as exc:
+                print(json.dumps({'operation': 'repair_access', 'repaired': False,
+                                  'error': str(exc)}, ensure_ascii=False, indent=2))
+                return 1
+            ok = all(item.get('repaired') for item in inspected)
+        else:
+            inspected = [diagnose_access(path) for path in args.diagnose_access]
+            ok = all(item.get('readable') for item in inspected)
+        print(json.dumps(inspected[0] if len(inspected) == 1 else inspected, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+    review_disabled_explicitly = args.review is False
     if args.session_ids:
         args.session_id = list(args.session_id or []) + args.session_ids
 
@@ -3403,14 +3432,16 @@ def main() -> int:
                        'cleanup': ('cleanup', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
                        'archiver': ('archiver', str), 'backend': ('backend', str), 'level': ('level', int),
                        'method': ('method', str), 'dictionary': ('dictionary', str),
-                       'word_size': ('word_size', int), 'threads': ('threads', int)}
+                       'word_size': ('word_size', int), 'threads': ('threads', int),
+                       'review': ('review', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
+                       'review_chunk_bytes': ('review_chunk_bytes', int)}
         for setting in args.set_archive_default:
             if '=' not in setting:
                 ap.error('--set-archive-default must use KEY=VALUE')
             key, raw = setting.split('=', 1)
             if key not in conversions:
                 ap.error(f'Unsupported archive default: {key}')
-            if key in ('archive', 'copy_source', 'cleanup') and raw.lower() not in ('true','false','yes','no','on','off','1','0'):
+            if key in ('archive', 'copy_source', 'cleanup', 'review') and raw.lower() not in ('true','false','yes','no','on','off','1','0'):
                 ap.error(f'Expected boolean value for {key}')
             field, convert = conversions[key]
             try:
@@ -3434,7 +3465,8 @@ def main() -> int:
                             ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'),
                             ('archive_backend', 'backend'), ('archive_level', 'level'), ('archive_method', 'method'),
                             ('archive_dictionary', 'dictionary'), ('archive_word_size', 'word_size'),
-                            ('archive_threads', 'threads')):
+                            ('archive_threads', 'threads'), ('review', 'review'),
+                            ('review_chunk_bytes', 'review_chunk_bytes')):
         value = getattr(args, argument)
         if value is not None:
             archive_options[field] = value
@@ -3443,6 +3475,8 @@ def main() -> int:
         archive_settings.validate()
     except (TypeError, ValueError) as exc:
         ap.error(f'Invalid archive configuration: {exc}')
+    args.review = archive_settings.review
+    args.review_chunk_bytes = archive_settings.review_chunk_bytes
 
     if args.reset_config:
         config_path().unlink(missing_ok=True)
@@ -3489,299 +3523,335 @@ def main() -> int:
         from codex_exporter.modern import audit
         print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
         return 0
-    from codex_exporter.review import review_existing_export, _validate_chunk_bytes
-    try:
-        _validate_chunk_bytes(args.review_chunk_bytes)
-    except ValueError as exc:
-        ap.error(str(exc))
+    from codex_exporter.progress import ProgressReporter
+    reporter = ProgressReporter(style=args.progress_style,
+                                enabled=args.progress if args.progress is not None else True)
+    with reporter:
+        from codex_exporter.review import review_existing_export, _validate_chunk_bytes
+        try:
+            _validate_chunk_bytes(args.review_chunk_bytes)
+        except ValueError as exc:
+            ap.error(str(exc))
 
-    def preferred_output(result: dict[str, Any]) -> str | None:
-        return result.get('review_archive') or result.get('archive') or result.get('file')
+        def preferred_output(result: dict[str, Any]) -> str | None:
+            return result.get('archive') or result.get('review_archive') or result.get('file') or result.get('review_directory')
 
-    def report_output(result: dict[str, Any]) -> None:
-        if not args.json_result:
-            if result.get('review_directory'):
-                print(f"Review text files: {result['review_directory']}", file=sys.stderr)
-            if result.get('archive') and result.get('review_archive'):
-                print(f"Full archival export: {result['archive']}", file=sys.stderr)
-            print(preferred_output(result))
+        def report_output(result: dict[str, Any]) -> None:
+            if not args.json_result:
+                if result.get('review_directory'):
+                    print(f"Review text files: {result['review_directory']}", file=sys.stderr)
+                print(preferred_output(result))
 
-    def finish_export(result: dict[str, Any], snapshot: Any) -> dict[str, Any]:
-        if result.get('file') and not result.get('skipped'):
-            result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot,
-                                    review=args.review, review_chunk_bytes=args.review_chunk_bytes)
-        return result
+        def finish_export(result: dict[str, Any], snapshot: Any) -> dict[str, Any]:
+            if result.get('file') and not result.get('skipped'):
+                result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot,
+                                        review=args.review, review_chunk_bytes=args.review_chunk_bytes, reporter=reporter)
+            return result
 
-    if args.review_from:
-        if not args.review:
-            ap.error('--review-from cannot be combined with --no-review')
-        if any((args.project, args.session_id, args.jsonl, args.sessions_file,
-                args.latest_session, args.browse, args.chatgpt_export)):
-            ap.error('--review-from cannot be combined with another source selector')
-        if any((args.redact, args.no_file, args.stdout, args.clipboard, args.list,
-                args.list_responses, args.message is not None, args.response is not None,
-                args.from_message is not None, args.to_message is not None,
-                args.last_n_turns is not None, args.live_context, args.chatgpt_audit)):
-            ap.error('--review-from preserves existing text; redaction, no-file, stdout/clipboard, and record selectors are unsupported')
-        if args.mode is not None:
-            ap.error('--review-from preserves the existing export mode; --mode is unsupported')
-        if any((args.reasoning_summaries, args.plain, args.wrap_md, args.no_frontmatter,
-                args.no_map, args.fence_turns, args.keep_hogs, args.tool_outputs != 'full',
-                args.source_truncation != 'annotate', args.max_line_chars != 20_000,
-                args.max_repeated_lines != 25, args.max_tool_chars != 20_000,
-                not args.manifest, args.manifest_path is not None, args.save_as,
-                args.choose_out_dir, args.name, args.filename_template,
-                args.collision != 'rename')):
-            ap.error('--review-from preserves existing rendered content and uses rename collisions; rendering and selection overrides are unsupported')
-        source = args.review_from.expanduser().resolve()
-        output = args.out_dir.expanduser().resolve() if args.out_dir else source.parent
-        result = review_existing_export(source, output, chunk_bytes=args.review_chunk_bytes)
-        if args.json_result:
-            print(json.dumps(result, ensure_ascii=False))
-        else:
-            report_output(result)
-        if args.open_after:
-            open_in_file_manager(Path(result['review_archive']), select=True)
-        return 0
+        if args.review_from:
+            if review_disabled_explicitly:
+                ap.error('--review-from cannot be combined with --no-review')
+            if any((args.project, args.session_id, args.jsonl, args.sessions_file,
+                    args.latest_session, args.browse, args.chatgpt_export)):
+                ap.error('--review-from cannot be combined with another source selector')
+            if any((args.redact, args.no_file, args.stdout, args.clipboard, args.list,
+                    args.list_responses, args.message is not None, args.response is not None,
+                    args.from_message is not None, args.to_message is not None,
+                    args.last_n_turns is not None, args.live_context, args.chatgpt_audit)):
+                ap.error('--review-from preserves existing text; redaction, no-file, stdout/clipboard, and record selectors are unsupported')
+            if args.mode is not None:
+                ap.error('--review-from preserves the existing export mode; --mode is unsupported')
+            if any((args.reasoning_summaries, args.plain, args.wrap_md, args.no_frontmatter,
+                    args.no_map, args.fence_turns, args.keep_hogs, args.tool_outputs != 'full',
+                    args.source_truncation != 'annotate', args.max_line_chars != 20_000,
+                    args.max_repeated_lines != 25, args.max_tool_chars != 20_000,
+                    not args.manifest, args.manifest_path is not None, args.save_as,
+                    args.choose_out_dir, args.name, args.filename_template,
+                    args.collision != 'rename')):
+                ap.error('--review-from preserves existing rendered content and uses rename collisions; rendering and selection overrides are unsupported')
+            source = args.review_from.expanduser().resolve()
+            output = args.out_dir.expanduser().resolve() if args.out_dir else source.parent
+            result = review_existing_export(source, output, chunk_bytes=args.review_chunk_bytes, progress=reporter,
+                                            archive=archive_settings.archive)
+            reporter.finish(detail="Standalone review conversion")
+            if args.json_result:
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                report_output(result)
+            if args.open_after:
+                open_in_file_manager(Path(preferred_output(result)), select=bool(result.get('review_archive')))
+            return 0
 
-    args.mode = args.mode or 'last-response'
+        args.mode = args.mode or 'last-response'
 
-    if args.chatgpt_export:
-        if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
-            ap.error('--chatgpt-export cannot be combined with Codex source selectors')
-        from codex_exporter.chatgpt_archive import export_chatgpt, audit_chatgpt
-        if args.chatgpt_audit:
-            report = audit_chatgpt(args.chatgpt_export.expanduser().resolve(),
+        if args.chatgpt_export:
+            if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+                ap.error('--chatgpt-export cannot be combined with Codex source selectors')
+            from codex_exporter.chatgpt_archive import export_chatgpt, audit_chatgpt
+            if args.chatgpt_audit:
+                report = audit_chatgpt(args.chatgpt_export.expanduser().resolve(),
+                    conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
+                    project_id=args.chatgpt_project_id,
+                    progress=args.progress if args.progress is not None else sys.stderr.isatty())
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+                return 0
+            out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
+            exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
                 conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
                 project_id=args.chatgpt_project_id,
                 progress=args.progress if args.progress is not None else sys.stderr.isatty())
-            print(json.dumps(report, ensure_ascii=False, indent=2))
-            return 0
-        out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
-        exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
-            conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
-            project_id=args.chatgpt_project_id,
-            progress=args.progress if args.progress is not None else sys.stderr.isatty())
-        if args.json_result:
-            print(json.dumps(exported, ensure_ascii=False))
-        else:
-            for item in exported: print(item['file'])
-        if not exported:
-            print('WARNING: no conversation records matched the supplied filters.', file=sys.stderr)
-        return 0
-
-    if args.chatgpt_audit:
-        ap.error('--chatgpt-audit requires --chatgpt-export ZIP_OR_DIRECTORY')
-    configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
-    if args.tokenizer_info:
-        print(json.dumps({"python": sys.executable, **token_counter_info()}, ensure_ascii=False, indent=2, sort_keys=True))
-        if not any((args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+            if args.json_result:
+                print(json.dumps(exported, ensure_ascii=False))
+            else:
+                for item in exported: print(item['file'])
+            if not exported:
+                print('WARNING: no conversation records matched the supplied filters.', file=sys.stderr)
             return 0
 
-    global _SOURCE_TRUNCATION_POLICY
-    _SOURCE_TRUNCATION_POLICY = args.source_truncation
-    if args.redact and archive_settings.copy_source and not args.no_file:
-        ap.error('--redact does not redact the native JSONL; use --no-source-copy or --no-archive --no-source-copy')
-    sources = resolve_source_paths(args, ap)
-    if archive_settings.archive and not args.no_file and not args.list and not args.list_responses:
-        if not args.manifest:
-            ap.error('Default archive needs a manifest; pass --manifest or --no-archive')
-        from codex_exporter.archive_pipeline import find_archiver
-        if archive_settings.effective_backend() == '7zip':
-            find_archiver(archive_settings.archiver)  # Fail before generating output if unavailable.
-    if args.save_as and len(sources) != 1:
-        ap.error("--save-as is only valid for a single source")
-    if args.manifest_path and len(sources) != 1:
-        ap.error("--manifest-path is only valid for a single source")
+        if args.chatgpt_audit:
+            ap.error('--chatgpt-audit requires --chatgpt-export ZIP_OR_DIRECTORY')
+        with reporter.stage("Initialize tokenizer", unit="steps", detail=args.tokenizer):
+            configure_token_counter(encoding=args.token_encoding, mode=args.tokenizer, require=args.require_tiktoken)
+        if args.tokenizer_info:
+            print(json.dumps({"python": sys.executable, **token_counter_info()}, ensure_ascii=False, indent=2, sort_keys=True))
+            if not any((args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
+                return 0
 
-    out_dir = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
-    if args.choose_out_dir:
-        selected = choose_directory(out_dir)
-        if selected is None:
-            return 1
-        out_dir = selected.resolve()
-    if (args.out_dir or args.choose_out_dir) and args.remember_out_dir:
-        cfg["last_out_dir"] = str(out_dir)
-        save_config(cfg)
-    template = (
-        DEFAULT_STABLE_FILENAME_TEMPLATE if args.stable_filenames
-        else args.filename_template or str(cfg.get("filename_template") or DEFAULT_FILENAME_TEMPLATE)
-    )
-    if args.save_filename_template:
-        cfg["filename_template"] = template
-        save_config(cfg)
+        global _SOURCE_TRUNCATION_POLICY
+        _SOURCE_TRUNCATION_POLICY = args.source_truncation
+        if args.redact and archive_settings.copy_source and not args.no_file:
+            ap.error('--redact does not redact the native JSONL; use --no-source-copy or --no-archive --no-source-copy')
+        with reporter.stage("Resolve sources", unit="files") as meter:
+            sources = resolve_source_paths(args, ap)
+            meter.update(len(sources))
+        from codex_exporter.file_access import validate_export_paths
+        protected_sources = [source for source, _ in sources]
+        if args.manifest_path:
+            validate_export_paths({'manifest': args.manifest_path}, protected_sources)
 
-    if args.fast:
-        if args.mode != 'thread' or args.list or args.list_responses or args.last_n_turns is not None or args.live_context:
-            ap.error('--fast only supports full chronological --mode thread (without turn limits or live-context)')
-        if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
-            ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
+        def validate_destination(destination: Path) -> None:
+            outputs = {'Markdown': destination}
+            if args.manifest:
+                outputs['manifest'] = args.manifest_path or destination.with_suffix('.manifest.json')
+            if archive_settings.copy_source:
+                outputs['native JSONL'] = destination.with_suffix('.jsonl')
+            if archive_settings.archive:
+                outputs['archive'] = destination.with_suffix('.zip')
+            if args.unknown_events == 'sidecar':
+                outputs['unknown-event sidecar'] = destination.with_suffix('.unknown.jsonl')
+            validate_export_paths(outputs, protected_sources)
 
-    results: list[dict[str, Any]] = []
-    clipboard_parts: list[str] = []
-    fast_catalog = None
-    for source_path, supplied_sid in sources:
-        from codex_exporter.snapshot import snapshot_source
-        staging_dir = out_dir if not (args.no_file or args.list or args.list_responses) else None
-        with snapshot_source(source_path, directory=staging_dir,
-                             progress=args.progress if args.progress is not None else sys.stderr.isatty()) as snapshot:
-            auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
-                args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
-                args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
-            use_fast = args.fast if args.fast is not None else (
-                auto_stream_eligible and snapshot.size_bytes >= args.fast_threshold_mib * 1048576
-            )
-            if use_fast:
-                from codex_exporter.modern import discover, stream_export
-                if fast_catalog is None:
-                    fast_catalog = {r['session_id']: r for r in discover(codex_home())}
-                row = fast_catalog.get(supplied_sid)
-                sid = supplied_sid or parse_session_id_from_name(source_path)
-                index_title = read_session_index_title(sid) if not args.name else ''
-                title = normalize_title(args.name or index_title or (row or {}).get('title') or sid or source_path.stem)
-                title_source = ('user_override' if args.name else 'session_index' if index_title else
-                                (row or {}).get('title_source') or 'catalog_fallback')
-                fast_out = out_dir
-                # Apply the same persisted naming preference as the classic renderer.
-                # Stream mode cannot honestly compute exact full-output token counts
-                # before writing; leave {counts} blank and record this in the manifest.
-                from string import Formatter
-                stream_template = template
-                accepted = {'title': safe_slug(title, max_len=70), 'session_id': sid,
-                    'session_short': sid[-8:], 'session_short_part': '_' + sid[-8:],
-                    'mode': 'thread', 'stamp': export_stamp(), 'counts': ''}
-                invalid = {field for _, field, _, _ in Formatter().parse(stream_template)
-                    if field not in accepted and field is not None}
-                if invalid:
-                    ap.error('Streaming filename template cannot use precomputed output metrics: '
-                             + ', '.join(sorted(invalid)))
-                if '/' in stream_template or '\\' in stream_template:
-                    ap.error('--filename-template must specify a basename, not a directory')
-                filename = safe_export_filename(stream_template.format(**accepted))
-                # A short UUID is essential to avoid collisions between identically titled threads.
-                if sid[-8:].lower() not in filename.lower():
-                    filename = safe_export_filename(Path(filename).stem + '_' + sid[-8:] + '.md')
-                from codex_exporter.archive_pipeline import avoid_existing_archive
-                stream_path = avoid_existing_archive(fast_out / filename, args.collision) if archive_settings.archive else fast_out / filename
-                result = stream_export(snapshot.path, stream_path, session_id=sid, title=title,
-                    title_source=title_source, snapshot=snapshot,
-                    include_reasoning_summaries=args.reasoning_summaries,
-                    tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
-                    strip=False,  # preserve every recorded printable character in stream mode
-                    max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines,
-                    source_truncation=args.source_truncation, unknown_events=args.unknown_events,
-                    collision=args.collision, redact=args.redact, strict_events=args.strict_events,
-                    progress=args.progress if args.progress is not None else sys.stderr.isatty())
-                result = finish_export(result, snapshot)
-                results.append(result)
+        if archive_settings.archive and not args.no_file and not args.list and not args.list_responses:
+            if not args.manifest:
+                ap.error('Default archive needs a manifest; pass --manifest or --no-archive')
+            from codex_exporter.archive_pipeline import find_archiver
+            if archive_settings.effective_backend() == '7zip':
+                find_archiver(archive_settings.archiver)  # Fail before generating output if unavailable.
+        if args.save_as and len(sources) != 1:
+            ap.error("--save-as is only valid for a single source")
+        if args.manifest_path and len(sources) != 1:
+            ap.error("--manifest-path is only valid for a single source")
+
+        out_dir = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
+        if args.choose_out_dir:
+            selected = choose_directory(out_dir)
+            if selected is None:
+                return 1
+            out_dir = selected.resolve()
+        if (args.out_dir or args.choose_out_dir) and args.remember_out_dir:
+            cfg["last_out_dir"] = str(out_dir)
+            save_config(cfg)
+        template = (
+            DEFAULT_STABLE_FILENAME_TEMPLATE if args.stable_filenames
+            else args.filename_template or str(cfg.get("filename_template") or DEFAULT_FILENAME_TEMPLATE)
+        )
+        if args.save_filename_template:
+            cfg["filename_template"] = template
+            save_config(cfg)
+
+        if args.fast:
+            if args.mode != 'thread' or args.list or args.list_responses or args.last_n_turns is not None or args.live_context:
+                ap.error('--fast only supports full chronological --mode thread (without turn limits or live-context)')
+            if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
+                ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
+
+        results: list[dict[str, Any]] = []
+        clipboard_parts: list[str] = []
+        fast_catalog = None
+        for source_path, supplied_sid in sources:
+            from codex_exporter.snapshot import snapshot_source
+            staging_dir = out_dir if not (args.no_file or args.list or args.list_responses) else None
+            with snapshot_source(source_path, directory=staging_dir, reporter=reporter) as snapshot:
+                auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
+                    args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
+                    args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
+                use_fast = args.fast if args.fast is not None else (
+                    auto_stream_eligible and snapshot.size_bytes >= args.fast_threshold_mib * 1048576
+                )
+                if use_fast:
+                    from codex_exporter.modern import discover, stream_export
+                    if fast_catalog is None:
+                        fast_catalog = {r['session_id']: r for r in discover(codex_home())}
+                    row = fast_catalog.get(supplied_sid)
+                    sid = supplied_sid or parse_session_id_from_name(source_path)
+                    index_title = read_session_index_title(sid) if not args.name else ''
+                    title = normalize_title(args.name or index_title or (row or {}).get('title') or sid or source_path.stem)
+                    title_source = ('user_override' if args.name else 'session_index' if index_title else
+                                    (row or {}).get('title_source') or 'catalog_fallback')
+                    fast_out = out_dir
+                    # Apply the same persisted naming preference as the classic renderer.
+                    # Stream mode cannot honestly compute exact full-output token counts
+                    # before writing; leave {counts} blank and record this in the manifest.
+                    from string import Formatter
+                    stream_template = template
+                    accepted = {'title': safe_slug(title, max_len=70), 'session_id': sid,
+                        'session_short': sid[-8:], 'session_short_part': '_' + sid[-8:],
+                        'mode': 'thread', 'stamp': export_stamp(), 'counts': ''}
+                    invalid = {field for _, field, _, _ in Formatter().parse(stream_template)
+                        if field not in accepted and field is not None}
+                    if invalid:
+                        ap.error('Streaming filename template cannot use precomputed output metrics: '
+                                 + ', '.join(sorted(invalid)))
+                    if '/' in stream_template or '\\' in stream_template:
+                        ap.error('--filename-template must specify a basename, not a directory')
+                    filename = safe_export_filename(stream_template.format(**accepted))
+                    # A short UUID is essential to avoid collisions between identically titled threads.
+                    if sid[-8:].lower() not in filename.lower():
+                        filename = safe_export_filename(Path(filename).stem + '_' + sid[-8:] + '.md')
+                    from codex_exporter.archive_pipeline import avoid_existing_archive
+                    stream_path = avoid_existing_archive(fast_out / filename, args.collision) if archive_settings.archive else fast_out / filename
+                    validate_destination(stream_path)
+                    result = stream_export(snapshot.path, stream_path, session_id=sid, title=title,
+                        title_source=title_source, snapshot=snapshot,
+                        include_reasoning_summaries=args.reasoning_summaries,
+                        tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
+                        strip=False,  # preserve every recorded printable character in stream mode
+                        max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines,
+                        source_truncation=args.source_truncation, unknown_events=args.unknown_events,
+                        collision=args.collision, redact=args.redact, strict_events=args.strict_events,
+                        reporter=reporter, protected_sources=protected_sources)
+                    validate_destination(Path(result["file"]))
+                    result = finish_export(result, snapshot)
+                    results.append(result)
+                    if args.report_events:
+                        print(json.dumps({'stream_event_count': result.get('rendered_records'),
+                             'unknown_event_count': result.get('unknown_event_count'),
+                             'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
+                    if args.open_after and preferred_output(result):
+                        open_in_file_manager(Path(preferred_output(result)), select=True)
+                    report_output(result)
+                    continue
+                reset_runtime_audit()
+                include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
+                with reporter.stage("Parse captured records", unit="records") as meter:
+                    records, meta = parse_session(
+                        path=snapshot.path,
+                        include_actions=include_actions,
+                        include_reasoning_summaries=args.reasoning_summaries,
+                        reconstruct_live_context=args.live_context,
+                        tool_outputs=args.tool_outputs,
+                        max_tool_chars=args.max_tool_chars,
+                        strip=not args.keep_hogs,
+                        max_line_chars=args.max_line_chars,
+                        max_repeated_lines=args.max_repeated_lines,
+                        progress=meter,
+                    )
                 if args.report_events:
-                    print(json.dumps({'stream_event_count': result.get('rendered_records'),
-                         'unknown_event_count': result.get('unknown_event_count'),
-                         'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
+                    report_event_audit(meta)
+                if args.strict_events and sum(counter_to_dict(meta.get("_unknown_event_types")).values()):
+                    raise RuntimeError("Unknown event schemas were detected; inspect --report-events or the manifest.")
+                if args.list:
+                    print_message_list(records)
+                    continue
+                if args.list_responses:
+                    print_response_list(records)
+                    continue
+
+                scoped = select_last_n_turns(records, args.last_n_turns)
+                selected_records = choose_records(scoped, args)
+                effective_sid = supplied_sid or parse_session_id_from_name(source_path) or str(meta.get("id") or "")
+                title = discover_title(records, meta, args.name, effective_sid)
+                descriptor = mode_descriptor(args)
+                with reporter.stage("Render selected records", unit="records", detail=f"{len(selected_records):,} selected records"):
+                    if args.mode == "thread" and not args.plain:
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
+                    elif args.mode == "turn" and not args.plain and not args.ui_style:
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
+                    else:
+                        text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256)
+                with reporter.stage("Normalize rendered text", unit="steps"):
+                    if not args.keep_mojibake:
+                        text = cp437_cp1252_mojibake_repair(text)
+                    text = redact(text, args.redact)
+                    text = strip_hogs(text, enabled=not args.keep_hogs, max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines)
+                    if args.wrap_md:
+                        text = wrap_markdown(text, title=args.wrap_title or None)
+                with reporter.stage("Count rendered output", unit="steps", detail=token_field_label()):
+                    text = finalize_count_placeholders(text)
+
+                include_short = args.stable_filenames or args.include_session_short_id or len(sources) > 1
+                filename = render_filename(template, title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
+                if args.no_filename_counts:
+                    filename = render_filename(template.replace("{counts}", ""), title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
+                output_path: Path | None = None
+                if not args.no_file:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    candidate = out_dir / filename
+                    if args.save_as:
+                        selected_path = choose_save_file(out_dir, filename)
+                        if selected_path is None:
+                            return 1
+                        candidate = selected_path
+                        if args.remember_out_dir:
+                            cfg["last_out_dir"] = str(candidate.parent.resolve())
+                            save_config(cfg)
+                    if archive_settings.archive:
+                        from codex_exporter.archive_pipeline import avoid_existing_archive
+                        candidate = avoid_existing_archive(candidate, args.collision)
+                    output_path = resolve_collision(candidate, args.collision)
+                    if output_path is not None:
+                        validate_destination(output_path)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        with reporter.stage("Write Markdown", unit="files", total=1) as meter:
+                            output_path.write_text(text, encoding="utf-8", newline="\n")
+                            meter.update(1)
+
+                manifest_path = None
+                if args.manifest:
+                    with reporter.stage("Write manifest", unit="files", total=1) as meter:
+                        manifest = build_manifest(source=source_path, output=output_path, session_id=effective_sid, title=title, mode=descriptor, records=selected_records, meta=meta, text=text, redacted=args.redact, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
+                        manifest_path = write_manifest(manifest, output_path, args.manifest_path)
+                        meter.update(1)
+                if args.stdout:
+                    if len(sources) > 1:
+                        print(f"\n<!-- codex-export source: {source_path} -->\n")
+                    print(text, end="")
+                if args.clipboard:
+                    clipboard_parts.append(text)
+                result = {
+                    "version": __version__, "file": str(output_path) if output_path else None,
+                    "manifest": str(manifest_path) if manifest_path else None,
+                    "source_jsonl": str(source_path), "source_sha256": snapshot.sha256,
+                    "source_snapshot": snapshot.metadata, "decoded_source_bytes": snapshot.size_bytes,
+                    "session_id": effective_sid or None, "title": title, "mode": descriptor,
+                    "lines": count_lines(text), "token_count": approx_token_count(text), "token_counter": token_counter_info(),
+                    "parse_error_count": len(meta.get("_parse_errors", [])), "repaired_json_line_count": len(meta.get("_repaired_json_lines", [])),
+                    "redacted": bool(args.redact), "models": collect_models(selected_records, meta),
+                }
+                if output_path is not None:
+                    result = finish_export(result, snapshot)
+                results.append(result)
                 if args.open_after and preferred_output(result):
                     open_in_file_manager(Path(preferred_output(result)), select=True)
-                report_output(result)
-                continue
-            reset_runtime_audit()
-            include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
-            records, meta = parse_session(
-                path=snapshot.path,
-                include_actions=include_actions,
-                include_reasoning_summaries=args.reasoning_summaries,
-                reconstruct_live_context=args.live_context,
-                tool_outputs=args.tool_outputs,
-                max_tool_chars=args.max_tool_chars,
-                strip=not args.keep_hogs,
-                max_line_chars=args.max_line_chars,
-                max_repeated_lines=args.max_repeated_lines,
-            )
-            if args.report_events:
-                report_event_audit(meta)
-            if args.strict_events and sum(counter_to_dict(meta.get("_unknown_event_types")).values()):
-                raise RuntimeError("Unknown event schemas were detected; inspect --report-events or the manifest.")
-            if args.list:
-                print_message_list(records)
-                continue
-            if args.list_responses:
-                print_response_list(records)
-                continue
+                if output_path:
+                    report_output(result)
 
-            scoped = select_last_n_turns(records, args.last_n_turns)
-            selected_records = choose_records(scoped, args)
-            effective_sid = supplied_sid or parse_session_id_from_name(source_path) or str(meta.get("id") or "")
-            title = discover_title(records, meta, args.name, effective_sid)
-            descriptor = mode_descriptor(args)
-            if args.mode == "thread" and not args.plain:
-                text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
-            elif args.mode == "turn" and not args.plain and not args.ui_style:
-                text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
-            else:
-                text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256)
-            if not args.keep_mojibake:
-                text = cp437_cp1252_mojibake_repair(text)
-            text = redact(text, args.redact)
-            text = strip_hogs(text, enabled=not args.keep_hogs, max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines)
-            if args.wrap_md:
-                text = wrap_markdown(text, title=args.wrap_title or None)
-            text = finalize_count_placeholders(text)
-
-            include_short = args.stable_filenames or args.include_session_short_id or len(sources) > 1
-            filename = render_filename(template, title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
-            if args.no_filename_counts:
-                filename = render_filename(template.replace("{counts}", ""), title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
-            output_path: Path | None = None
-            if not args.no_file:
-                out_dir.mkdir(parents=True, exist_ok=True)
-                candidate = out_dir / filename
-                if args.save_as:
-                    selected_path = choose_save_file(out_dir, filename)
-                    if selected_path is None:
-                        return 1
-                    candidate = selected_path
-                    if args.remember_out_dir:
-                        cfg["last_out_dir"] = str(candidate.parent.resolve())
-                        save_config(cfg)
-                if archive_settings.archive:
-                    from codex_exporter.archive_pipeline import avoid_existing_archive
-                    candidate = avoid_existing_archive(candidate, args.collision)
-                output_path = resolve_collision(candidate, args.collision)
-                if output_path is not None:
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    output_path.write_text(text, encoding="utf-8", newline="\n")
-
-            manifest_path = None
-            if args.manifest:
-                manifest = build_manifest(source=source_path, output=output_path, session_id=effective_sid, title=title, mode=descriptor, records=selected_records, meta=meta, text=text, redacted=args.redact, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
-                manifest_path = write_manifest(manifest, output_path, args.manifest_path)
-            if args.stdout:
-                if len(sources) > 1:
-                    print(f"\n<!-- codex-export source: {source_path} -->\n")
-                print(text, end="")
-            if args.clipboard:
-                clipboard_parts.append(text)
-            result = {
-                "version": __version__, "file": str(output_path) if output_path else None,
-                "manifest": str(manifest_path) if manifest_path else None,
-                "source_jsonl": str(source_path), "source_sha256": snapshot.sha256,
-                "source_snapshot": snapshot.metadata, "decoded_source_bytes": snapshot.size_bytes,
-                "session_id": effective_sid or None, "title": title, "mode": descriptor,
-                "lines": count_lines(text), "token_count": approx_token_count(text), "token_counter": token_counter_info(),
-                "parse_error_count": len(meta.get("_parse_errors", [])), "repaired_json_line_count": len(meta.get("_repaired_json_lines", [])),
-                "redacted": bool(args.redact), "models": collect_models(selected_records, meta),
-            }
-            if output_path is not None:
-                result = finish_export(result, snapshot)
-            results.append(result)
-            if args.open_after and preferred_output(result):
-                open_in_file_manager(Path(preferred_output(result)), select=True)
-            if output_path:
-                report_output(result)
-
-    if args.clipboard and clipboard_parts:
-        copy_to_clipboard("\n\n".join(clipboard_parts))
-    if args.json_result:
-        print(json.dumps(results[0] if len(results) == 1 else results, ensure_ascii=False))
-    return 0
+        reporter.finish(detail=f"{len(results):,} export(s)")
+        if args.clipboard and clipboard_parts:
+            copy_to_clipboard("\n\n".join(clipboard_parts))
+        if args.json_result:
+            print(json.dumps(results[0] if len(results) == 1 else results, ensure_ascii=False))
+        return 0
 
 
 if __name__ == "__main__":

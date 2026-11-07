@@ -18,6 +18,8 @@ import sqlite3
 import sys
 import time
 
+from .progress import ProgressReporter
+
 if TYPE_CHECKING:
     from .snapshot import SourceSnapshot
 
@@ -182,28 +184,22 @@ def audit(home: Path, project: str = '') -> dict[str, Any]:
                         for r in rows]}
 
 
-def _progress(done: int, total: int, begin: float, *, force: bool = False) -> None:
-    if not force and not sys.stderr.isatty():
-        return
-    elapsed = max(time.monotonic() - begin, .001)
-    pct = 100.0 * done / total if total else 100.0
-    msg = f'\rCodex stream: {pct:5.1f}%  {done / 1048576:,.1f}/{total / 1048576:,.1f} MiB  {done / elapsed / 1048576:,.1f} MiB/s'
-    print(msg, end='\n' if done >= total else '', file=sys.stderr, flush=True)
-
-
 def stream_export(source: Path, destination: Path, *, session_id: str, title: str, title_source: str = "",
                   include_reasoning_summaries: bool = False, tool_outputs: str = 'full',
                   max_tool_chars: int = 20_000, strip: bool = False,
                   max_line_chars: int = 20_000, max_repeated_lines: int = 25,
                   collision: str = 'rename', progress: bool = True, redact: bool = False, strict_events: bool = False,
                   source_truncation: str = 'annotate', unknown_events: str = 'report',
-                  snapshot: SourceSnapshot | None = None) -> dict[str, Any]:
+                  snapshot: SourceSnapshot | None = None,
+                  reporter: ProgressReporter | None = None,
+                  protected_sources=()) -> dict[str, Any]:
     """Bounded-memory one-pass export; stable readable headings, provenance and audit.
 
     The original event JSONL remains the fidelity authority. No assembled giant
     string, full source read_bytes(), whole-thread tokenization, or source write.
     """
     from . import cli
+    reporter = reporter if reporter is not None else ProgressReporter(enabled=progress)
     if unknown_events not in {'report', 'sidecar'}:
         raise ValueError('unknown_events must be report or sidecar')
     if source_truncation not in {'annotate', 'preserve', 'error'}:
@@ -222,6 +218,12 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                 i += 1
         elif collision != 'overwrite':
             raise ValueError(f'Invalid collision policy {collision}')
+    from .file_access import validate_export_paths
+    outputs = {'Markdown': destination, 'manifest': destination.with_suffix('.manifest.json')}
+    if unknown_events == 'sidecar':
+        outputs['unknown-event sidecar'] = destination.with_suffix('.unknown.jsonl')
+    validate_export_paths(outputs, [source, *protected_sources,
+                                   *([snapshot.original_path] if snapshot else [])])
     # Staged output: a parser failure never overwrites a completed archive.
     import tempfile
     fd, tmp = tempfile.mkstemp(prefix='.codex-export-', suffix='.partial', dir=destination.parent)
@@ -237,8 +239,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     decoded_size = 0
     counts: Counter[str] = Counter()
     marker_locations: list[dict[str, int]] = []
-    first = time.monotonic()
-    last_progress = first
+    last_progress = time.monotonic()
     last_key: tuple[str, str, str] | None = None
     upstream_truncations: list[dict[str, Any]] = []
     error_samples: list[dict[str, Any]] = []
@@ -247,6 +248,9 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     cli._SOURCE_TRUNCATION_POLICY = source_truncation
     try:
         with ExitStack() as stack:
+            render_task = stack.enter_context(reporter.stage(
+                'Read and render records', total=total,
+                detail='Source physical bytes; chronological Markdown'))
             physical = stack.enter_context(source.open('rb', buffering=1024 * 1024))
             if is_zstd:
                 try:
@@ -299,16 +303,19 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                     if not raw:
                         break
                     decoded_size += len(raw)
-                    now = time.monotonic()
-                    if progress and now - last_progress >= 1:
-                        _progress(min(physical.tell(), total), total, first, force=True)
-                        last_progress = now
                     if not raw.endswith(b'\n') and (is_zstd or physical.tell() == total):
                         # A final complete valid JSON object need not end with newline.
                         pass
                     sha.update(raw)
                     line_no += 1
                     counts['source_lines'] += 1
+                    now = time.monotonic()
+                    if now - last_progress >= 0.2:
+                        render_task.update(min(physical.tell(), total), detail=(
+                            f'{counts["source_lines"]:,} source lines; '
+                            f'{counts["rendered_records"]:,} rendered records; '
+                            f'{decoded_size:,} decoded bytes'))
+                        last_progress = now
                     if not raw.strip():
                         continue
                     try:
@@ -382,43 +389,54 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                              f'| Decoded source SHA-256 | `{sha.hexdigest()}` |\n\n'
                              'Counts describe recorded events, not unique conversation turns. '
                              'This audit is derived from the original source, not a guarantee of semantic completeness.\n')
+                render_task.update(detail='Flush rendered Markdown to disk')
                 output.flush()
                 os.fsync(output.fileno())
+                render_task.update(min(physical.tell(), total), detail=(
+                    f'{counts["source_lines"]:,} source lines; '
+                    f'{counts["rendered_records"]:,} rendered records; '
+                    f'{decoded_size:,} decoded bytes'))
             finally:
                 if unknown:
                     unknown.close()
-        if strict_events and counts['unknown_events']:
-            raise RuntimeError(f"Strict event audit failed: {counts['unknown_events']} unknown event schemas")
-        digest = sha.hexdigest()
-        if snapshot and (digest != snapshot.sha256 or decoded_size != snapshot.size_bytes):
-            raise RuntimeError('Captured source snapshot changed during rendering; refusing to publish this export')
-        manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
-                    'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(original_source),
-                    'source_sha256': digest, 'source_size_bytes_at_open': total,
-                    'source_size_bytes_at_end': source.stat().st_size,
-                    'source_encoding': source_encoding,
-                    'decoded_source_bytes': decoded_size, 'records': dict(counts),
-                    'parse_error_samples': error_samples, 'truncation_marker_locations': marker_locations,
-                    'upstream_truncations': upstream_truncations,
-                    'source_truncation_policy': source_truncation, 'redacted': redact,
-                    'unknown_events_policy': unknown_events, 'unknown_sidecar': str(sidecar) if sidecar else None,
-                    'text_fidelity': 'rendered_text_only; original JSONL remains authoritative',
-                    'partial_final_line_possible': counts['parse_errors'] > 0}
-        if snapshot:
-            manifest['source_snapshot'] = snapshot.metadata
-            manifest['source_size_bytes_at_open'] = snapshot.metadata['source_size_bytes_at_open']
-            manifest['source_size_bytes_at_end'] = snapshot.metadata['source_size_bytes_after_capture']
-            manifest['source_sha256_scope'] = 'captured_decoded_jsonl'
-            manifest['partial_final_line_possible'] = bool(snapshot.metadata['deferred_tail_bytes'])
-        if source.stat().st_size != total:
-            manifest['source_changed_during_export'] = True
-        os.replace(temp, destination)
-        if staged_unknown:
-            os.replace(staged_unknown, sidecar)
-        manifest_path = destination.with_suffix('.manifest.json')
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
-        if progress:
-            _progress(total, total, first, force=True)
+        with reporter.stage('Validate render and prepare manifest', unit='files',
+                            detail='Schema coverage, captured SHA-256, and export provenance'):
+            if strict_events and counts['unknown_events']:
+                raise RuntimeError(f"Strict event audit failed: {counts['unknown_events']} unknown event schemas")
+            digest = sha.hexdigest()
+            if snapshot and (digest != snapshot.sha256 or decoded_size != snapshot.size_bytes):
+                raise RuntimeError('Captured source snapshot changed during rendering; refusing to publish this export')
+            manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
+                        'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(original_source),
+                        'source_sha256': digest, 'source_size_bytes_at_open': total,
+                        'source_size_bytes_at_end': source.stat().st_size,
+                        'source_encoding': source_encoding,
+                        'decoded_source_bytes': decoded_size, 'records': dict(counts),
+                        'parse_error_samples': error_samples, 'truncation_marker_locations': marker_locations,
+                        'upstream_truncations': upstream_truncations,
+                        'source_truncation_policy': source_truncation, 'redacted': redact,
+                        'unknown_events_policy': unknown_events, 'unknown_sidecar': str(sidecar) if sidecar else None,
+                        'text_fidelity': 'rendered_text_only; original JSONL remains authoritative',
+                        'partial_final_line_possible': counts['parse_errors'] > 0}
+            if snapshot:
+                manifest['source_snapshot'] = snapshot.metadata
+                manifest['source_size_bytes_at_open'] = snapshot.metadata['source_size_bytes_at_open']
+                manifest['source_size_bytes_at_end'] = snapshot.metadata['source_size_bytes_after_capture']
+                manifest['source_sha256_scope'] = 'captured_decoded_jsonl'
+                manifest['partial_final_line_possible'] = bool(snapshot.metadata['deferred_tail_bytes'])
+            if source.stat().st_size != total:
+                manifest['source_changed_during_export'] = True
+        with reporter.stage('Publish rendered files', total=3 if staged_unknown else 2,
+                            unit='files', detail=destination.name) as task:
+            os.replace(temp, destination)
+            task.advance(1)
+            if staged_unknown:
+                os.replace(staged_unknown, sidecar)
+                task.advance(1, detail=sidecar.name)
+            manifest_path = destination.with_suffix('.manifest.json')
+            task.update(detail=manifest_path.name)
+            manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+            task.advance(1)
         return {'file': str(destination), 'manifest': str(manifest_path), 'session_id': session_id,
                 'redacted': bool(redact),
                 'source_jsonl': str(original_source), 'source_sha256': digest,

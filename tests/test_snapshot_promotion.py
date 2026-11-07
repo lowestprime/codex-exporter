@@ -20,13 +20,17 @@ def original(tmp_path: Path) -> tuple[Path, bytes]:
     return source, raw
 
 
-def test_hardlink_reuses_private_snapshot_without_linking_original(original, tmp_path):
+def test_promotion_preserves_snapshot_bytes_without_linking_original(original, tmp_path):
     source, raw = original
     destination = tmp_path / "exported.jsonl"
     with snapshot_source(source, directory=tmp_path) as snapshot:
         digest, size, strategy = archive_pipeline._stage_snapshot_copy(snapshot, destination)
-        assert strategy == "snapshot_hardlink"
-        assert os.path.samefile(destination, snapshot.path)
+        if os.name == "nt":
+            assert strategy == "snapshot_copy"
+            assert not os.path.samefile(destination, snapshot.path)
+        else:
+            assert strategy == "snapshot_hardlink"
+            assert os.path.samefile(destination, snapshot.path)
         assert not os.path.samefile(destination, source)
         assert (digest, size) == (hashlib.sha256(raw).hexdigest(), len(raw))
         assert destination.read_bytes() == source.read_bytes() == raw

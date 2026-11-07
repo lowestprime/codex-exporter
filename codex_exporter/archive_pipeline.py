@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import zipfile
 
@@ -36,14 +35,20 @@ class ArchiveSettings:
     archive: bool = True
     cleanup: bool = True
     backend: str = 'auto'
-    level: int = 6
-    method: str = 'Deflate'
+    level: int = 9
+    method: str = 'LZMA'
     dictionary: str = '256m'
     word_size: int = 64
     threads: int = 19
     archiver: str = ''
+    review: bool = False
+    review_chunk_bytes: int = 1_000_000
 
     def validate(self) -> None:
+        from .review import _validate_chunk_bytes
+        if not isinstance(self.review, bool):
+            raise ValueError('review must be a boolean')
+        _validate_chunk_bytes(self.review_chunk_bytes)
         if self.backend not in ('auto', 'python', '7zip'):
             raise ValueError('archive backend must be auto, python or 7zip')
         if self.backend == 'python' and self.method.upper() != 'DEFLATE':
@@ -87,56 +92,29 @@ def _check_member_signatures(members: dict[str, Path], expected: dict[str, tuple
             raise RuntimeError(f'Exported member changed during packaging: {name}; no cleanup performed')
 
 
-def _publish_archive(staged: Path, destination: Path) -> str:
-    """Publish exclusively; fall back to a verified copy on filesystems without links.
-
-    The copy fallback can be visible while writing, but it never overwrites an
-    existing path and cleanup only follows a fully verified published archive.
-    """
-    try:
-        os.link(staged, destination)
-        return 'hardlink'
-    except FileExistsError:
-        raise
-    except OSError:
-        pass
-    before = _file_signature(staged)
-    expected = _hash_file(staged)
-    owned: tuple[int, int] | None = None
-    try:
-        with staged.open('rb') as source, destination.open('xb') as target:
-            stat = os.fstat(target.fileno())
-            owned = (stat.st_dev, stat.st_ino)
-            digest = hashlib.sha256()
-            size = 0
-            for block in iter(lambda: source.read(1024 * 1024), b''):
-                target.write(block)
-                digest.update(block)
-                size += len(block)
-            target.flush()
-            os.fsync(target.fileno())
-        if ((digest.hexdigest(), size) != expected or _hash_file(destination) != expected
-                or _file_signature(staged) != before):
-            raise RuntimeError('Published archive copy verification failed; no cleanup performed')
-        return 'verified_copy'
-    except BaseException:
-        # Remove only the path created here, never an existing or replaced file.
-        if owned is not None:
-            try:
-                current = destination.lstat()
-                if (current.st_dev, current.st_ino) == owned and not destination.is_symlink():
-                    destination.unlink()
-            except OSError:
-                pass
-        raise
+def _publish_archive(staged: Path, destination: Path, *, reporter=None) -> str:
+    """Publish exclusively with the destination folder's Windows permissions."""
+    from .file_access import publish_file
+    return publish_file(staged, destination, reporter=reporter, stage_label='Publish archive')
 
 
-def _write_python_archive(staged: Path, members: dict[str, Path], level: int) -> None:
-    """ZIP method 8 needs no external executable and streams each member."""
-    with zipfile.ZipFile(staged, 'x', compression=zipfile.ZIP_DEFLATED,
-                         compresslevel=level, allowZip64=True, strict_timestamps=False) as archive:
-        for name, path in members.items():
-            archive.write(path, arcname=name)
+def _write_python_archive(staged: Path, members: dict[str, Path], level: int, *, reporter=None) -> None:
+    """ZIP method 8 with measured input-byte progress and bounded memory."""
+    from .progress import ProgressReporter
+    reporter = reporter or ProgressReporter(enabled=False)
+    total = sum(path.stat().st_size for path in members.values())
+    with reporter.stage('Compress archive', total=total, detail=f'Deflate level {level}; input bytes') as meter:
+        with zipfile.ZipFile(staged, 'x', compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=level, allowZip64=True, strict_timestamps=False) as archive:
+            for number, (name, path) in enumerate(members.items(), 1):
+                info = zipfile.ZipInfo.from_file(path, arcname=name, strict_timestamps=False)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info._compresslevel = level
+                meter.update(detail=f'{number}/{len(members)}: {name}')
+                with path.open('rb') as source, archive.open(info, 'w', force_zip64=info.file_size >= zipfile.ZIP64_LIMIT) as item:
+                    for block in iter(lambda: source.read(1024 * 1024), b''):
+                        item.write(block)
+                        meter.advance(len(block))
 
 
 def find_archiver(explicit: str = '') -> Path:
@@ -169,7 +147,7 @@ def find_archiver(explicit: str = '') -> Path:
                             'PeaZip/NanaZip GUI executables alone are not sufficient.')
 
 
-def _copy_decoded(source: Path, dest: Path) -> tuple[str, int]:
+def _copy_decoded(source: Path, dest: Path, *, meter=None) -> tuple[str, int]:
     """Bounded-memory decode of .jsonl.zst or copy of plain .jsonl."""
     h = hashlib.sha256()
     n = 0
@@ -188,6 +166,8 @@ def _copy_decoded(source: Path, dest: Path) -> tuple[str, int]:
                     target.write(chunk)
                     h.update(chunk)
                     n += len(chunk)
+                    if meter is not None:
+                        meter.update(n)
                 target.flush()
                 os.fsync(target.fileno())
         finally:
@@ -196,7 +176,7 @@ def _copy_decoded(source: Path, dest: Path) -> tuple[str, int]:
     return h.hexdigest(), n
 
 
-def _verify_members(archive: Path, expected: dict[str, Path], method: str) -> dict[str, str]:
+def _verify_members(archive: Path, expected: dict[str, Path], method: str, *, reporter=None) -> dict[str, str]:
     """Independently verify full ZIP members, accepting only safe Store fallback.
 
     7-Zip can choose ZIP Store (method 0) for inputs that do not benefit from
@@ -205,6 +185,8 @@ def _verify_members(archive: Path, expected: dict[str, Path], method: str) -> di
     unrequested compression algorithm, enforce the exact flat file inventory,
     and SHA-256-verify the fully decoded bytes against each loose source file.
     """
+    from .progress import ProgressReporter
+    reporter = reporter or ProgressReporter(enabled=False)
     requested = zipfile.ZIP_LZMA if method.upper() == 'LZMA' else zipfile.ZIP_DEFLATED
     allowed = {requested, zipfile.ZIP_STORED}
     methods = {zipfile.ZIP_STORED: 'Store', zipfile.ZIP_LZMA: 'LZMA',
@@ -224,16 +206,28 @@ def _verify_members(archive: Path, expected: dict[str, Path], method: str) -> di
                 and sum(i.file_size for i in infos) >= 64 * 1024):
             raise RuntimeError('Substantive ZIP uses Store for every member; '
                                'requested compression method was not demonstrated')
-        for info in infos:
-            digest = hashlib.sha256()
-            size = 0
-            with z.open(info, 'r') as entry:
-                for block in iter(lambda: entry.read(1024 * 1024), b''):
-                    digest.update(block)
-                    size += len(block)
-            original_hash, original_size = _hash_file(expected[info.filename])
-            if digest.hexdigest() != original_hash or size != original_size:
-                raise RuntimeError(f'Archive content mismatch: {info.filename}')
+        total = sum(info.file_size for info in infos) * 2
+        with reporter.stage('Verify archive', total=total,
+                            detail='Decode every member and compare SHA-256 with its source') as meter:
+            for number, info in enumerate(infos, 1):
+                digest = hashlib.sha256()
+                size = 0
+                meter.update(detail=f'{number}/{len(infos)}: decode {info.filename}')
+                with z.open(info, 'r') as entry:
+                    for block in iter(lambda: entry.read(1024 * 1024), b''):
+                        digest.update(block)
+                        size += len(block)
+                        meter.advance(len(block))
+                original = hashlib.sha256()
+                original_size = 0
+                meter.update(detail=f'{number}/{len(infos)}: compare {info.filename}')
+                with expected[info.filename].open('rb') as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b''):
+                        original.update(block)
+                        original_size += len(block)
+                        meter.advance(len(block))
+                if digest.hexdigest() != original.hexdigest() or size != original_size:
+                    raise RuntimeError(f'Archive content mismatch: {info.filename}')
         return {info.filename: methods[info.compress_type] for info in infos}
 
 
@@ -255,49 +249,56 @@ def avoid_existing_archive(md_path: Path, collision: str) -> Path:
             return candidate
         n += 1
 
-def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path) -> tuple[str, int, str]:
-    """Reuse only an owned, verified staging inode; never link app-owned input."""
+def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporter=None) -> tuple[str, int, str]:
+    """Promote only an owned snapshot; Windows creates a fresh inherited-DACL file."""
+    from .file_access import publish_file
+    from .progress import ProgressReporter
     from .snapshot import SourceSnapshot
     if not isinstance(snapshot, SourceSnapshot) or not snapshot.owns_staged_path():
         raise ValueError('Source-copy promotion requires an owned private snapshot')
+    reporter = reporter or ProgressReporter(enabled=False)
     before = snapshot.path.stat()
-    digest, size = _hash_file(snapshot.path)
+    with reporter.stage('Check captured source', total=snapshot.size_bytes) as meter:
+        state = hashlib.sha256()
+        size = 0
+        with snapshot.path.open('rb') as source:
+            for block in iter(lambda: source.read(4 * 1024 * 1024), b''):
+                state.update(block)
+                size += len(block)
+                meter.update(size)
+        digest = state.hexdigest()
     if (digest, size) != (snapshot.sha256, snapshot.size_bytes):
         raise RuntimeError('Snapshot content changed before source-copy staging')
-    try:
-        os.link(snapshot.path, destination)
-        strategy = 'snapshot_hardlink'
-    except FileExistsError:
-        raise
-    except OSError:
-        # FAT/exFAT, different volumes and some network filesystems cannot link.
-        # Exclusive create still protects an existing destination in the fallback.
-        if shutil.disk_usage(destination.parent).free < size + 8 * 1024 * 1024:
-            raise OSError('Insufficient free disk space to stage source copy')
-        digest, size = _copy_decoded(snapshot.path, destination)
-        strategy = 'snapshot_copy'
+    if os.name == 'nt' and shutil.disk_usage(destination.parent).free < size + 8 * 1024 * 1024:
+        raise OSError('Insufficient free disk space to stage source copy')
+    publication = publish_file(snapshot.path, destination, reporter=reporter, stage_label='Stage native JSONL')
     after = snapshot.path.stat()
     if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            or (digest, size) != (snapshot.sha256, snapshot.size_bytes)):
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
         raise RuntimeError('Snapshot changed during source-copy staging; no cleanup performed')
-    return digest, size, strategy
+    return digest, size, 'snapshot_hardlink' if publication == 'hardlink' else 'snapshot_copy'
 
 
 def package_export(result: dict[str, Any], original_source: Path,
                    settings: ArchiveSettings, *, snapshot: SourceSnapshot | None = None,
-                   review: bool = False, review_chunk_bytes: int = 1_000_000) -> dict[str, Any]:
+                   review: bool | None = None, review_chunk_bytes: int | None = None,
+                   reporter=None) -> dict[str, Any]:
     """Copy source; build/test a new flat ZIP; only then unlink three loose outputs.
 
     On an exception, originals are never touched, existing exports are kept,
     and a staging ZIP is discarded. No ZIP is ever silently overwritten.
     """
+    from .progress import ProgressReporter, run_seven_zip, SEVEN_ZIP_PROGRESS_ARGS
+    reporter = reporter or ProgressReporter(enabled=False)
+    review = settings.review if review is None else review
+    review_chunk_bytes = settings.review_chunk_bytes if review_chunk_bytes is None else review_chunk_bytes
+
     def add_review() -> None:
         if review and result.get('file') and not result.get('skipped'):
             from .review import create_review_bundle
             result.update(create_review_bundle(Path(result['file']),
                 Path(result['manifest']) if result.get('manifest') else None,
-                chunk_bytes=review_chunk_bytes))
+                chunk_bytes=review_chunk_bytes, progress=reporter, archive=False))
 
     settings.validate()
     if not settings.copy_source and not settings.archive:
@@ -320,6 +321,15 @@ def package_export(result: dict[str, Any], original_source: Path,
     manifest = Path(manifest_value).resolve() if manifest_value else None
     if settings.archive and (not manifest or not manifest.is_file()):
         raise RuntimeError('ZIP packaging requires an exported manifest; use --no-archive with --no-manifest')
+    from .file_access import validate_export_paths
+    outputs = {'Markdown': md}
+    if manifest is not None:
+        outputs['manifest'] = manifest
+    if settings.copy_source:
+        outputs['native JSONL'] = md.with_suffix('.jsonl')
+    if settings.archive:
+        outputs['archive'] = md.with_suffix('.zip')
+    validate_export_paths(outputs, [original_source, *([snapshot.original_path] if snapshot else [])])
     members: dict[str, Path] = {md.name: md}
     if manifest and manifest.is_file():
         if manifest.parent != md.parent:
@@ -329,7 +339,7 @@ def package_export(result: dict[str, Any], original_source: Path,
     if snapshot is not None:
         if settings.copy_source:
             source_copy = md.with_suffix('.jsonl')
-            decoded_sha, decoded_bytes, strategy = _stage_snapshot_copy(snapshot, source_copy)
+            decoded_sha, decoded_bytes, strategy = _stage_snapshot_copy(snapshot, source_copy, reporter=reporter)
             members[source_copy.name] = source_copy
             result['source_copy'] = str(source_copy)
             result['source_copy_sha256'] = decoded_sha
@@ -386,89 +396,109 @@ def package_export(result: dict[str, Any], original_source: Path,
         add_review()
         return result
     if any(p.parent != md.parent for p in members.values()):
-        raise RuntimeError('All ZIP members must reside in one output directory')
+        raise RuntimeError('Core ZIP members must reside in one export directory')
+    loose_members = dict(members)
     archive = md.with_suffix('.zip')
     backend = settings.effective_backend()
     archiver = find_archiver(settings.archiver) if backend == '7zip' else None
-    # Record intended archive provenance INSIDE its manifest before packaging.
-    # Verified extraction still compares every member byte-for-byte against the
-    # loose files. No external provenance document is required to interpret ZIP.
-    if manifest is not None:
-        details = json.loads(manifest.read_text(encoding='utf-8'))
-        details['archive_plan'] = {
-            'format': 'zip', 'method': settings.method, 'level': settings.level,
-            'backend': backend,
-            'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
-            'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
-            'threads': settings.threads if backend == '7zip' else 1,
-            'archive_filename': archive.name, 'members': sorted(members),
-            'source_copy_sha256': result.get('source_copy_sha256'),
-            'source_copy_bytes': result.get('source_copy_bytes'),
-            'source_copy_strategy': result.get('source_copy_strategy'),
-            'cleanup_after_full_archive_verification': settings.cleanup,
-        }
-        with manifest.open('w', encoding='utf-8', newline='\n') as f:
-            json.dump(details, f, indent=2, ensure_ascii=False)
-            f.write('\n')
+    if archive.exists():
+        raise FileExistsError(f'Refusing to replace an existing ZIP: {archive}')
+    details = json.loads(manifest.read_text(encoding='utf-8'))
+    details['archive_plan'] = {
+        'format': 'zip', 'method': settings.method, 'level': settings.level,
+        'backend': backend,
+        'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
+        'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
+        'threads': settings.threads if backend == '7zip' else 1,
+        'archive_filename': archive.name, 'members': sorted(members),
+        'source_copy_sha256': result.get('source_copy_sha256'),
+        'source_copy_bytes': result.get('source_copy_bytes'),
+        'source_copy_strategy': result.get('source_copy_strategy'),
+        'review_included': bool(review),
+        'cleanup_after_full_archive_verification': settings.cleanup,
+        'publication_permissions': 'inherit_destination_folder_on_windows',
+    }
+    def save_manifest() -> None:
+        with manifest.open('w', encoding='utf-8', newline='\n') as stream:
+            json.dump(details, stream, indent=2, ensure_ascii=False)
+            stream.write('\n')
+    save_manifest()
     result['archive_settings'] = {
         'method': settings.method, 'level': settings.level, 'backend': backend,
         'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
         'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
         'threads': settings.threads if backend == '7zip' else 1,
     }
-    if archive.exists():
-        raise FileExistsError(f'Refusing to replace an existing ZIP: {archive}')
-    member_signatures = {name: _file_signature(path) for name, path in members.items()}
-    # Generate a unique staging ZIP name *ending in .zip* for 7-Zip format recognition.
-    handle, staging_name = tempfile.mkstemp(prefix=f'.{md.stem}-', suffix='.zip', dir=md.parent)
-    os.close(handle)
-    staged = Path(staging_name)
-    staged.unlink()  # 7-Zip must create a fresh ZIP, never update one.
-    try:
+    with tempfile.TemporaryDirectory(prefix='.codex-archive-', dir=md.parent) as temporary:
+        work = Path(temporary)
+        staged = work / 'archive.zip'
+        compression_dir = md.parent
+        if review:
+            from .review import prepare_review_files, refresh_embedded_manifest
+            compression_dir = work / 'members'
+            compression_dir.mkdir()
+            prepared = prepare_review_files(md, manifest, directory=compression_dir,
+                                             chunk_bytes=review_chunk_bytes, progress=reporter, embedded=True)
+            extra_members = prepared['members']
+            if set(members) & set(extra_members):
+                raise RuntimeError('Review filenames conflict with core archive members')
+            members.update(extra_members)
+            details['archive_plan']['members'] = sorted(members)
+            save_manifest()
+            refresh_embedded_manifest(prepared, manifest)
+            result.update({key: value for key, value in prepared.items() if key != 'members'})
+            # Flat members for external 7-Zip, without copying the live source.
+            # These links are private compression inputs, never published files.
+            for name, path in loose_members.items():
+                try:
+                    os.link(path, compression_dir / name)
+                except OSError:
+                    shutil.copyfile(path, compression_dir / name)
+        member_signatures = {name: _file_signature(path) for name, path in members.items()}
         if backend == 'python':
-            _write_python_archive(staged, members, settings.level)
+            _write_python_archive(staged, members, settings.level, reporter=reporter)
         else:
-            cmd = [str(archiver), 'a', '-tzip', '-mx=' + str(settings.level),
-                   '-mm=' + settings.method, '-mmt=' + str(settings.threads),
-                   '-y', '-bd', '-bb0']
+            command = [str(archiver), 'a', '-tzip', '-mx=' + str(settings.level),
+                       '-mm=' + settings.method, '-mmt=' + str(settings.threads),
+                       '-y', *SEVEN_ZIP_PROGRESS_ARGS]
             if settings.method.upper() == 'LZMA':
-                cmd.extend(['-md=' + settings.dictionary, '-mfb=' + str(settings.word_size)])
-            cmd.extend([str(staged), *members.keys()])
-            run = subprocess.run(cmd, cwd=md.parent, capture_output=True, text=True,
-                                 encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
-            if run.returncode != 0:
-                raise RuntimeError(f'Archiver error {run.returncode} ({archiver}): '
-                                   + (run.stderr or run.stdout)[-1600:])
-        member_methods = _verify_members(staged, members, settings.method)
+                command.extend(['-md=' + settings.dictionary, '-mfb=' + str(settings.word_size)])
+            command.extend([str(staged), *members.keys()])
+            with reporter.stage('Compress archive', unit='percent',
+                                detail=f'{settings.method} level {settings.level}; '
+                                       f'{len(members)} files; requested threads {settings.threads}') as meter:
+                run = run_seven_zip(command, cwd=compression_dir, progress=meter)
+                if run.returncode != 0:
+                    raise RuntimeError(f'Archiver error {run.returncode} ({archiver}): '
+                                       + (run.stderr or run.stdout)[-1600:])
+        member_methods = _verify_members(staged, members, settings.method, reporter=reporter)
         _check_member_signatures(members, member_signatures)
         if archive.exists():
             raise FileExistsError(f'Archive appeared while packaging: {archive}')
-        publication = _publish_archive(staged, archive)
-    finally:
-        staged.unlink(missing_ok=True)
-    result['archive'] = str(archive)
-    result['archive_verified'] = True
-    result['archiver'] = str(archiver) if archiver else 'python.zipfile'
-    result['archive_backend'] = backend
-    result['archive_publication'] = publication
-    result['archive_method'] = settings.method
-    result['archive_members'] = sorted(members)
-    result['archive_member_methods'] = member_methods
-    result['archive_used_store_fallback'] = ('Store' in member_methods.values())
-    result['archived_markdown'] = md.name
-    result['archived_manifest'] = manifest.name if manifest else None
-    result['archived_source'] = source_copy.name if source_copy else None
-    result['loose_files_removed'] = False
-    # The review receives the final manifest actually stored in the verified ZIP.
-    # If review creation fails, retain both that ZIP and every loose source file.
-    add_review()
-    if settings.cleanup:
-        _check_member_signatures(members, member_signatures)
-        # Exact exported paths only. Never remove app-owned source or unknown-event sidecars.
-        for file in members.values():
-            file.unlink()
-        result['loose_files_removed'] = True
-        result['file'] = None
-        result['manifest'] = None
-        result['source_copy'] = None
+        publication = _publish_archive(staged, archive, reporter=reporter)
+        result.update({
+            'archive': str(archive), 'archive_verified': True,
+            'archiver': str(archiver) if archiver else 'python.zipfile',
+            'archive_backend': backend, 'archive_publication': publication,
+            'archive_method': settings.method, 'archive_members': sorted(members),
+            'archive_member_methods': member_methods,
+            'archive_used_store_fallback': 'Store' in member_methods.values(),
+            'archive_bytes': archive.stat().st_size,
+            'archive_uncompressed_bytes': sum(path.stat().st_size for path in members.values()),
+            'archived_markdown': md.name,
+            'archived_manifest': manifest.name if manifest else None,
+            'archived_source': source_copy.name if source_copy else None,
+            'loose_files_removed': False,
+        })
+        if review:
+            result.update(review_archive=str(archive), review_directory=None, review_layout='embedded')
+        if settings.cleanup:
+            _check_member_signatures(members, member_signatures)
+            with reporter.stage('Clean exported files', total=len(loose_members), unit='files',
+                                detail='Verified archive retained; live source untouched') as meter:
+                # Remove only the exact generated triplet, after all checks pass.
+                for file in loose_members.values():
+                    file.unlink()
+                    meter.advance(1)
+            result.update(loose_files_removed=True, file=None, manifest=None, source_copy=None)
     return result
