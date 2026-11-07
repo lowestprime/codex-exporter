@@ -2,56 +2,41 @@
 
 | Surface | Tested or targeted | Notes |
 |---|---|---|
-| Python | 3.10–3.13 | Base package uses the standard library; `tiktoken`, `zstandard`, and `ijson` are optional for their respective features |
-| Windows | Windows 11, PowerShell 7+ | Native dialogs use `tkinter`; clipboard uses verified `CF_UNICODETEXT`; CLI stdout/stderr use UTF-8 |
-| macOS/Linux | Python 3.10+ | Clipboard requires `pbcopy`, `wl-copy`, `xclip`, or `xsel` |
-| Codex storage | `sessions/`, `archived_sessions/`, direct `--jsonl` | Plain JSONL and `.jsonl.zst`; compressed inputs require `zstandard` |
-| Session schemas | Synthetic legacy/current fixtures and schema regressions | Unknown schemas are reported; rendered Markdown is not native JSONL serialization |
-| Compaction/rollback | `compacted.replacement_history`, `thread_rolled_back` | Requested reconstruction is explicitly approximate |
-| Tokenization | Regex fallback or optional `tiktoken` | Exact only for the selected encoding and output text; review part sizing uses UTF-8 bytes |
-| Full archival ZIP | Deflate level 6 by default in new configurations | Built-in Python backend, or compatible 7-Zip CLI; saved LZMA preferences remain until changed |
-| Review ZIP and files | Deflate method 8 plus retained UTF-8 TXT files | Standard-library creation and independent CRC/SHA-256 checks; direct TXT upload is available when ZIP ingestion is unavailable |
-| Legacy review conversion | Flat, unencrypted export ZIP, `.md`, or `.txt` | Python reads LZMA Markdown/manifest members; no external archiver or Codex session is needed; native JSONL is not opened |
-| Windows ChatGPT/Codex 26.1013.40934 | Earlier user-reported target, not a current end-to-end certification | Local catalog/rollouts and cloud account exports remain separate sources |
-| Large full-thread streaming | Synthetic regression coverage | One JSONL event in memory at a time; large individual records can still consume memory |
-| Official ChatGPT account export ZIP/JSON | Synthetic fixture coverage | Recorded mapping branches and numbered shards; `ijson` optional/required beyond 64 MiB |
+| Python | 3.10–3.13 | Standard-library base; optional tiktoken, zstandard, and ijson for their respective features |
+| Windows | Windows 11, PowerShell 7+ target; Windows CI | UTF-8 CLI streams, native dialogs/clipboard; fresh destination publication inherits parent permissions |
+| macOS/Linux | Python 3.10+ | Platform clipboard helper required for clipboard use |
+| Full archival ZIP | LZMA level 9, 256m, word size 64, 19 requested threads | Compatible external 7-Zip CLI; requested worker budget is not measured worker utilization |
+| Default output | One verified ZIP, three original files | Markdown, manifest, captured JSONL; successful cleanup removes loose originals |
+| Embedded review | Explicit --review | Review text/index/guide inside the same archive; default disabled |
+| Standalone review conversion | Explicit --review-from | Deflate review ZIP plus retained text directory; --no-archive selects text only |
+| ZIP diagnostics | Python zipfile with the relevant codec present | Metadata-only or full CRC/size/SHA; actual LZMA property inspection; no extraction or execution |
+| Remote ChatGPT upload/analysis | Must be checked in the receiving conversation | Local decoder success does not establish attachment availability, remote codec configuration, or context capacity |
+| Codex storage | sessions, archived_sessions, direct JSONL | Plain JSONL and optional .jsonl.zst decoding |
+| Live snapshots | Fixed prefix with independent verification | Later appends deferred; incomplete tail recorded; detected replacement/rewrite/truncation fails |
+| Full-thread rendering | Streaming or original buffered renderer | Large single records can still consume memory; rendered content is not native JSONL serialization |
+| Token counts | Regex fallback or optional tiktoken | Exact only for the selected encoding/output; review part caps use bytes |
+| Account-export conversion | ZIP/directory/JSON and numbered shards | Optional ijson for large shards; separate from local rollout access |
 
-## 0.3.10 validation scope
+## Release validation
 
-The supported CI matrix targets Windows, macOS, and Linux with CPython 3.10 and
-3.13, plus distribution and mirrored-script validation. The corresponding
-Actions runs establish the result for a specific release.
+CI targets Windows, macOS and Linux with Python 3.10/3.13, plus packaging and
+mirrored-script checks. Consult the Actions runs for the exact released commit.
+The Windows jobs exercise ACL inheritance/repair and PowerShell wrappers.
 
-Review regressions independently reconstruct original Markdown bytes, validate
-Unicode/CRLF boundaries, check whole-file and body hashes, enforce size limits,
-read every Deflate member, and test legacy LZMA conversion without opening the
-native JSONL. They also cover invalid UTF-8, ambiguous/unsafe ZIP inventories,
-encryption and symlink flags, and output collisions. The live snapshot suite
-continues to exercise both renderers while the original source changes.
+ZIP diagnostics report the runtime where they actually execute. ZIP method 14
+requires a reader with LZMA support; reducing its dictionary does not add that
+codec to an unsupported reader. A missing attachment path is a pre-decode result.
 
-With `backend=auto`, a configured archiver path selects the external backend;
-without one, Deflate uses Python. `backend=python` forces built-in Deflate while
-preserving that saved path. LZMA requires `auto` or `7zip` and a compatible external
-CLI. LZMA dictionary/word-size settings do not apply to Deflate, and the built-in
-writer uses one compression worker rather than the configured 7-Zip thread count.
-Review ZIPs always use built-in Deflate level 6.
+The diagnostic's default 512 MiB dictionary guard is a policy threshold, not a
+remote or local memory measurement. Python ZIP/LZMA retains dictionaries and
+internal buffers beyond the requested 1 MiB reads. Sequential streaming avoids
+explicit whole-member reads but does not promise a fixed total process footprint.
 
-Full-archive publication supports a verified copy fallback when hard links are
-unavailable. Snapshot reuse also falls back to copying; app-owned inputs are never
-hard-linked as exported native copies. Existing archives are not overwritten.
+No automatic archive-format migration or compression fallback is performed.
+Explicit saved Deflate preferences from 0.3.10 remain until the user changes them;
+installing a new version does not erase configuration. LZMA needs auto/7zip and a
+compatible external CLI; explicit Python-backend archives use Deflate.
 
-A portable file format cannot ensure that a chat environment exposes an uploaded
-file to its tools or fits the entire history in context. TXT parts and the recent
-excerpt provide a direct-upload fallback. Their byte bounds are not exact token
-counts, and the review process does not claim a semantic audit of unread content.
-Consult the receiving service's current upload limits.
-
-## Historical 0.3.9 validation
-
-- Local Linux / CPython 3.12.14: 102 tests passed, with one optional OS clipboard test skipped.
-- Real archiver: official 7-Zip 26.05 Linux x64; a 701 MiB synthetic growing rollout passed archive/source-hash and cleanup checks using the then-default ZIP/LZMA settings.
-- That synthetic archive run reached approximately 5.29 GiB of child-process peak RSS, including the archiver. It is not a memory or performance prediction for other inputs or the new Deflate defaults.
-
-The live source contract remains a verified append-only prefix, not an atomic
-filesystem snapshot against arbitrary in-place writers. Compressed inputs require
-complete Zstandard frames, including checksums where present.
+See [archive diagnostics](docs/ARCHIVE-DIAGNOSTICS.md),
+[integrity semantics](docs/INTEGRITY-AND-MANIFEST.md), and the
+[Windows upgrade guide](docs/WINDOWS-UPGRADE.md).

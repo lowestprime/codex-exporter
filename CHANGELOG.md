@@ -1,3 +1,11 @@
+## 0.3.12 — Separate archive availability, codec capability, and integrity (2026-11-07)
+
+- Add opt-in read-only ZIP diagnostics to the CLI and a standalone standard-library reader. Report actual runtime capabilities, archive size/SHA-256, inventory, encoded LZMA dictionaries, and full streamed member size/CRC/SHA-256 checks.
+- Classify absent paths, access failures, missing/unsupported codecs, explicit dictionary policy, actual memory failures, malformed data, and source changes separately. Metadata-only results never claim full content verification.
+- Validate LZMA envelope bounds and report unsafe/duplicate/link names without extracting or executing members. Keep decoder-memory scope explicit: read chunk size is not a total memory ceiling.
+- Preserve the normal compression profile, single three-file ZIP, live snapshots, Windows publication, review options, progress, saved configuration, and compression path. No default diagnostics or companion outputs.
+- Add regression coverage and receiving-chat diagnostic instructions. Correct stale compatibility documentation; do not claim remote ChatGPT compatibility from local codec success.
+
 ## 0.3.11 — One LZMA ZIP, inherited Windows access, measured progress (2026-11-07)
 
 - Restore LZMA level 9, a 256 MiB dictionary, word size 64, 19 requested threads, and the automatic compatible external backend. Retain explicit saved configuration until deliberately changed; document restoring earlier Deflate overrides.
