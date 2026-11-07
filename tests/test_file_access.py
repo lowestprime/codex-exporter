@@ -234,6 +234,24 @@ def _dacl(path: Path) -> str:
     return file_access._windows_security(path)['sddl'].split('D:', 1)[1]
 
 
+def _effective_file_dacl(path: Path) -> str:
+    """Ignore only OI/CI on regular-file ACEs, which have no child objects.
+
+    icacls /reset can preserve these inheritance flags where ordinary creation
+    removes them. Keep trustee, access mask, allow/deny type, ID/IO/other flags,
+    ACE order, and DACL protection/auto-inheritance flags unchanged.
+    """
+    def normalize(match):
+        fields = match.group(1).split(';')
+        flags = fields[1]
+        fields[1] = ''.join(flags[i:i + 2] for i in range(0, len(flags), 2)
+                            if flags[i:i + 2] not in ('OI', 'CI'))
+        return '(' + ';'.join(fields) + ')'
+
+    assert path.is_file()
+    return re.sub(r'\(([^()]*)\)', normalize, _dacl(path))
+
+
 @pytest.fixture
 def windows_acl_dirs(tmp_path):
     if os.name != 'nt':
@@ -306,7 +324,7 @@ def test_windows_repair_resets_only_selected_export_dacl(windows_acl_dirs):
     assert _dacl(destination) != _dacl(control)
     reports = file_access.repair_export_access([destination])
     assert len(reports) == 1 and reports[0]['repaired']
-    assert _dacl(destination) == _dacl(control)
+    assert _effective_file_dacl(destination) == _effective_file_dacl(control)
     assert reports[0]['after']['security']['owner_sid'] == before['security']['owner_sid']
     assert destination.read_bytes() == b'existing exported bytes'
     assert file_access._windows_security(original) == source_security
@@ -324,14 +342,16 @@ def test_windows_repair_old_flat_review_exports(windows_acl_dirs):
         os.rename(staged, directory / name)
     control = directory / 'control.txt'
     control.write_text('normal inherited ACL', encoding='utf-8')
-    expected = _dacl(control)
+    expected = _effective_file_dacl(control)
     control.unlink()
-    assert _dacl(directory / 'part-0001.txt') != expected
+    assert _effective_file_dacl(directory / 'part-0001.txt') != expected
     reports = file_access.repair_export_access([directory])
     assert len(reports) == 4
     assert all(report['repaired'] for report in reports)
+    assert all(report['before']['security']['owner_sid'] ==
+               report['after']['security']['owner_sid'] for report in reports)
     for item in directory.iterdir():
-        assert _dacl(item) == expected
+        assert _effective_file_dacl(item) == expected
         assert item.read_text(encoding='utf-8') == '{}\n'
 
 
@@ -352,3 +372,39 @@ def test_copy_progress_distinguishes_checksum_copy_and_readback(tmp_path, monkey
         'Publish archive: source checksum', 'Publish archive: copy', 'Publish archive: verify',
     ]
     assert all(event['completed'] == event['total'] == source.stat().st_size for event in completed)
+
+
+@pytest.mark.parametrize('mutate_source', [False, True])
+def test_copy_accepts_stat_api_time_asymmetry_but_detects_changes(tmp_path, monkeypatch, mutate_source):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(file_access, 'hardlink_publication_allowed', lambda: False)
+    original_fstat = os.fstat
+
+    def differing_fstat(fd):
+        result = original_fstat(fd)
+        values = {field: getattr(result, field) for field in dir(result) if field.startswith('st_')}
+        # Windows CPython can report birth time for path stat and metadata change
+        # time for fstat. Simulate a stable API difference without altering IDs.
+        values['st_ctime_ns'] += 123_000_000
+        values['st_ctime'] += 0.123
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(file_access.os, 'fstat', differing_fstat)
+    source, output = tmp_path / 'staged.zip', tmp_path / 'codex_example.zip'
+    raw = b'unchanged bytes must publish despite timestamp API asymmetry'
+    source.write_bytes(raw)
+
+    def progress(done, total):
+        if mutate_source and not done:
+            with source.open('ab') as changed:
+                changed.write(b'changed')
+
+    if mutate_source:
+        with pytest.raises(RuntimeError, match='changed during publication'):
+            file_access.publish_file(source, output, progress=progress)
+        assert not output.exists()
+        assert source.read_bytes() == raw + b'changed'
+    else:
+        assert file_access.publish_file(source, output, progress=progress) == 'verified_copy'
+        assert source.read_bytes() == output.read_bytes() == raw

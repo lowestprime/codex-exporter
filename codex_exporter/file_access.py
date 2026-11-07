@@ -87,7 +87,11 @@ def publish_file(source: Path, destination: Path, *,
     try:
         with source.open('rb') as original:
             before = os.fstat(original.fileno())
-            if _signature(before) != _signature(initial):
+            # Windows pathname stat can expose creation time as st_ctime while
+            # fstat exposes ChangeTime. Compare timestamps within the same API;
+            # only device/file identity is compared across the two observations.
+            if (not os.path.samestat(before, initial) or
+                    _signature(source.lstat()) != _signature(initial)):
                 raise RuntimeError('Staged file changed before publication; no cleanup performed')
             with stage('source checksum', before.st_size) as task:
                 expected = _digest(original, progress=task.update if task else None)
@@ -117,7 +121,7 @@ def publish_file(source: Path, destination: Path, *,
                     os.fsync(output.fileno())
                 if ((digest.hexdigest(), copied) != expected or
                         _signature(os.fstat(original.fileno())) != _signature(before) or
-                        _signature(source.lstat()) != _signature(before)):
+                        _signature(source.lstat()) != _signature(initial)):
                     raise RuntimeError('Staged file changed during publication; no cleanup performed')
         with stage('verify', before.st_size) as task:
             current = destination.lstat()
