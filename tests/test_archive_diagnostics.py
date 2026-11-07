@@ -332,13 +332,17 @@ def test_path_warnings_do_not_extract_members_or_execute_contents(tmp_path):
         link.create_system = 3
         link.external_attr = (stat.S_IFLNK | 0o777) << 16
         archive.writestr(link, '../target')
+    with zipfile.ZipFile(path) as archive:
+        # ZipInfo normalizes Windows separators when the fixture is written.
+        unsafe_names = [info.filename for info in archive.infolist()[:4]]
+    assert len(unsafe_names) == 4
     before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
     report = diagnostics.diagnose_archive(path)
     after = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
     assert report['ok'] is True
     assert before == after
     warnings = {(w['member'], w['reason']) for w in report['warnings']}
-    assert all((name, 'unsafe_to_extract_path') in warnings for name, _ in dangerous[:4])
+    assert all((name, 'unsafe_to_extract_path') in warnings for name in unsafe_names)
     assert ('link', 'symbolic_link_member') in warnings
     assert not (tmp_path.parent / 'outside.txt').exists()
 
