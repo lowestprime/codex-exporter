@@ -1,4 +1,4 @@
-# Codex Exporter 0.3.11 — live exports, one LZMA ZIP, readable Windows files
+# Codex Exporter 0.3.12 — live LZMA exports and precise archive diagnostics
 
 Export a running Codex thread into **one verified ZIP containing the original
 three files**: rendered Markdown, its JSON manifest, and the captured native
@@ -16,6 +16,23 @@ The printed path and `--open-after` select the final ZIP. Exporting continues to
 work while Codex appends new events: each export captures a verified, fixed
 prefix, and later events appear in the next export. The app-owned rollout is
 never moved, deleted, or modified.
+
+## Diagnose a receiving application's archive failure
+
+Version 0.3.12 adds opt-in, read-only diagnostics while keeping the normal
+compression profile and three-file output unchanged:
+
+```powershell
+codex-export --diagnose-archive 'C:\Exports\codex_example.zip'
+codex-export --diagnose-archive 'C:\Exports\codex_example.zip' --archive-check metadata
+```
+
+The full check reports the actual current runtime, archive hash, member hashes and
+CRC results, method IDs, and encoded LZMA dictionaries. Missing paths, unsupported
+codecs, dictionary-policy limits, and damaged members have distinct results. The
+same module runs as a standalone Python script. It does not certify a different
+ChatGPT conversation or change any export settings. See the
+[diagnostic and receiving-chat guide](docs/ARCHIVE-DIAGNOSTICS.md).
 
 ## Default output and optional review text
 
@@ -73,7 +90,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.11/codex_exporter-0.3.11-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.12/codex_exporter-0.3.12-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }

@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.11"
+__version__ = "0.3.12"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -3380,10 +3380,16 @@ def main() -> int:
     review.add_argument('--review-from', type=Path, metavar='EXPORT_ZIP_OR_TEXT',
                         help='Explicitly create a standalone review ZIP and text folder from an existing export')
     access = ap.add_mutually_exclusive_group()
+    access.add_argument('--diagnose-archive', action='append', type=Path, metavar='ZIP_PATH',
+                        help='Read-only current-runtime ZIP/LZMA diagnostics; repeatable; JSON output')
     access.add_argument('--diagnose-access', action='append', type=Path, metavar='PATH',
                         help='Inspect read access and Windows ACLs for an explicit path; repeatable')
     access.add_argument('--repair-access', action='append', type=Path, metavar='EXPORT_PATH',
                         help='Restore inherited Windows permissions on explicit generated exports; repeatable')
+    ap.add_argument('--archive-check', choices=['full', 'metadata'], default='full',
+                    help='For --diagnose-archive: full hash/CRC decoding (default) or metadata only')
+    ap.add_argument('--archive-max-dictionary-mib', type=int, default=512,
+                    help='For --diagnose-archive: explicit per-member LZMA dictionary guard (default: 512 MiB)')
     ap.add_argument("--tokenizer", choices=["auto", "tiktoken", "regex"], default="auto")
     ap.add_argument("--token-encoding", default=DEFAULT_TOKEN_ENCODING)
     ap.add_argument("--require-tiktoken", action="store_true")
@@ -3399,6 +3405,20 @@ def main() -> int:
     ap.add_argument("--max-tool-chars", type=int, default=20_000)
     ap.add_argument("--json", dest="json_result", action="store_true")
     args = ap.parse_args()
+    if args.diagnose_archive:
+        if any((args.session_ids, args.session_id, args.jsonl, args.project, args.sessions_file,
+                args.latest_session, args.browse, args.chatgpt_export, args.review_from,
+                args.set_archive_default, args.reset_config, args.set_default_out_dir,
+                args.set_filename_template, args.reset_filename_template, args.choose_default_out_dir)):
+            ap.error('Archive diagnostics cannot be combined with export sources or configuration changes')
+        if args.archive_max_dictionary_mib < 1:
+            ap.error('--archive-max-dictionary-mib must be positive')
+        from codex_exporter.archive_diagnostics import diagnose_archive
+        reports = [diagnose_archive(path, full=args.archive_check == 'full',
+                                    max_dictionary_mib=args.archive_max_dictionary_mib)
+                   for path in args.diagnose_archive]
+        print(json.dumps(reports[0] if len(reports) == 1 else reports, ensure_ascii=False, indent=2))
+        return 0 if all(report['ok'] for report in reports) else 1
     if args.diagnose_access or args.repair_access:
         if any((args.session_ids, args.session_id, args.jsonl, args.project, args.sessions_file,
                 args.latest_session, args.browse, args.chatgpt_export, args.review_from)):
