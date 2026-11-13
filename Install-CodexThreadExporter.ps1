@@ -109,7 +109,8 @@ if ($AppendProfile) {
         $updated = [regex]::Replace($existing, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $helper }, 1)
     } elseif ($existing.Contains('# Codex Thread Exporter PowerShell helper functions')) {
         $legacyPattern = '(?s)# Codex Thread Exporter PowerShell helper functions.*?(?=# List all functions defined in this profile script|\z)'
-        $updated = [regex]::Replace($existing, $legacyPattern, $helper + "`r`n`r`n", 1)
+        # A replacement string would expand helper literals such as $_ as regex tokens.
+        $updated = [regex]::Replace($existing, $legacyPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $helper + "`r`n`r`n" }, 1)
     } else {
         $updated = $existing.TrimEnd() + "`r`n`r`n" + $helper.Trim() + "`r`n"
     }
@@ -117,7 +118,8 @@ if ($AppendProfile) {
         if (Test-Path -LiteralPath $profilePath) {
             Copy-Item -LiteralPath $profilePath -Destination "$profilePath.codex-exporter-backup-$(Get-Date -Format yyyyMMdd-HHmmss-fff)" -Force
         }
-        Set-Content -LiteralPath $profilePath -Value $updated -Encoding utf8NoBOM
+        # Keep the preserved trailing region byte-stable across repeated installations.
+        Set-Content -LiteralPath $profilePath -Value $updated -Encoding utf8NoBOM -NoNewline
     }
 }
 

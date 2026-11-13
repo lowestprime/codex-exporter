@@ -165,3 +165,46 @@ def test_powershell_installer_replaces_late_stale_overrides_and_is_idempotent(tm
     assert content.count('# CodexExporter-ArchiveOverrides') == 1
     assert (target / 'codex_exporter' / 'browser.py').is_file()
     assert (target / 'CodexExporter-ArchiveOverrides.ps1').is_file()
+
+
+@pytest.mark.skipif(not PWSH, reason='PowerShell not installed')
+@pytest.mark.parametrize('newline', [b'\n', b'\r\n'], ids=['lf', 'crlf'])
+def test_powershell_legacy_profile_migration_is_literal_and_idempotent(tmp_path, newline):
+    """Exercise the CI legacy-region fixture, including its preserved trailing code."""
+    target = tmp_path / 'codex exporter custom path' / 'tool'
+    profile = tmp_path / 'Microsoft.PowerShell_profile.ps1'
+    lines = [
+        b"function Existing-ProfileFunction { 'preserved' }",
+        b'# Codex Thread Exporter PowerShell helper functions',
+        b"function Legacy-CodexHelper { 'replace me' }",
+        b'# List all functions defined in this profile script',
+        b"function Existing-TrailingFunction { 'also preserved' }",
+    ]
+    profile.write_bytes(newline.join(lines) + newline)
+    command = [PWSH, '-NoProfile', '-File', str(ROOT / 'Install-CodexThreadExporter.ps1'),
+               '-InstallDir', str(target), '-PythonPath', sys.executable,
+               '-ProfilePath', str(profile), '-AppendProfile']
+    subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=True)
+    first = profile.read_bytes()
+    assert b'Legacy-CodexHelper' not in first
+    assert first.count(b'Existing-ProfileFunction') == 1
+    assert first.count(b'Existing-TrailingFunction') == 1
+    assert first.count(b'# >>> Codex Thread Exporter helpers >>>') == 1
+    assert first.endswith(newline.join(lines[-2:]) + newline)
+    backups = sorted(tmp_path.glob(profile.name + '.codex-exporter-backup-*'))
+    assert len(backups) == 1
+
+    # The first migration must produce usable helpers, not merely repair itself on rerun.
+    check = ("$ErrorActionPreference='Stop'; . " + _ps_quote(profile) + '; '
+             'function Invoke-CodexExporterRaw { param([object[]]$ArgumentList); '
+             'ConvertTo-Json -InputObject @($ArgumentList) -Compress }; '
+             "Invoke-CodexThreadExport 'synthetic-session' --since-text 'exact anchor'")
+    invocation = subprocess.run([PWSH, '-NoProfile', '-Command', check], cwd=tmp_path,
+                                capture_output=True, text=True, check=True)
+    forwarded = json.loads(invocation.stdout)
+    assert forwarded[forwarded.index('--mode') + 1] == 'thread'
+    assert forwarded[forwarded.index('--since-text') + 1] == 'exact anchor'
+
+    subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=True)
+    assert profile.read_bytes() == first
+    assert sorted(tmp_path.glob(profile.name + '.codex-exporter-backup-*')) == backups
