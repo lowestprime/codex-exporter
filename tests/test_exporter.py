@@ -260,7 +260,8 @@ def test_browser_single_selection(tmp_path: Path) -> None:
         sys.executable, str(SCRIPT), '--no-archive', "--browse", "--mode", "thread", "--out-dir", str(tmp_path / "out"),
         "--tokenizer", "regex", "--json",
     ], input="1\n", env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=45)
-    assert "Codex session browser —" in result.stdout
+    assert "Codex session browser" in result.stderr
+    assert "Codex session browser" not in result.stdout
     data = json.loads(result.stdout.strip().splitlines()[-1])
     assert data["session_id"] == "66666666-6666-7666-8666-666666666666"
 

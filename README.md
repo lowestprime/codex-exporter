@@ -1,21 +1,31 @@
-# Codex Exporter 0.3.12 — live LZMA exports and precise archive diagnostics
+# Codex Exporter 0.4.0 — bounded live archives and exact turn selection
 
-Export a running Codex thread into **one verified ZIP containing the original
-three files**: rendered Markdown, its JSON manifest, and the captured native
-JSONL. Ordinary exports leave no `.review.zip` or `.review` directory. Maximum
-configured LZMA settings are restored: level 9, a 256 MiB dictionary, word size
-64, and 19 requested threads, using a compatible external 7-Zip CLI.
+Export a running Codex thread with **every final ZIP at most 512,000,000 bytes**.
+A fitting single-session export contains the familiar three files: Markdown,
+provenance manifest, and native JSONL. Larger exports become independently readable
+ZIP parts with lossless reconstruction metadata. Multiple sessions share one
+bounded archive set by default. There is no default `.review.zip` or loose folder.
+
+The LZMA profile remains level 9, dictionary 256m, word size 64 and 19 requested
+threads. Selection now reduces both Markdown and native JSONL to the requested
+scope; it does not reattach the entire historical rollout.
 
 ```powershell
-cdx-thread '11111111-2222-4333-8444-555555555555'
-# Direct equivalent:
-codex-export --session-id '11111111-2222-4333-8444-555555555555' --mode thread
+cdx-thread 'SESSION-ID'
+cdx-turns 'SESSION-ID'
+cdx-since 'SESSION-ID' 'text:distinct phrase in the starting prompt'
+cdx-since 'SESSION-ID' 'turn:42'
+cdx-last 'SESSION-ID' 5
+cdx-browse
+# Direct equivalent, inclusive of the selected user turn:
+codex-export --session-id 'SESSION-ID' --since-turn 42
 ```
 
-The printed path and `--open-after` select the final ZIP. Exporting continues to
-work while Codex appends new events: each export captures a verified, fixed
-prefix, and later events appear in the next export. The app-owned rollout is
-never moved, deleted, or modified.
+Every final archive path is printed on stdout; progress and browser UI use stderr.
+A verified fixed snapshot allows the session to keep running. The original rollout
+is never moved, deleted or modified. Read the [bounded archive, selection and
+browser guide](docs/BOUNDED-EXPORTS-AND-SELECTION.md) for exact guarantees, controls,
+configuration and the limits of remote ChatGPT compatibility.
 
 ## Diagnose a receiving application's archive failure
 
@@ -38,9 +48,11 @@ ChatGPT conversation or change any export settings. See the
 
 | Selection | Generated output after successful cleanup |
 |---|---|
-| Default export | One `<stem>.zip` with `<stem>.md`, `<stem>.manifest.json`, and `<stem>.jsonl` |
+| Fitting single-session export | One `<stem>.zip` with `<stem>.md`, `<stem>.manifest.json`, and matching `<stem>.jsonl` |
+| Oversized export | Independently readable `.partNNNN-of-NNNN.zip` files, each within the cap |
+| Multiple sessions/project | One bounded archive set with per-session files and `BATCH_INDEX.json`; opt out with `--separate-archives` |
 | `--review` | The same ZIP, additionally containing bounded review TXT files, index, and guide |
-| `--no-review` | The original three-file ZIP; this is the default |
+| `--no-review` | No review TXT members; the fitting single-session three-file layout is the default |
 | `--no-archive` | Loose export files; explicitly requested review adds a text directory, never a ZIP |
 | `--no-archive-cleanup` | Verified ZIP plus retained loose export files |
 | `--no-source-copy` | Omit native JSONL, for example when using rendered-content redaction |
@@ -78,7 +90,10 @@ See [integrity semantics](docs/INTEGRITY-AND-MANIFEST.md).
 
 Use the interpreter that runs your existing exporter. Installing a release does
 not erase explicitly saved preferences, so installations that selected Deflate
-in 0.3.10 should restore LZMA explicitly:
+in 0.3.10 should restore LZMA explicitly. The wheel-only command below updates the
+Python package; install the matching PowerShell helpers using the
+[Windows upgrade guide](docs/WINDOWS-UPGRADE.md) to expose `cdx-since` and
+`cdx-turns` and update existing `cdx-*` routing:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -90,7 +105,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.3.12/codex_exporter-0.3.12-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.4.0/codex_exporter-0.4.0-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }
@@ -149,8 +164,9 @@ preserves recoverable loose outputs; cleanup applies only after successful
 verification and publication. Export output paths are checked for source and
 output aliases, including existing hard links, before writing. An explicit
 manifest path cannot overwrite the live source or the rendered Markdown.
-Explicit unknown-event sidecars remain separate
-and are retained; they are not part of the default three-file layout.
+Explicit unknown-event sidecars join the same bounded archive set and are removed
+with generated loose outputs only after complete verification. They remain loose
+when archiving or cleanup is explicitly disabled.
 
 An external archiver may use Store for a short or incompressible member. The
 validator accepts that method-0 fallback while rejecting unrequested compression
@@ -431,7 +447,9 @@ At the direct CLI level, `--out-dir` and `--choose-out-dir` are remembered by de
 | `cdx-turn <ID> N` | Prompt plus response block `N`, with metadata |
 | `cdx-response-block <ID> N` | Response block `N` |
 | `cdx-response <ID>` | Latest response, wrapped Markdown, clipboard |
-| `cdx-last <ID> N` | Last `N` turns |
+| `cdx-last <ID> N` | Last `N` turns with matching JSONL |
+| `cdx-since <ID> SELECTOR` | Inclusive prompt/turn/ID/time selection through snapshot end |
+| `cdx-turns <ID>` | List actual user-turn anchors, IDs, timestamps and prompt previews |
 | `cdx-live <ID>` | Reconstructed compaction/rollback-aware live context |
 | `cdx-batch <ID1>,<ID2>` | Deterministic batch export with short IDs |
 | `cdx-final <ID>` | Last substantial assistant message |
@@ -496,14 +514,12 @@ codex-export --sessions-file .\sessions.txt --mode thread --stable-filenames
 codex-export --session-id <ID> --mode thread --last-n-turns 5
 ```
 
-`--browse` is optional and does not change the noninteractive architecture. Browser controls are:
-
-```text
-number/range  select rows       a  select current page
-n / p         next/previous     m  projects/sessions view
-/ text        filter            s  find ID/rollout filename
-b             back              q  quit
-```
+Batch exports now share one bounded archive set unless `--separate-archives` is
+requested. `--browse` runs before progress starts; its UI and prompts use stderr.
+It supports immediate numeric/range selection, a cross-page basket (`+1`, `+all`,
+`x`), preview (`v N`), search (`/words`), full-path project grouping, sorting,
+availability filters, refresh and clean q/EOF/Ctrl+C cancellation. See the
+[complete browser controls](docs/BOUNDED-EXPORTS-AND-SELECTION.md#browser-interaction).
 
 ## Token counting
 

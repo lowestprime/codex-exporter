@@ -1,4 +1,4 @@
-# Installs Codex Exporter 0.3+ and safely replaces its marked PowerShell profile block.
+# Installs Codex Exporter 0.4+ and safely replaces its marked PowerShell profile block.
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\projects\CodexTools',
@@ -19,8 +19,9 @@ $sourceScript = Join-Path $repoRoot 'Export-CodexThread.py'
 $sourcePackage = Join-Path $repoRoot 'codex_exporter'
 $sourceHelper = Join-Path $repoRoot 'powershell\CodexThreadExport-profile-block.v8.ps1'
 $sourcePathRepair = Join-Path $repoRoot 'powershell\Repair-CodexExporterPath.ps1'
+$sourceOverrides = Join-Path $repoRoot 'powershell\CodexExporter-ArchiveOverrides.ps1'
 
-foreach ($required in @($sourceScript, $sourcePackage, $sourceHelper, $sourcePathRepair)) {
+foreach ($required in @($sourceScript, $sourcePackage, $sourceHelper, $sourcePathRepair, $sourceOverrides)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Required source missing: $required" }
 }
 
@@ -29,10 +30,12 @@ $PythonPath = [System.IO.Path]::GetFullPath($PythonPath)
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { throw "Python executable not found: $PythonPath" }
 
 $installPath = [System.IO.Path]::GetFullPath($InstallDir)
+if ($installPath.TrimEnd('\','/') -eq $repoRoot.TrimEnd('\','/')) { throw 'InstallDir must differ from the source checkout.' }
 $installedScript = Join-Path $installPath 'Export-CodexThread.py'
 $installedPackage = Join-Path $installPath 'codex_exporter'
 $installedHelper = Join-Path $installPath 'CodexThreadExport-profile-block.v8.ps1'
 $installedPathRepair = Join-Path $installPath 'Repair-CodexExporterPath.ps1'
+$installedOverrides = Join-Path $installPath 'CodexExporter-ArchiveOverrides.ps1'
 New-Item -ItemType Directory -Force -Path $installPath | Out-Null
 if (Test-Path -LiteralPath $installedScript) {
     $backupRoot = Join-Path $installPath ('backups\upgrade-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
@@ -48,15 +51,19 @@ if (Test-Path -LiteralPath $installedPackage) {
 }
 Copy-Item -LiteralPath $sourcePackage -Destination $installedPackage -Recurse -Force
 Copy-Item -LiteralPath $sourcePathRepair -Destination $installedPathRepair -Force
+Copy-Item -LiteralPath $sourceOverrides -Destination $installedOverrides -Force
 
 $scriptLiteral = "'" + $installedScript.Replace("'", "''") + "'"
 $pythonLiteral = $PythonPath.Replace("'", "''")
 $helper = (Get-Content -LiteralPath $sourceHelper -Raw).Trim()
 $helper = $helper.Replace("'C:\projects\CodexTools\Export-CodexThread.py'", $scriptLiteral)
 $helper = $helper.Replace('__CODEX_EXPORT_PYTHON__', $pythonLiteral)
+$overrideLoader = "# CodexExporter-ArchiveOverrides (v0.4.0)`r`n. '$($installedOverrides.Replace("'", "''"))'`r`n"
+$helper = $helper.Replace('# <<< Codex Thread Exporter helpers <<<', $overrideLoader + '# <<< Codex Thread Exporter helpers <<<')
 Set-Content -LiteralPath $installedHelper -Value $helper -Encoding utf8NoBOM
 
 & $PythonPath -m py_compile $installedScript
+if ($LASTEXITCODE -ne 0) { throw 'Installed exporter did not compile.' }
 
 if ($InstallPackage) {
     & $PythonPath -m pip install --upgrade $repoRoot
@@ -90,6 +97,10 @@ if ($AppendProfile) {
         $existing = ''
     }
 
+    $previous = $existing
+    # Remove only installer-owned late loaders; the new marked block loads current overrides last.
+    $loaderPattern = "(?m)^# CodexExporter-ArchiveOverrides[^`r`n]*`r?`n[ `t]*\.[ `t]+'[^`r`n]*CodexExporter-ArchiveOverrides\.ps1'[ `t]*`r?`n?"
+    $existing = [regex]::Replace($existing, $loaderPattern, '')
     $begin = '# >>> Codex Thread Exporter helpers >>>'
     $end = '# <<< Codex Thread Exporter helpers <<<'
     $pattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
@@ -98,15 +109,17 @@ if ($AppendProfile) {
         $updated = [regex]::Replace($existing, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $helper }, 1)
     } elseif ($existing.Contains('# Codex Thread Exporter PowerShell helper functions')) {
         $legacyPattern = '(?s)# Codex Thread Exporter PowerShell helper functions.*?(?=# List all functions defined in this profile script|\z)'
-        $updated = [regex]::Replace($existing, $legacyPattern, $helper + "`r`n`r`n", 1)
+        # A replacement string would expand helper literals such as $_ as regex tokens.
+        $updated = [regex]::Replace($existing, $legacyPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $helper + "`r`n`r`n" }, 1)
     } else {
         $updated = $existing.TrimEnd() + "`r`n`r`n" + $helper.Trim() + "`r`n"
     }
-    if ($updated -cne $existing) {
+    if ($updated -cne $previous) {
         if (Test-Path -LiteralPath $profilePath) {
             Copy-Item -LiteralPath $profilePath -Destination "$profilePath.codex-exporter-backup-$(Get-Date -Format yyyyMMdd-HHmmss-fff)" -Force
         }
-        Set-Content -LiteralPath $profilePath -Value $updated -Encoding utf8NoBOM
+        # Keep the preserved trailing region byte-stable across repeated installations.
+        Set-Content -LiteralPath $profilePath -Value $updated -Encoding utf8NoBOM -NoNewline
     }
 }
 

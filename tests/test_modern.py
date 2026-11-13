@@ -80,8 +80,9 @@ def test_stream_respects_force_and_collision(tmp_path):
     second=cli(args,home); assert second.returncode==0,second.stderr
     assert json.loads(first.stdout)['file'] != json.loads(second.stdout)['file']
     force=cli(['--jsonl',str(SAMPLE),'--mode','thread','--fast','--last-n-turns','2'],home)
-    assert force.returncode != 0
-    assert '--fast only supports' in force.stderr
+    assert force.returncode == 0, force.stderr
+    assert 'Select native JSONL interval' in force.stderr
+    assert Path(force.stdout.strip()).is_file()
 
 
 def test_stream_unknown_event_sidecar(tmp_path):

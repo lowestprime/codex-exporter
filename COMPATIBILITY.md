@@ -40,3 +40,20 @@ compatible external CLI; explicit Python-backend archives use Deflate.
 See [archive diagnostics](docs/ARCHIVE-DIAGNOSTICS.md),
 [integrity semantics](docs/INTEGRITY-AND-MANIFEST.md), and the
 [Windows upgrade guide](docs/WINDOWS-UPGRADE.md).
+
+## Version 0.4.0 archive and selection contract
+
+Every published export/review ZIP is at most 512,000,000 bytes. Oversized outputs
+use independently readable ZIP parts with lossless reconstruction metadata.
+Multi-session/project exports share one bounded set by default;
+`--separate-archives` retains per-session sets. Partial JSONL records are explicitly
+marked byte fragments and require reconstruction before whole-record parsing.
+
+Subset exports retain matching native JSONL and identify original snapshot versus
+excerpt hashes. Inclusive since/last-N selection works with both classic and
+streaming thread rendering. Reconstructed live context is incompatible with exact
+subset native copies; an explicit no-source-copy export remains available.
+
+These contracts concern generated artifacts, not guaranteed attachment
+materialization, decoder availability or complete context ingestion in another
+ChatGPT conversation. See [the detailed guide](docs/BOUNDED-EXPORTS-AND-SELECTION.md).

@@ -1,6 +1,7 @@
 include Export-CodexThread.py
 include Install-CodexThreadExporter.ps1
 include Install-CodexExporter-ArchiveOverrides.ps1
+include Update-CodexExporter-ProfileRouting.ps1
 include README.md CHANGELOG.md COMPATIBILITY.md CONTRIBUTING.md SECURITY.md LICENSE
 recursive-include bash *.sh
 recursive-include docs *.md
