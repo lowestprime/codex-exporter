@@ -43,9 +43,12 @@ class ArchiveSettings:
     archiver: str = ''
     review: bool = False
     review_chunk_bytes: int = 1_000_000
+    max_bytes: int = 512_000_000
 
     def validate(self) -> None:
         from .review import _validate_chunk_bytes
+        from .bounded_archive import validate_max_bytes
+        validate_max_bytes(self.max_bytes)
         if not isinstance(self.review, bool):
             raise ValueError('review must be a boolean')
         _validate_chunk_bytes(self.review_chunk_bytes)
@@ -176,7 +179,8 @@ def _copy_decoded(source: Path, dest: Path, *, meter=None) -> tuple[str, int]:
     return h.hexdigest(), n
 
 
-def _verify_members(archive: Path, expected: dict[str, Path], method: str, *, reporter=None) -> dict[str, str]:
+def _verify_members(archive: Path, expected: dict[str, Path], method: str, *, reporter=None,
+                    checksums: dict[str, tuple[str, int]] | None = None) -> dict[str, str]:
     """Independently verify full ZIP members, accepting only safe Store fallback.
 
     7-Zip can choose ZIP Store (method 0) for inputs that do not benefit from
@@ -228,6 +232,8 @@ def _verify_members(archive: Path, expected: dict[str, Path], method: str, *, re
                         meter.advance(len(block))
                 if digest.hexdigest() != original.hexdigest() or size != original_size:
                     raise RuntimeError(f'Archive content mismatch: {info.filename}')
+                if checksums is not None:
+                    checksums[info.filename] = (digest.hexdigest(), size)
         return {info.filename: methods[info.compress_type] for info in infos}
 
 
@@ -237,7 +243,13 @@ def avoid_existing_archive(md_path: Path, collision: str) -> Path:
 
     Never overwrite an existing ZIP, even when --collision overwrite is selected.
     """
-    if not md_path.with_suffix('.zip').exists():
+    def occupied(path: Path) -> bool:
+        import glob
+        from .bounded_archive import archive_stem_digest
+        return (path.with_suffix('.zip').exists() or
+                any(path.parent.glob(glob.escape(path.stem) + '.part*-of-*.zip')) or
+                any(path.parent.glob('*-' + archive_stem_digest(path) + '.part*-of-*.zip')))
+    if not occupied(md_path):
         return md_path
     if collision != 'rename':
         raise FileExistsError('An archive already exists for this export basename: '
@@ -245,7 +257,7 @@ def avoid_existing_archive(md_path: Path, collision: str) -> Path:
     n = 1
     while True:
         candidate = md_path.with_name(f'{md_path.stem}-{n}{md_path.suffix}')
-        if not candidate.exists() and not candidate.with_suffix('.zip').exists():
+        if not candidate.exists() and not occupied(candidate):
             return candidate
         n += 1
 
@@ -277,6 +289,33 @@ def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporte
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
         raise RuntimeError('Snapshot changed during source-copy staging; no cleanup performed')
     return digest, size, 'snapshot_hardlink' if publication == 'hardlink' else 'snapshot_copy'
+
+
+
+def _compress_archive(staged: Path, members: dict[str, Path], settings: ArchiveSettings, *,
+                      backend: str, archiver: Path | None, reporter=None) -> None:
+    """Create a private flat ZIP with the exact requested codec configuration."""
+    from .progress import ProgressReporter, run_seven_zip, SEVEN_ZIP_PROGRESS_ARGS
+    reporter = reporter or ProgressReporter(enabled=False)
+    if backend == 'python':
+        _write_python_archive(staged, members, settings.level, reporter=reporter)
+        return
+    parents = {path.parent for path in members.values()}
+    if len(parents) != 1 or any(name != path.name for name, path in members.items()):
+        raise ValueError('External archiver inputs must be flat files in one private directory')
+    command = [str(archiver), 'a', '-tzip', '-mx=' + str(settings.level),
+               '-mm=' + settings.method, '-mmt=' + str(settings.threads),
+               '-y', *SEVEN_ZIP_PROGRESS_ARGS]
+    if settings.method.upper() == 'LZMA':
+        command.extend(['-md=' + settings.dictionary, '-mfb=' + str(settings.word_size)])
+    command.extend([str(staged), *members.keys()])
+    with reporter.stage('Compress archive', unit='percent',
+                        detail=f'{settings.method} level {settings.level}; '
+                               f'{len(members)} files; requested threads {settings.threads}') as meter:
+        run = run_seven_zip(command, cwd=next(iter(parents)), progress=meter)
+        if run.returncode != 0:
+            raise RuntimeError(f'Archiver error {run.returncode} ({archiver}): '
+                               + (run.stderr or run.stdout)[-1600:])
 
 
 def package_export(result: dict[str, Any], original_source: Path,
@@ -323,6 +362,11 @@ def package_export(result: dict[str, Any], original_source: Path,
         raise RuntimeError('ZIP packaging requires an exported manifest; use --no-archive with --no-manifest')
     from .file_access import validate_export_paths
     outputs = {'Markdown': md}
+    unknown_sidecar = Path(result['unknown_sidecar']).resolve() if result.get('unknown_sidecar') else None
+    if unknown_sidecar is not None:
+        if not unknown_sidecar.is_file():
+            raise FileNotFoundError(f'Unknown-event sidecar missing: {unknown_sidecar}')
+        outputs['unknown-event sidecar'] = unknown_sidecar
     if manifest is not None:
         outputs['manifest'] = manifest
     if settings.copy_source:
@@ -335,6 +379,10 @@ def package_export(result: dict[str, Any], original_source: Path,
         if manifest.parent != md.parent:
             raise RuntimeError('Export manifest must be in Markdown output directory for flat ZIP')
         members[manifest.name] = manifest
+    if unknown_sidecar is not None:
+        if unknown_sidecar.parent != md.parent or unknown_sidecar.name in members:
+            raise RuntimeError('Unknown-event sidecar must be a distinct flat export file')
+        members[unknown_sidecar.name] = unknown_sidecar
     source_copy: Path | None = None
     if snapshot is not None:
         if settings.copy_source:
@@ -411,12 +459,16 @@ def package_export(result: dict[str, Any], original_source: Path,
         'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
         'threads': settings.threads if backend == '7zip' else 1,
         'archive_filename': archive.name, 'members': sorted(members),
+        'native_source_member': source_copy.name if source_copy else None,
         'source_copy_sha256': result.get('source_copy_sha256'),
         'source_copy_bytes': result.get('source_copy_bytes'),
         'source_copy_strategy': result.get('source_copy_strategy'),
         'review_included': bool(review),
         'cleanup_after_full_archive_verification': settings.cleanup,
         'publication_permissions': 'inherit_destination_folder_on_windows',
+        'max_archive_bytes': settings.max_bytes,
+        'overflow_policy': 'independent_zip_parts_with_lossless_offset_and_sha256_provenance',
+        'overflow_filename_pattern': archive.stem + '.partNNNN-of-NNNN.zip',
     }
     def save_manifest() -> None:
         with manifest.open('w', encoding='utf-8', newline='\n') as stream:
@@ -428,6 +480,7 @@ def package_export(result: dict[str, Any], original_source: Path,
         'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
         'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
         'threads': settings.threads if backend == '7zip' else 1,
+        'max_bytes': settings.max_bytes,
     }
     with tempfile.TemporaryDirectory(prefix='.codex-archive-', dir=md.parent) as temporary:
         work = Path(temporary)
@@ -455,39 +508,52 @@ def package_export(result: dict[str, Any], original_source: Path,
                 except OSError:
                     shutil.copyfile(path, compression_dir / name)
         member_signatures = {name: _file_signature(path) for name, path in members.items()}
-        if backend == 'python':
-            _write_python_archive(staged, members, settings.level, reporter=reporter)
-        else:
-            command = [str(archiver), 'a', '-tzip', '-mx=' + str(settings.level),
-                       '-mm=' + settings.method, '-mmt=' + str(settings.threads),
-                       '-y', *SEVEN_ZIP_PROGRESS_ARGS]
-            if settings.method.upper() == 'LZMA':
-                command.extend(['-md=' + settings.dictionary, '-mfb=' + str(settings.word_size)])
-            command.extend([str(staged), *members.keys()])
-            with reporter.stage('Compress archive', unit='percent',
-                                detail=f'{settings.method} level {settings.level}; '
-                                       f'{len(members)} files; requested threads {settings.threads}') as meter:
-                run = run_seven_zip(command, cwd=compression_dir, progress=meter)
-                if run.returncode != 0:
-                    raise RuntimeError(f'Archiver error {run.returncode} ({archiver}): '
-                                       + (run.stderr or run.stdout)[-1600:])
-        member_methods = _verify_members(staged, members, settings.method, reporter=reporter)
+        compression_members = ({name: compression_dir / name for name in members}
+                               if review else members)
+        _compress_archive(staged, compression_members, settings, backend=backend,
+                          archiver=archiver, reporter=reporter)
+        verified_checksums: dict[str, tuple[str, int]] = {}
+        _verify_members(staged, members, settings.method, reporter=reporter,
+                        checksums=verified_checksums)
         _check_member_signatures(members, member_signatures)
-        if archive.exists():
-            raise FileExistsError(f'Archive appeared while packaging: {archive}')
-        publication = _publish_archive(staged, archive, reporter=reporter)
+        from .bounded_archive import bound_archive, publish_parts
+        parts = bound_archive(
+            staged, members, max_bytes=settings.max_bytes, work=work / 'bounded',
+            compress=lambda path, inputs: _compress_archive(
+                path, inputs, settings, backend=backend, archiver=archiver, reporter=reporter),
+            method=settings.method, reporter=reporter, checksums=verified_checksums)
+        _check_member_signatures(members, member_signatures)
+        destinations, publications = publish_parts(parts, archive, max_bytes=settings.max_bytes,
+                                                   reporter=reporter, publisher=_publish_archive)
+        member_methods = {name: method for part in parts for name, method in part.member_methods.items()}
+        payload_store = any(
+            part.member_methods[name] == 'Store'
+            for part in parts
+            for name in ([entry['member'] for entry in part.provenance['members']]
+                         if part.provenance else part.members))
+        archive = destinations[0]
         result.update({
-            'archive': str(archive), 'archive_verified': True,
+            'archive': str(archive), 'archives': [str(path) for path in destinations],
+            'archive_verified': True, 'archive_count': len(parts),
+            'archive_parts': [
+                {'archive': str(path), 'bytes': part.size_bytes, 'members': part.members,
+                 'provenance': part.provenance}
+                for path, part in zip(destinations, parts)],
             'archiver': str(archiver) if archiver else 'python.zipfile',
-            'archive_backend': backend, 'archive_publication': publication,
-            'archive_method': settings.method, 'archive_members': sorted(members),
+            'archive_backend': backend, 'archive_publication': publications[0],
+            'archive_publications': publications,
+            'archive_method': settings.method, 'archive_members': sorted(member_methods),
             'archive_member_methods': member_methods,
-            'archive_used_store_fallback': 'Store' in member_methods.values(),
+            'archive_used_store_fallback': payload_store,
+            'archive_metadata_method': 'Store' if any(part.provenance for part in parts) else None,
             'archive_bytes': archive.stat().st_size,
+            'archive_total_bytes': sum(part.size_bytes for part in parts),
+            'archive_max_bytes': settings.max_bytes,
             'archive_uncompressed_bytes': sum(path.stat().st_size for path in members.values()),
             'archived_markdown': md.name,
             'archived_manifest': manifest.name if manifest else None,
             'archived_source': source_copy.name if source_copy else None,
+            'archived_unknown_sidecar': unknown_sidecar.name if unknown_sidecar else None,
             'loose_files_removed': False,
         })
         if review:
@@ -500,5 +566,6 @@ def package_export(result: dict[str, Any], original_source: Path,
                 for file in loose_members.values():
                     file.unlink()
                     meter.advance(1)
-            result.update(loose_files_removed=True, file=None, manifest=None, source_copy=None)
+            result.update(loose_files_removed=True, file=None, manifest=None, source_copy=None,
+                          unknown_sidecar=None)
     return result

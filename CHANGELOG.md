@@ -1,3 +1,19 @@
+## 0.4.0 — Bounded archive sets, exact excerpts, and inclusive selection (2026-11-13)
+
+- Enforce a conservative 512,000,000-byte hard ceiling on all export/review ZIPs.
+  Reuse fitting compressed streams; split oversized members losslessly; verify
+  complete SHA/CRC coverage before publishing independent parts and cleaning up.
+- Combine batch/project sessions into one bounded set by default, with a session
+  index and an explicit `--separate-archives` compatibility option.
+- Add `--since`/`cdx-since`, typed selector aliases, ambiguity handling, and
+  `--list-turns`/`cdx-turns`. Preserve real repeated steering and modern native IDs.
+- Match retained JSONL to selected turns/records, preserve original raw bytes and
+  merged tool provenance, and allow streaming selected since/last-N intervals.
+- Replace the browser with terminal-aware stderr interaction, persistent basket,
+  previews, search, filters, sorting, full-workspace grouping and clean cancellation.
+- Fix PowerShell/Bash forwarding, newest-version routing and standalone module
+  installation; preserve explicit overrides and all compression preferences.
+
 ## 0.3.12 — Separate archive availability, codec capability, and integrity (2026-11-07)
 
 - Add opt-in read-only ZIP diagnostics to the CLI and a standalone standard-library reader. Report actual runtime capabilities, archive size/SHA-256, inventory, encoded LZMA dictionaries, and full streamed member size/CRC/SHA-256 checks.

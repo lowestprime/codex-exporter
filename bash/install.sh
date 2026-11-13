@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Codex Exporter 0.2+ on macOS/Linux.
+# Install Codex Exporter 0.4+ on macOS/Linux.
 set -euo pipefail
 
 install_dir=${CODEX_EXPORT_INSTALL_DIR:-"$HOME/.codex-tools"}
@@ -47,7 +47,18 @@ if [ -z "$python" ]; then
 fi
 
 mkdir -p "$install_dir"
-cp "$repo_root/Export-CodexThread.py" "$install_dir/Export-CodexThread.py"
+install_dir=$(cd "$install_dir" && pwd)
+if [ "$install_dir" != "$repo_root" ]; then
+    if [ -f "$install_dir/Export-CodexThread.py" ]; then
+        backup_dir="$install_dir/backups/upgrade-$(date +%Y%m%d-%H%M%S)-$$"
+        mkdir -p "$backup_dir"
+        cp "$install_dir/Export-CodexThread.py" "$backup_dir/"
+        if [ -d "$install_dir/codex_exporter" ]; then cp -R "$install_dir/codex_exporter" "$backup_dir/"; fi
+    fi
+    cp "$repo_root/Export-CodexThread.py" "$install_dir/Export-CodexThread.py"
+    mkdir -p "$install_dir/codex_exporter"
+    cp -R "$repo_root/codex_exporter/." "$install_dir/codex_exporter/"
+fi
 cp "$repo_root/bash/codex-thread-export.sh" "$install_dir/codex-thread-export.sh"
 "$python" -m py_compile "$install_dir/Export-CodexThread.py"
 
@@ -65,14 +76,16 @@ if [ "$no_profile" -eq 0 ]; then
     touch "$profile_file"
     begin='# >>> Codex Thread Exporter helpers >>>'
     end='# <<< Codex Thread Exporter helpers <<<'
-    source_line=". \"$install_dir/codex-thread-export.sh\""
+    source_line=$(printf '. %q' "$install_dir/codex-thread-export.sh")
+    python_line=$(printf 'export CODEX_EXPORT_PYTHON=%q' "$python")
+    fallback_line=$(printf 'export CODEX_EXPORT_FALLBACK_SCRIPT=%q' "$install_dir/Export-CodexThread.py")
     tmp=$(mktemp)
     awk -v begin="$begin" -v end="$end" '
         $0 == begin { skip=1; next }
         skip && $0 == end { skip=0; next }
         !skip { print }
     ' "$profile_file" > "$tmp"
-    printf '\n%s\n%s\n%s\n' "$begin" "$source_line" "$end" >> "$tmp"
+    printf '%s\n%s\n%s\n%s\n%s\n' "$begin" "$python_line" "$fallback_line" "$source_line" "$end" >> "$tmp"
     if ! cmp -s "$profile_file" "$tmp"; then
         cp "$profile_file" "$profile_file.codex-exporter-backup-$(date +%Y%m%d-%H%M%S)"
         mv "$tmp" "$profile_file"

@@ -57,7 +57,7 @@ def test_factory_defaults_restore_full_lzma_controls_and_disable_review():
         'archive': True, 'copy_source': True, 'cleanup': True, 'archiver': '',
         'backend': 'auto', 'method': 'LZMA', 'level': 9,
         'dictionary': '256m', 'word_size': 64, 'threads': 19,
-        'review': False, 'review_chunk_bytes': 1_000_000,
+        'review': False, 'review_chunk_bytes': 1_000_000, 'max_bytes': 512_000_000,
     }
     assert settings.effective_backend() == '7zip'
 

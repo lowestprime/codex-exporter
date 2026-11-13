@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import copy
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.3.12"
+__version__ = "0.4.0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -426,6 +427,17 @@ class Record:
     seq: int = 0
     command_key: str = ""
     output_key: str = ""
+    source_seqs: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Keep every native line behind merged call/output cards and duplicates.
+        if not self.source_seqs and self.seq > 0:
+            self.source_seqs = (self.seq,)
+        if (self.kind == 'message' and self.role == 'user'
+                and self.source_type.casefold() not in ('user_message', 'usermessage')):
+            from codex_exporter.selection import is_injected_context
+            if is_injected_context(self.text):
+                self.kind, self.role, self.source_type = 'note', 'system', 'injected_context'
 
 
 def cp437_cp1252_mojibake_repair(text: str) -> str:
@@ -1569,6 +1581,12 @@ def classify_record(
         return Record("action", "tool", "MCP tool completion\n\n" +
                       json.dumps(item, ensure_ascii=False, indent=2), timestamp, item_type, seq)
 
+    # Native media-only prompts still define a user turn. Keep a stable marker;
+    # the exact image/audio payload remains in the matching native JSONL.
+    from codex_exporter.selection import native_user_text
+    native_prompt = native_user_text(obj)
+    if native_prompt:
+        return Record('message', 'user', native_prompt, timestamp, payload_type or top_type, seq)
     return None
 
 
@@ -1619,6 +1637,7 @@ def merge_command_outputs(records: list[Record]) -> list[Record]:
                     cmd.seq or rec.seq,
                     cmd.command_key,
                     rec.output_key,
+                    tuple(sorted(set(cmd.source_seqs + rec.source_seqs))),
                 )
             )
             continue
@@ -1672,7 +1691,8 @@ def insert_action_group_summaries(records: list[Record]) -> list[Record]:
 
         summary = action_summary_for_block(block)
         if summary:
-            out.append(Record("note", "system", summary, block[0].timestamp, "summary", block[0].seq))
+            out.append(Record("note", "system", summary, block[0].timestamp, "summary", block[0].seq,
+                              source_seqs=tuple(sorted({n for r in block for n in r.source_seqs}))))
         out.extend(block)
         i = j
 
@@ -2005,7 +2025,7 @@ def render_thread_frontmatter(
             f"source_snapshot_captured_at: {yaml_quote(source_snapshot['capture_completed_at'])}",
             f"source_snapshot_bytes: {source_snapshot['captured_size_bytes']}",
             f"source_snapshot_deferred_tail_bytes: {source_snapshot['deferred_tail_bytes']}",
-            'source_hash_scope: "captured_decoded_jsonl"',
+            f"source_hash_scope: {yaml_quote('selected_native_jsonl' if source_snapshot.get('selection') else 'captured_decoded_jsonl')}",
         ]
     return "\n".join(lines)
 
@@ -2083,6 +2103,23 @@ def render_record_stream(records: list[Record]) -> str:
     return "\n\n".join(r.text.rstrip() for r in records if r.text.strip()).rstrip()
 
 
+def selection_note(source_snapshot: dict[str, Any] | None) -> str:
+    selection = (source_snapshot or {}).get('selection')
+    if not selection:
+        return ''
+    if selection.get('mode') == 'turn_interval':
+        scope = f"user turns {selection['start_turn']} through {selection['stop_turn']} (inclusive)"
+    else:
+        scope = 'the native records backing the selected rendered content'
+    text = (f'> Native source scope: {scope}. The included JSONL is an exact byte excerpt; '
+            'necessary session metadata and turn configuration are labeled as context in the manifest. '
+            'The manifest retains original snapshot hashes and byte/line mappings.\n\n')
+    if selection.get('embedded_history_record_count'):
+        text += ('> Selected compaction records contain embedded historical context. Their original bytes '
+                 'are retained and disclosed in the manifest; older turns were not appended separately.\n\n')
+    return text
+
+
 def render_thread_export(
     *,
     records: list[Record],
@@ -2115,6 +2152,8 @@ def render_thread_export(
         )
 
     parts.extend([f"# {title}", ""])
+    if source_snapshot and source_snapshot.get('selection'):
+        parts.append(selection_note(source_snapshot))
 
     if include_map:
         parts.append(render_export_map(records, meta, title))
@@ -2233,6 +2272,8 @@ def filename_count_suffix(text: str) -> str:
 
 
 def mode_descriptor(args: argparse.Namespace) -> str:
+    if getattr(args, "_selection_descriptor", None):
+        return args._selection_descriptor
     mode = str(args.mode)
     if mode in {"response", "turn"} and getattr(args, "response", None):
         mode = f"{mode}-{int(args.response):04d}"
@@ -2374,7 +2415,8 @@ def build_manifest(
     if source_snapshot:
         manifest['source_snapshot'] = source_snapshot
         manifest['source']['encoding'] = source_snapshot['source_encoding']
-        manifest['source']['sha256_scope'] = 'captured_decoded_jsonl'
+        manifest['source']['sha256_scope'] = ('selected_native_jsonl' if source_snapshot.get('selection')
+                                                  else 'captured_decoded_jsonl')
         manifest['source']['captured_size_bytes'] = source_snapshot['captured_size_bytes']
     return manifest
 
@@ -2541,7 +2583,8 @@ def parse_session(
 
             meta["_recognized_event_types"][key_name] += 1
             key = (rec.kind, rec.role, rec.text)
-            if key == last_key:
+            if key == last_key and not (rec.role == 'user' and rec.source_type == records[-1].source_type):
+                records[-1].source_seqs = tuple(sorted(set(records[-1].source_seqs + rec.source_seqs)))
                 audit_increment("cleaned", "adjacent_duplicate_record", 1)
                 continue
             last_key = key
@@ -3112,114 +3155,10 @@ def _clear_browser_screen() -> None:
         print("\033[2J\033[H", end="")
 
 
-def browse_sessions() -> list[str]:
-    """Portable optional TUI; the noninteractive CLI remains the core architecture."""
-    all_rows = list_session_descriptors()
-    if not all_rows:
-        raise RuntimeError(f"No Codex session JSONLs found under {codex_home()}")
-
-    page_size = 20
-    page = 0
-    query = ""
-    view = "sessions"  # sessions | projects | project
-    active_project = ""
-
-    while True:
-        filtered = [
-            row for row in all_rows
-            if (not query or query in " ".join((row["project"], row["title"], row["session_id"], row["cwd"])).lower())
-            and (view != "project" or row["project"] == active_project)
-        ]
-        _clear_browser_screen()
-        print("Codex session browser — noninteractive commands remain available for automation")
-        print(f"View: {view}" + (f" / {active_project}" if active_project else "") + (f" | Filter: {query}" if query else ""))
-
-        if view == "projects":
-            grouped: dict[str, list[dict[str, Any]]] = {}
-            for row in filtered:
-                grouped.setdefault(row["project"] or "(unknown project)", []).append(row)
-            project_rows = sorted(grouped.items(), key=lambda item: max(r["mtime"] for r in item[1]), reverse=True)
-            pages = max(1, (len(project_rows) + page_size - 1) // page_size)
-            page = min(page, pages - 1)
-            visible_projects = project_rows[page * page_size : (page + 1) * page_size]
-            print(f"Page {page + 1}/{pages}")
-            print()
-            print("| # | project | sessions | most recent |")
-            print("|---:|---|---:|---|")
-            for index, (project, rows) in enumerate(visible_projects, 1):
-                modified = datetime.fromtimestamp(max(row["mtime"] for row in rows)).isoformat(timespec="seconds")
-                escaped_project = project.replace("|", "\\|")
-                print(f"| {index} | {escaped_project} | {len(rows)} | {modified} |")
-            visible_sessions: list[dict[str, Any]] = []
-        else:
-            pages = max(1, (len(filtered) + page_size - 1) // page_size)
-            page = min(page, pages - 1)
-            visible_sessions = filtered[page * page_size : (page + 1) * page_size]
-            print(f"Page {page + 1}/{pages} — {len(filtered)} matching sessions")
-            print()
-            print("| # | session_id | modified | size | project | A | title |")
-            print("|---:|---|---|---:|---|---|---|")
-            for index, row in enumerate(visible_sessions, 1):
-                title = str(row["title"]).replace("|", "\\|")
-                project = str(row["project"]).replace("|", "\\|")
-                print(f"| {index} | {row['session_id']} | {row['modified']} | {human_size(row['size'])} | {project} | {'Y' if row['archived'] else ''} | {title} |")
-            visible_projects = []
-
-        print()
-        print("Commands: number/range select · a page-all · n/p page · m projects/sessions · / search · s ID · b back · q quit")
-        raw = input("> ").strip()
-        if not sys.stdin.isatty():
-            print()
-        lowered = raw.lower()
-        if lowered in {"q", "quit", "exit"}:
-            return []
-        if lowered == "n":
-            page = min(page + 1, pages - 1)
-            continue
-        if lowered == "p":
-            page = max(page - 1, 0)
-            continue
-        if lowered == "m":
-            view = "projects" if view != "projects" else "sessions"
-            active_project = ""
-            page = 0
-            continue
-        if lowered == "b":
-            view = "projects"
-            active_project = ""
-            page = 0
-            continue
-        if raw.startswith("/"):
-            query = raw[1:].strip().lower()
-            page = 0
-            continue
-        if lowered == "s":
-            needle = input("Session ID, rollout filename, or ID prefix: ").strip().lower()
-            if not sys.stdin.isatty():
-                print()
-            matches = [row for row in all_rows if needle in row["session_id"].lower() or needle in row["path"].name.lower()]
-            if len(matches) == 1:
-                return [matches[0]["session_id"]]
-            query = needle
-            view = "sessions"
-            page = 0
-            continue
-        if lowered == "a":
-            return [row["session_id"] for row in visible_sessions]
-        try:
-            if view == "projects":
-                choices = _browser_selection(raw, len(visible_projects))
-                if len(choices) != 1:
-                    raise RuntimeError("Select one project row at a time.")
-                active_project = visible_projects[choices[0] - 1][0]
-                view = "project"
-                page = 0
-                continue
-            choices = _browser_selection(raw, len(visible_sessions))
-            if choices:
-                return [visible_sessions[index - 1]["session_id"] for index in choices]
-        except (ValueError, RuntimeError) as exc:
-            input(f"{exc} Press Enter to continue.")
+def browse_sessions(**options: Any) -> list[str]:
+    """Run the chooser while no progress heartbeat owns the terminal."""
+    from codex_exporter.browser import browse_sessions as choose
+    return choose(list_session_descriptors, **options)
 
 
 def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[tuple[Path, str]]:
@@ -3261,7 +3200,7 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
         pairs.append((path, parse_session_id_from_name(path)))
     dedup: dict[str, tuple[Path, str]] = {}
     for path, sid in pairs:
-        dedup[str(path.resolve()).casefold()] = (path, sid)
+        dedup[os.path.normcase(str(path.resolve()))] = (path, sid)
     result = list(dedup.values())
     if not result:
         parser.error("provide --session-id, --project, --jsonl, --sessions-file, --latest-session, or --browse")
@@ -3283,6 +3222,10 @@ def main() -> int:
     ap.add_argument("--list-sessions", action="store_true")
     ap.add_argument("--full-session-titles", action="store_true", help="Show complete single-line titles in session listings (may be very large)")
     ap.add_argument("--browse", action="store_true", help="Optional standard-library terminal browser with multi-select")
+    ap.add_argument("--browse-query", default="", help="Initial literal browser search; words are AND matched")
+    ap.add_argument("--browse-page-size", type=int, default=None, help="Browser rows per page (default: terminal height)")
+    ap.add_argument("--browse-status", choices=['all', 'available', 'live', 'archived', 'missing'], default='all')
+    ap.add_argument("--browse-sort", choices=['recent', 'oldest', 'size', 'title', 'project'], default='recent')
     ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
     ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_DIR_OR_JSON", help="Convert account-export ZIP, extracted directory, conversations.json or numbered shards")
     ap.add_argument("--chatgpt-audit", action="store_true", help="Read-only inventory of account-export conversation shards; no Markdown written")
@@ -3315,7 +3258,16 @@ def main() -> int:
     ap.add_argument("--from-message", type=int)
     ap.add_argument("--to-message", type=int)
     ap.add_argument("--min-chars", type=int, default=1000)
-    ap.add_argument("--last-n-turns", type=int)
+    ap.add_argument("--last-n-turns", "--last", type=int, help="Export the last N user turns and matching native JSONL")
+    ap.add_argument("--turn", type=int, help="Export exactly this 1-based user turn (alias for --mode turn --response N)")
+    since = ap.add_mutually_exclusive_group()
+    since.add_argument("--since", metavar="SELECTOR", help="Inclusive start: turn:N, id:ID, text:WORDS, time:ISO, or literal prompt text")
+    since.add_argument("--since-turn", type=int, metavar="N", help="Inclusive 1-based user turn number")
+    since.add_argument("--since-id", metavar="ID", help="Inclusive exact turn or user-message ID")
+    since.add_argument("--since-text", metavar="WORDS", help="Inclusive case-insensitive literal prompt substring")
+    since.add_argument("--since-time", metavar="ISO", help="First user turn at/after an offset-aware ISO timestamp or local date")
+    ap.add_argument("--since-occurrence", type=int, metavar="N", help="Choose this 1-based match when text/ID is ambiguous")
+    ap.add_argument("--list-turns", action="store_true", help="List stable user-turn anchors, timestamps, IDs and prompt previews")
     ap.add_argument("--live-context", action="store_true", help="Reconstruct active context from compaction and rollback events; explicitly approximate")
     ap.add_argument("--reasoning-summaries", action="store_true", help="Include explicit recorded reasoning summaries; never raw internal reasoning")
     ap.add_argument("--list", action="store_true")
@@ -3362,6 +3314,8 @@ def main() -> int:
     pipeline.add_argument('--archiver-path', help='Exact 7-Zip-compatible CLI executable; auto-discovered otherwise')
     pipeline.add_argument('--archive-backend', choices=['auto', 'python', '7zip'],
                           help='auto uses 7-Zip for LZMA; Python supports explicit Deflate exports')
+    pipeline.add_argument('--separate-archives', action='store_true', help='Keep one independently bounded archive set per session instead of bundling a batch')
+    pipeline.add_argument('--archive-max-bytes', type=int, help='Hard ceiling for every ZIP, at most 512000000 bytes; larger exports become independent parts')
     pipeline.add_argument('--archive-level', type=int)
     pipeline.add_argument('--archive-method', choices=['LZMA', 'Deflate'])
     pipeline.add_argument('--archive-dictionary', help='LZMA dictionary size, e.g. 256m')
@@ -3369,7 +3323,7 @@ def main() -> int:
     pipeline.add_argument('--archive-threads', type=int)
     pipeline.add_argument('--show-archive-config', action='store_true')
     pipeline.add_argument('--set-archive-default', action='append', metavar='KEY=VALUE',
-                          help='Persist a default (archive, copy_source, cleanup, archiver, backend, level, method, dictionary, word_size, threads, review, review_chunk_bytes)')
+                          help='Persist a default (archive, copy_source, cleanup, archiver, backend, level, method, dictionary, word_size, threads, max_bytes, review, review_chunk_bytes)')
     review = ap.add_argument_group('optional text review')
     review.add_argument('--review', dest='review', action='store_true', default=None,
                         help='Include lossless text review parts inside the same archive (opt-in)')
@@ -3454,7 +3408,7 @@ def main() -> int:
                        'method': ('method', str), 'dictionary': ('dictionary', str),
                        'word_size': ('word_size', int), 'threads': ('threads', int),
                        'review': ('review', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
-                       'review_chunk_bytes': ('review_chunk_bytes', int)}
+                       'review_chunk_bytes': ('review_chunk_bytes', int), 'max_bytes': ('max_bytes', int)}
         for setting in args.set_archive_default:
             if '=' not in setting:
                 ap.error('--set-archive-default must use KEY=VALUE')
@@ -3485,7 +3439,7 @@ def main() -> int:
                             ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'),
                             ('archive_backend', 'backend'), ('archive_level', 'level'), ('archive_method', 'method'),
                             ('archive_dictionary', 'dictionary'), ('archive_word_size', 'word_size'),
-                            ('archive_threads', 'threads'), ('review', 'review'),
+                            ('archive_threads', 'threads'), ('archive_max_bytes', 'max_bytes'), ('review', 'review'),
                             ('review_chunk_bytes', 'review_chunk_bytes')):
         value = getattr(args, argument)
         if value is not None:
@@ -3543,6 +3497,49 @@ def main() -> int:
         from codex_exporter.modern import audit
         print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
         return 0
+    # Resolve interactive choices before a progress stage can redraw its prompt.
+    if args.browse:
+        if any((args.project, args.session_id, args.jsonl, args.sessions_file,
+                args.latest_session, args.chatgpt_export, args.review_from)):
+            ap.error('--browse cannot be combined with another source selector')
+        try:
+            chosen = browse_sessions(query=args.browse_query, page_size=args.browse_page_size,
+                                     status=args.browse_status, sort=args.browse_sort)
+        except ValueError as exc:
+            ap.error(str(exc))
+        if not chosen:
+            return 0
+        args.session_id = chosen
+        args.browse = False
+        args.mode = args.mode or 'thread'
+    since_values = [('turn', args.since_turn), ('id', args.since_id),
+                    ('text', args.since_text), ('time', args.since_time)]
+    since_selector = args.since
+    for kind, value in since_values:
+        if value is not None:
+            since_selector = f'{kind}:{value}'
+    args.since = since_selector
+    if args.since is not None and not args.since.strip():
+        ap.error('--since requires a nonempty selector; use --list-turns to inspect anchors')
+    if args.since_occurrence is not None and (not args.since or args.since_occurrence < 1):
+        ap.error('--since-occurrence requires --since and a positive match number')
+    if args.last_n_turns is not None and args.last_n_turns < 1:
+        ap.error('--last-n-turns/--last must be positive')
+    if args.turn is not None:
+        if args.turn < 1 or args.mode not in (None, 'thread', 'turn') or args.response is not None:
+            ap.error('--turn needs a positive turn number and cannot override --mode or --response')
+        args.mode, args.response = 'turn', args.turn
+    if args.since:
+        if args.mode not in (None, 'thread', 'chat-actions') or any((args.last_n_turns,
+                args.response, args.message, args.from_message, args.to_message, args.live_context)):
+            ap.error('--since exports chronological turns through the snapshot end; conflicting record selectors are unsupported')
+        args.mode = args.mode or 'thread'
+    if args.list_turns and any((args.since, args.last_n_turns, args.response, args.message,
+                               args.from_message, args.to_message, args.live_context)):
+        ap.error('--list-turns lists original user turns and cannot combine with record selectors')
+    if args.live_context and archive_settings.copy_source and not args.no_file and (
+            args.last_n_turns is not None or (args.mode or 'last-response') not in ('thread', 'chat-actions')):
+        ap.error('Native excerpts cannot map reconstructed live context exactly; omit --live-context or use --no-source-copy')
     from codex_exporter.progress import ProgressReporter
     reporter = ProgressReporter(style=args.progress_style,
                                 enabled=args.progress if args.progress is not None else True)
@@ -3560,12 +3557,20 @@ def main() -> int:
             if not args.json_result:
                 if result.get('review_directory'):
                     print(f"Review text files: {result['review_directory']}", file=sys.stderr)
-                print(preferred_output(result))
+                paths = result.get('archives') or result.get('review_archives') or [preferred_output(result)]
+                for path in paths:
+                    if path:
+                        print(path)
+
+        bundle_batch = False
 
         def finish_export(result: dict[str, Any], snapshot: Any) -> dict[str, Any]:
             if result.get('file') and not result.get('skipped'):
-                result = package_export(result, snapshot.path, archive_settings, snapshot=snapshot,
-                                        review=args.review, review_chunk_bytes=args.review_chunk_bytes, reporter=reporter)
+                from dataclasses import replace
+                settings = replace(archive_settings, archive=False, review=False) if bundle_batch else archive_settings
+                result = package_export(result, snapshot.path, settings, snapshot=snapshot,
+                                        review=False if bundle_batch else args.review,
+                                        review_chunk_bytes=args.review_chunk_bytes, reporter=reporter)
             return result
 
         if args.review_from:
@@ -3577,7 +3582,7 @@ def main() -> int:
             if any((args.redact, args.no_file, args.stdout, args.clipboard, args.list,
                     args.list_responses, args.message is not None, args.response is not None,
                     args.from_message is not None, args.to_message is not None,
-                    args.last_n_turns is not None, args.live_context, args.chatgpt_audit)):
+                    args.last_n_turns is not None, args.since, args.list_turns, args.live_context, args.chatgpt_audit)):
                 ap.error('--review-from preserves existing text; redaction, no-file, stdout/clipboard, and record selectors are unsupported')
             if args.mode is not None:
                 ap.error('--review-from preserves the existing export mode; --mode is unsupported')
@@ -3592,7 +3597,7 @@ def main() -> int:
             source = args.review_from.expanduser().resolve()
             output = args.out_dir.expanduser().resolve() if args.out_dir else source.parent
             result = review_existing_export(source, output, chunk_bytes=args.review_chunk_bytes, progress=reporter,
-                                            archive=archive_settings.archive)
+                                            archive=archive_settings.archive, max_bytes=archive_settings.max_bytes)
             reporter.finish(detail="Standalone review conversion")
             if args.json_result:
                 print(json.dumps(result, ensure_ascii=False))
@@ -3605,8 +3610,10 @@ def main() -> int:
         args.mode = args.mode or 'last-response'
 
         if args.chatgpt_export:
-            if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse)):
-                ap.error('--chatgpt-export cannot be combined with Codex source selectors')
+            if any((args.project, args.session_id, args.jsonl, args.sessions_file, args.latest_session, args.browse,
+                    args.since, args.list_turns, args.last_n_turns, args.response, args.message,
+                    args.from_message, args.to_message)):
+                ap.error('--chatgpt-export cannot be combined with Codex source or record selectors')
             from codex_exporter.chatgpt_archive import export_chatgpt, audit_chatgpt
             if args.chatgpt_audit:
                 report = audit_chatgpt(args.chatgpt_export.expanduser().resolve(),
@@ -3644,6 +3651,8 @@ def main() -> int:
         with reporter.stage("Resolve sources", unit="files") as meter:
             sources = resolve_source_paths(args, ap)
             meter.update(len(sources))
+        bundle_batch = (len(sources) > 1 and archive_settings.archive and not args.separate_archives
+                        and not any((args.no_file, args.list, args.list_responses, args.list_turns)))
         from codex_exporter.file_access import validate_export_paths
         protected_sources = [source for source, _ in sources]
         if args.manifest_path:
@@ -3661,7 +3670,7 @@ def main() -> int:
                 outputs['unknown-event sidecar'] = destination.with_suffix('.unknown.jsonl')
             validate_export_paths(outputs, protected_sources)
 
-        if archive_settings.archive and not args.no_file and not args.list and not args.list_responses:
+        if archive_settings.archive and not args.no_file and not args.list and not args.list_responses and not args.list_turns:
             if not args.manifest:
                 ap.error('Default archive needs a manifest; pass --manifest or --no-archive')
             from codex_exporter.archive_pipeline import find_archiver
@@ -3690,18 +3699,74 @@ def main() -> int:
             save_config(cfg)
 
         if args.fast:
-            if args.mode != 'thread' or args.list or args.list_responses or args.last_n_turns is not None or args.live_context:
-                ap.error('--fast only supports full chronological --mode thread (without turn limits or live-context)')
+            if args.mode != 'thread' or args.list or args.list_responses or args.list_turns or args.live_context:
+                ap.error('--fast supports chronological --mode thread, including --since/--last, without list or live-context modes')
             if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
                 ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
 
         results: list[dict[str, Any]] = []
         clipboard_parts: list[str] = []
         fast_catalog = None
+        base_args = args
+        turn_listings: list[dict[str, Any]] = []
         for source_path, supplied_sid in sources:
+            args = copy.copy(base_args)
             from codex_exporter.snapshot import snapshot_source
-            staging_dir = out_dir if not (args.no_file or args.list or args.list_responses) else None
+            from codex_exporter.selection import index_turns, resolve_since, excerpt_turns, excerpt_records, turn_rows
+            staging_dir = out_dir if not (args.no_file or args.list or args.list_responses or args.list_turns) else None
             with snapshot_source(source_path, directory=staging_dir, reporter=reporter) as snapshot:
+                preselected = False
+                needs_turns = args.list_turns or args.since or (not args.live_context and not (args.list or args.list_responses)
+                    and (args.last_n_turns is not None or args.mode in ('turn', 'response', 'last-response')))
+                if needs_turns:
+                    try:
+                        with reporter.stage('Index user turns', total=snapshot.size_bytes) as meter:
+                            turn_index = index_turns(snapshot, progress=meter)
+                    except ValueError as exc:
+                        ap.error(str(exc))
+                    if args.list_turns:
+                        rows = turn_rows(turn_index)
+                        turn_listings.append({'source': str(source_path), 'session_id': supplied_sid, 'turns': rows})
+                        if not args.json_result:
+                            print(f'User turns: {source_path}')
+                            for row in rows:
+                                stamp = ''.join(c for c in (row['timestamp'] or '-') if c.isprintable())
+                                turn_id = ''.join(c for c in (row['turn_id'] or '-') if c.isprintable())
+                                print(f"{row['turn']:>5}  {stamp}  {turn_id}  {row['preview']}")
+                        continue
+                    start_turn, stop_turn = None, None
+                    descriptor = mode_descriptor(args)
+                    try:
+                        if args.since:
+                            anchor = resolve_since(turn_index, args.since, occurrence=args.since_occurrence)
+                            start_turn = anchor.number
+                            descriptor = f'{args.mode}-since-turn-{start_turn:04d}'
+                        elif args.last_n_turns is not None:
+                            if not turn_index.turns:
+                                raise ValueError('No actual user turns were found for --last')
+                            start_turn = max(1, len(turn_index.turns) - args.last_n_turns + 1)
+                            args.last_n_turns = None
+                        elif args.mode in ('turn', 'response'):
+                            if args.response is None:
+                                raise ValueError(f'--mode {args.mode} requires --response N')
+                            anchor = resolve_since(turn_index, f'turn:{args.response}')
+                            start_turn = stop_turn = anchor.number
+                            args.response = 1
+                        elif args.mode == 'last-response' and turn_index.turns:
+                            start_turn = len(turn_index.turns)
+                        if start_turn is not None:
+                            with reporter.stage('Select native JSONL interval') as meter:
+                                snapshot = excerpt_turns(snapshot, start_turn, stop_turn, index=turn_index, progress=meter)
+                            preselected = True
+                            if args.since:
+                                snapshot.metadata['selection']['requested_selector'] = args.since
+                                snapshot.metadata['selection']['requested_occurrence'] = args.since_occurrence
+                                if args.since.startswith('time:'):
+                                    from codex_exporter.selection import parse_since_time
+                                    snapshot.metadata['selection']['resolved_time_threshold'] = parse_since_time(args.since[5:]).isoformat()
+                            args._selection_descriptor = descriptor
+                    except ValueError as exc:
+                        ap.error(str(exc))
                 auto_stream_eligible = (args.mode == 'thread' and not any((args.list, args.list_responses,
                     args.clipboard, args.stdout, args.no_file, args.wrap_md, args.save_as, not args.manifest,
                     args.last_n_turns is not None, args.live_context, args.no_frontmatter, args.fence_turns, args.no_map, args.manifest_path is not None)))
@@ -3726,7 +3791,7 @@ def main() -> int:
                     stream_template = template
                     accepted = {'title': safe_slug(title, max_len=70), 'session_id': sid,
                         'session_short': sid[-8:], 'session_short_part': '_' + sid[-8:],
-                        'mode': 'thread', 'stamp': export_stamp(), 'counts': ''}
+                        'mode': mode_descriptor(args), 'stamp': export_stamp(), 'counts': ''}
                     invalid = {field for _, field, _, _ in Formatter().parse(stream_template)
                         if field not in accepted and field is not None}
                     if invalid:
@@ -3742,7 +3807,7 @@ def main() -> int:
                     stream_path = avoid_existing_archive(fast_out / filename, args.collision) if archive_settings.archive else fast_out / filename
                     validate_destination(stream_path)
                     result = stream_export(snapshot.path, stream_path, session_id=sid, title=title,
-                        title_source=title_source, snapshot=snapshot,
+                        title_source=title_source, snapshot=snapshot, mode=mode_descriptor(args),
                         include_reasoning_summaries=args.reasoning_summaries,
                         tool_outputs=args.tool_outputs, max_tool_chars=args.max_tool_chars,
                         strip=False,  # preserve every recorded printable character in stream mode
@@ -3757,9 +3822,10 @@ def main() -> int:
                         print(json.dumps({'stream_event_count': result.get('rendered_records'),
                              'unknown_event_count': result.get('unknown_event_count'),
                              'parse_error_count': result.get('parse_error_count')}), file=sys.stderr)
-                    if args.open_after and preferred_output(result):
+                    if args.open_after and not bundle_batch and preferred_output(result):
                         open_in_file_manager(Path(preferred_output(result)), select=True)
-                    report_output(result)
+                    if not bundle_batch:
+                        report_output(result)
                     continue
                 reset_runtime_audit()
                 include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
@@ -3788,7 +3854,20 @@ def main() -> int:
                     continue
 
                 scoped = select_last_n_turns(records, args.last_n_turns)
-                selected_records = choose_records(scoped, args)
+                if preselected and base_args.last_n_turns is None and args.mode == 'turn':
+                    selected_records = records
+                elif preselected and base_args.last_n_turns is None and args.mode in ('response', 'last-response'):
+                    selected_records = [record for record in records if not (record.kind == 'message' and record.role == 'user')]
+                else:
+                    selected_records = choose_records(scoped, args)
+                # A subset archive carries only the native lines behind its rendered records.
+                # Contiguous turn exports already retain their complete source interval.
+                if archive_settings.copy_source and not args.no_file and (
+                        args.mode not in ('thread', 'turn', 'chat-actions') or
+                        (args.last_n_turns is not None and not preselected) or
+                        (args.mode == 'turn' and base_args.last_n_turns is not None)):
+                    with reporter.stage('Select matching native records') as meter:
+                        snapshot = excerpt_records(snapshot, selected_records, progress=meter)
                 effective_sid = supplied_sid or parse_session_id_from_name(source_path) or str(meta.get("id") or "")
                 title = discover_title(records, meta, args.name, effective_sid)
                 descriptor = mode_descriptor(args)
@@ -3861,11 +3940,27 @@ def main() -> int:
                 if output_path is not None:
                     result = finish_export(result, snapshot)
                 results.append(result)
-                if args.open_after and preferred_output(result):
+                if args.open_after and not bundle_batch and preferred_output(result):
                     open_in_file_manager(Path(preferred_output(result)), select=True)
-                if output_path:
+                if output_path and not bundle_batch:
                     report_output(result)
 
+        args = base_args
+        if bundle_batch and results:
+            from codex_exporter.batch_archive import package_batch
+            from codex_exporter.archive_pipeline import avoid_existing_archive
+            label = safe_slug(args.project or 'batch', max_len=50)
+            candidate = avoid_existing_archive(out_dir / f'codex_{label}_{export_stamp()}.md', args.collision)
+            bundled = package_batch(results, candidate.with_suffix('.zip'), archive_settings, reporter=reporter)
+            results = [bundled]
+            report_output(bundled)
+            if args.open_after and preferred_output(bundled):
+                open_in_file_manager(Path(preferred_output(bundled)), select=True)
+        if args.list_turns:
+            reporter.finish(detail=f"{sum(len(item['turns']) for item in turn_listings):,} user turns")
+            if args.json_result:
+                print(json.dumps(turn_listings[0] if len(turn_listings) == 1 else turn_listings, ensure_ascii=False))
+            return 0
         reporter.finish(detail=f"{len(results):,} export(s)")
         if args.clipboard and clipboard_parts:
             copy_to_clipboard("\n\n".join(clipboard_parts))

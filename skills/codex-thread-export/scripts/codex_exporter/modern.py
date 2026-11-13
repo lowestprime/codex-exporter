@@ -190,6 +190,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                   max_line_chars: int = 20_000, max_repeated_lines: int = 25,
                   collision: str = 'rename', progress: bool = True, redact: bool = False, strict_events: bool = False,
                   source_truncation: str = 'annotate', unknown_events: str = 'report',
+                  mode: str = 'thread',
                   snapshot: SourceSnapshot | None = None,
                   reporter: ProgressReporter | None = None,
                   protected_sources=()) -> dict[str, Any]:
@@ -275,15 +276,17 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                              + f'source_jsonl: {yaml_quote(str(original_source))}\n'
                              + f'title_source: {yaml_quote(title_source or "unavailable")}\n'
                              + f'exported_at: {yaml_quote(created)}\n'
-                             + 'mode: "thread"\n'
+                             + f'mode: {yaml_quote(mode)}\n'
                              + 'history_semantics: "chronological_source_history"\n'
                              + f'source_encoding: {yaml_quote(source_encoding)}\n'
                              + 'token_count_method: "not_computed_streaming"\n---\n\n')
                 if snapshot:
-                    output.write('> Captured a verified prefix of the live rollout. Later writes are included in the next export. '
+                    output.write('> Exported from a verified snapshot of the live rollout. Later writes are included in the next export. '
                                  f'Captured bytes: {snapshot.size_bytes:,}; deferred trailing bytes: '
                                  f'{snapshot.metadata["deferred_tail_bytes"]:,}.\n\n')
                 output.write(f'# {title}\n\n')
+                if snapshot:
+                    output.write(cli.selection_note(snapshot.metadata))
                 output.write('> Local chronological rollout export. The original JSONL remains the authoritative source. '
                              'This streaming layout cannot provide exact output token counts or the classic turn-level map.\n\n')
                 output.write('## Thread export map\n\n'
@@ -406,7 +409,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
             digest = sha.hexdigest()
             if snapshot and (digest != snapshot.sha256 or decoded_size != snapshot.size_bytes):
                 raise RuntimeError('Captured source snapshot changed during rendering; refusing to publish this export')
-            manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread',
+            manifest = {'exporter': f'codex-export {cli.__version__}', 'mode': 'stream_thread' if mode == 'thread' else mode, 'renderer': 'stream',
                         'session_id': session_id, 'title': title, 'title_source': title_source or 'unavailable', 'source': str(original_source),
                         'source_sha256': digest, 'source_size_bytes_at_open': total,
                         'source_size_bytes_at_end': source.stat().st_size,
@@ -422,7 +425,8 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                 manifest['source_snapshot'] = snapshot.metadata
                 manifest['source_size_bytes_at_open'] = snapshot.metadata['source_size_bytes_at_open']
                 manifest['source_size_bytes_at_end'] = snapshot.metadata['source_size_bytes_after_capture']
-                manifest['source_sha256_scope'] = 'captured_decoded_jsonl'
+                manifest['source_sha256_scope'] = ('selected_native_jsonl' if snapshot.metadata.get('selection')
+                                                    else 'captured_decoded_jsonl')
                 manifest['partial_final_line_possible'] = bool(snapshot.metadata['deferred_tail_bytes'])
             if source.stat().st_size != total:
                 manifest['source_changed_during_export'] = True
@@ -438,7 +442,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
             manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
             task.advance(1)
         return {'file': str(destination), 'manifest': str(manifest_path), 'session_id': session_id,
-                'redacted': bool(redact),
+                'redacted': bool(redact), 'mode': mode, 'unknown_sidecar': str(sidecar) if sidecar else None,
                 'source_jsonl': str(original_source), 'source_sha256': digest,
                 **({'source_snapshot': snapshot.metadata, 'decoded_source_bytes': snapshot.size_bytes} if snapshot else {}),
                 'source_lines': counts['source_lines'], 'rendered_records': counts['rendered_records'],

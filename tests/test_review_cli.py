@@ -128,10 +128,13 @@ def test_last_response_review_uses_only_selected_rendered_content(
             assert OLD_ANSWER.encode() not in archive.read(name)
     with zipfile.ZipFile(result['archive']) as archive:
         assert archive.read(result['archived_markdown']) == reconstructed
-        # The native member in the same ZIP remains complete, independently of the
-        # selected rendered/review mode; it is never copied into review parts.
-        assert archive.read(result['archived_source']) == before
-    assert index['source_sha256'] == hashlib.sha256(before).hexdigest()
+        # Subset exports carry the matching native excerpt, never prior turns.
+        native = archive.read(result['archived_source'])
+        assert NEW_ANSWER.encode() in native
+        assert OLD_PROMPT.encode() not in native
+        assert OLD_ANSWER.encode() not in native
+        assert native != before
+    assert index['source_sha256'] == hashlib.sha256(native).hexdigest()
     assert synthetic_source.read_bytes() == before
 
 
