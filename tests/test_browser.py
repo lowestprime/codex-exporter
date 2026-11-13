@@ -132,7 +132,7 @@ def test_navigation_search_and_preview_do_not_rescan_catalog():
     browser.browse_sessions(provider, input_stream=io.StringIO('n\np\n/Session\nv 1\nq\n'),
                             output_stream=output, page_size=2, width=100)
     assert len(calls) == 1
-    assert 'Source: /rollouts/thread-3.jsonl' in output.getvalue()
+    assert f"Source: {row(3)['path']}" in output.getvalue()
 
 
 def test_query_is_casefolded_literal_and_matches_all_words():

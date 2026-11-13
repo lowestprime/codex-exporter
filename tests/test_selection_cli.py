@@ -48,7 +48,7 @@ def test_since_includes_anchor_and_all_later_tools_without_history(source, tmp_p
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
     native = Path(value['source_copy']).read_bytes()
-    md = Path(value['file']).read_text()
+    md = Path(value['file']).read_text(encoding='utf-8')
     assert b'Historical-only prompt' not in native and 'Historical-only prompt' not in md
     assert b'Answer-1' not in native and 'Answer-1' not in md
     for text in ('Precise current anchor', 'Latest steering', 'tool-2', 'exact output-2', 'Answer-2', 'Answer-3'):
@@ -56,7 +56,7 @@ def test_since_includes_anchor_and_all_later_tools_without_history(source, tmp_p
     assert native.startswith(before.splitlines(keepends=True)[0])
     assert b'\r\n' in native
     assert value['source_copy_sha256'] == hashlib.sha256(native).hexdigest()
-    manifest = json.loads(Path(value['manifest']).read_text())
+    manifest = json.loads(Path(value['manifest']).read_text(encoding='utf-8'))
     selection = manifest['source_snapshot']['selection']
     assert selection['start_turn'] == 2 and selection['stop_turn'] == 3
     assert selection['input_snapshot_sha256'] == hashlib.sha256(before).hexdigest()
@@ -76,7 +76,7 @@ def test_all_subset_modes_copy_matching_native_lines(source, tmp_path, args, inc
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
     native = Path(value['source_copy']).read_bytes()
-    md = Path(value['file']).read_text()
+    md = Path(value['file']).read_text(encoding='utf-8')
     for text in include:
         assert text.encode() in native and text in md
     for text in exclude:
@@ -119,26 +119,26 @@ def test_single_turn_keeps_tools_after_injected_context_and_duplicate_surface(so
         {'type': 'event_msg', 'payload': {'type': 'agent_message', 'message': 'preserved final'}},
         {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'future unrelated'}},
     ]
-    source.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    source.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
     result = run(source, tmp_path, '--turn', '1')
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
-    md = Path(value['file']).read_text()
-    native = Path(value['source_copy']).read_text()
+    md = Path(value['file']).read_text(encoding='utf-8')
+    native = Path(value['source_copy']).read_text(encoding='utf-8')
     assert 'preserved-tool' in md and 'preserved final' in md
     assert 'future unrelated' not in md and 'future unrelated' not in native
     assert 'environment_context' in md and 'environment_context' in native
 
 
 def test_ambiguous_text_needs_explicit_occurrence(source, tmp_path):
-    data = source.read_text().replace('Latest steering', 'Precise current anchor 🧠')
-    source.write_text(data)
+    data = source.read_text(encoding='utf-8').replace('Latest steering', 'Precise current anchor 🧠')
+    source.write_text(data, encoding='utf-8')
     ambiguous = run(source, tmp_path, '--since-text', 'Precise current anchor')
     assert ambiguous.returncode != 0 and 'matches 2 user turns' in ambiguous.stderr
     selected = run(source, tmp_path, '--since-text', 'Precise current anchor', '--since-occurrence', '2')
     assert selected.returncode == 0, selected.stderr
     value = json.loads(selected.stdout)
-    native = Path(value['source_copy']).read_text()
+    native = Path(value['source_copy']).read_text(encoding='utf-8')
     assert 'Answer-3' in native and 'Answer-2' not in native
 
 
@@ -148,9 +148,9 @@ def test_media_only_user_turn_is_present_in_markdown_and_exact_native(source, tm
         {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': '', 'audio': {'url': 'synthetic-audio-reference'}}},
         {'type': 'event_msg', 'payload': {'type': 'agent_message', 'message': 'Recorded response to media'}},
     ]
-    source.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    source.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
     result = run(source, tmp_path, '--turn', '1')
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
-    assert '[audio sha256:' in Path(value['file']).read_text()
+    assert '[audio sha256:' in Path(value['file']).read_text(encoding='utf-8')
     assert Path(value['source_copy']).read_bytes() == source.read_bytes()
