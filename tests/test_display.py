@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import textwrap
 import time
 import types
 
@@ -92,6 +93,7 @@ def test_json_never_pages_even_on_tty():
 
 def test_terminal_navigation_limits_frames_and_restores_screen(monkeypatch):
     monkeypatch.setenv('TERM', 'xterm-256color')
+    monkeypatch.setattr(display, '_windows_vt', lambda stream: True)
     monkeypatch.setattr(display, '_terminal_size', lambda stream: os.terminal_size((90, 10)))
     target, source = Terminal(), Terminal()
     keys = iter(['down', 'pagedown', 'up', 'end', 'home', 'q'])
@@ -109,12 +111,28 @@ def test_terminal_navigation_limits_frames_and_restores_screen(monkeypatch):
 
 def test_keyboard_interrupt_restores_terminal(monkeypatch):
     monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setattr(display, '_windows_vt', lambda stream: True)
     target = Terminal()
     def interrupt():
         raise KeyboardInterrupt
     display.print_listing(['row'] * 100, settings=display.DisplaySettings(pager='always'),
                           input_stream=Terminal(), output_stream=target, key_reader=interrupt)
     assert target.getvalue().endswith('\x1b[?25h\x1b[?1049l')
+
+
+def test_console_without_vt_keeps_navigation_and_plain_output(monkeypatch):
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setattr(display, '_windows_vt', lambda stream: False)
+    monkeypatch.setattr(display, '_terminal_size', lambda stream: os.terminal_size((90, 10)))
+    source, target = Terminal(), Terminal()
+    keys = iter(['end', 'q'])
+    display.print_listing([f'row {i}' for i in range(40)], settings=display.DisplaySettings(),
+                          input_stream=source, output_stream=target, key_reader=lambda: next(keys))
+    content = target.getvalue()
+    assert '\x1b' not in content
+    assert 'lines 1-6/40' in content and 'lines 35-40/40' in content
+    assert 'row 0\n' in content and 'row 39\n' in content
+    assert content.count('Enter/Space/PgDn next') == 2
 
 
 def test_wrap_preserves_all_printable_characters_and_cell_width():
@@ -142,10 +160,22 @@ def test_real_pty_pages_and_restores_terminal_attributes():
     import termios
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 80, 0, 0))
-    code = ("import sys,termios; from codex_exporter.display import *; "
-            "before=termios.tcgetattr(0); "
-            "print_listing([f'row {i}' for i in range(40)], settings=DisplaySettings()); "
-            "assert before==termios.tcgetattr(0); print('TERMINAL_RESTORED', flush=True)")
+    code = textwrap.dedent("""
+        import sys
+        import termios
+        from codex_exporter.display import DisplaySettings, print_listing
+
+        before = termios.tcgetattr(0)
+        print_listing([f'row {i}' for i in range(40)], settings=DisplaySettings())
+        print('\\nPAGER_EXITED', flush=True)
+        # Darwin sets transient PENDIN when ICANON is restored. Normal input
+        # processing clears that kernel state; verify the next shell line works
+        # before comparing every terminal attribute, without masking any flag.
+        assert sys.stdin.readline() == 'after-pager\\n'
+        after = termios.tcgetattr(0)
+        assert before == after, f'terminal attributes changed: {before!r} -> {after!r}'
+        print('TERMINAL_RESTORED', flush=True)
+    """)
     env = {**os.environ, 'TERM': 'xterm-256color'}
     process = subprocess.Popen([sys.executable, '-c', code], stdin=slave, stdout=slave, stderr=slave,
                                cwd=Path(__file__).resolve().parents[1], env=env)
@@ -166,8 +196,10 @@ def test_real_pty_pages_and_restores_terminal_attributes():
         os.write(master, b'\x1b[F')  # End
         until(b'row 39')
         os.write(master, b'q')
-        until(b'TERMINAL_RESTORED')
-        assert process.wait(timeout=5) == 0
+        until(b'\r\nPAGER_EXITED\r\n')
+        os.write(master, b'after-pager\n')
+        until(b'\r\nTERMINAL_RESTORED\r\n')
+        assert process.wait(timeout=5) == 0, output.decode(errors='replace')
     finally:
         if process.poll() is None:
             process.kill()

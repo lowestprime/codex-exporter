@@ -71,7 +71,7 @@ The benchmark prepared the Markdown and manifest, captured the JSONL using `snap
 | Mixed JSONL | 16,906,154 | `7367911a28522c0c4c571a5f26b52f82f27ca63d027398227890a9c255288bdd` |
 | Mixed Markdown | 16,802,769 | `e9ee80a2180cd9a2cbc65c621b424a85653f3567c6af2c796b9815d3671db150` |
 
-### Final implementation module SHA-256
+### Measured implementation module SHA-256
 
 | Module | SHA-256 |
 |---|---|
@@ -85,3 +85,5 @@ The benchmark prepared the Markdown and manifest, captured the JSONL using `snap
 ## Final comparison scope
 
 The main tables use three fresh repeats of the final **256 KiB** probe setting. Earlier prototype and 1 MiB-probe measurements were kept separate and were not pooled into these statistics. The package modules listed above were unchanged across all nine final comparison runs. The measured gains should be attributed to this implementation and these workloads, with the limits stated above.
+
+The module hashes identify the benchmark revision. Subsequent cross-platform release validation corrected Windows CRLF diagnostic-log normalization and test-terminal assumptions; the measured encoding, planning, and packing paths were unchanged.

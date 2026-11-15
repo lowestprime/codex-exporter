@@ -389,3 +389,10 @@ def test_rich_two_rows_preserve_member_suffix_and_redraw_without_wrapping(capabl
         for row in chunk.splitlines():
             clean = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', row)
             assert len(clean) <= 79
+
+
+def test_runner_normalizes_crlf_without_duplicate_log_lines():
+    program = 'import sys; sys.stdout.buffer.write(b"first\\r\\nsecond\\rthird\\n")'
+    result = run_seven_zip([sys.executable, '-c', program], timeout=10)
+    assert result.returncode == 0
+    assert result.stdout == 'first\nsecond\nthird\n'

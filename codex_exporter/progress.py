@@ -516,7 +516,8 @@ class _Tail:
                 self.size -= excess
 
     def text(self) -> str:
-        text = _ANSI.sub('', ''.join(self.parts))
+        # Normalize paired Windows line endings before translating lone progress CRs.
+        text = _ANSI.sub('', ''.join(self.parts)).replace('\r\n', '\n')
         return ''.join('\n' if ch in '\r\b' else ch for ch in text
                        if ch in '\n\r\t\b' or unicodedata.category(ch) not in ('Cc', 'Cf', 'Cs'))
 
