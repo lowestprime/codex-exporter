@@ -20,7 +20,7 @@ def _zip(path, members, settings, **kwargs):
 
 
 @pytest.fixture
-def setup_cli(tmp_path, monkeypatch):
+def setup_cli(tmp_path, monkeypatch, fake_range_compressor):
     monkeypatch.setenv('CODEX_EXPORT_CONFIG', str(tmp_path / 'config.json'))
     monkeypatch.setattr(cli, 'codex_home', lambda: tmp_path / 'nonexistent-codex')
     for module in (archive_pipeline, batch_archive):

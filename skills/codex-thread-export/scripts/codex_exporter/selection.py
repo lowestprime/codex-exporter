@@ -85,6 +85,8 @@ class TurnIndex:
     injected_context_lines: tuple[int, ...]
     repaired_json_lines: tuple[int, ...]
     signature: tuple[int, ...]
+    deferred_tail_bytes: int = 0
+    physical_size_bytes: int = 0
 
 
 def _signature(path: Path) -> tuple[int, ...]:
@@ -180,11 +182,34 @@ def _types(obj: dict[str, Any]):
 
 
 def _timestamp(*objects: dict[str, Any]) -> str:
-    for obj in objects:
-        for key in ('timestamp', 'time', 'created_at', 'createdAt'):
-            if obj.get(key):
-                return str(obj[key])
-    return ''
+    from .timestamps import extract_source_timestamp
+    return next((value for obj in objects if (value := extract_source_timestamp(obj))), '')
+
+
+def is_internal_service_context(text: str) -> bool:
+    """Recognize full service envelopes that can also use native UserMessage.
+
+    Never inspect a preview or discard a mixed user message. User answers,
+    heartbeats, /goal requests, and text following a closed envelope remain user
+    input. The original record is retained as context, not removed from exports.
+    """
+    remaining = text.strip()
+    for _ in range(64):
+        opening = re.match(
+            r'^<(?:(codex_internal_context)\s+source=["\'](?:goal|user_goal)["\']|'
+            r'(in-app-browser-context)\s+source=["\']ambient-ui-state["\']|'
+            r'(external_codex_apps_open_page|external_codex_apps_selected_page_part_\d+_of_\d+|turn_aborted))>',
+            remaining, re.IGNORECASE)
+        if opening is None:
+            return False
+        tag = next(group for group in opening.groups() if group)
+        closing = re.search('</' + re.escape(tag) + '>', remaining[opening.end():], re.IGNORECASE)
+        if closing is None:
+            return False
+        remaining = remaining[opening.end() + closing.end():].strip()
+        if not remaining:
+            return True
+    return False
 
 
 def is_injected_context(text: str) -> bool:
@@ -306,7 +331,7 @@ def _substantive(obj: dict[str, Any]) -> bool:
     return top in ('response_item', 'event_msg') or bool(item) or bool(payload.get('role') or obj.get('role'))
 
 
-def index_turns(source: Path | SourceSnapshot, *, progress: Any = None) -> TurnIndex:
+def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_listing: bool = False) -> TurnIndex:
     """Index actual user messages with one bounded-memory pass over a snapshot.
 
     Memory scales with turn count and the largest individual JSONL record, not
@@ -328,10 +353,24 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None) -> TurnI
     activity = False
     pending_turn_id = ''
     offset = total_lines = reported = 0
+    deferred_tail = 0
+    physical_digest = None
     with _stage(progress, 'Index user turns', before[2]) as task, path.open('rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != before[:2] or opened.st_size < before[2]:
+            raise SelectionError('Source was replaced or truncated before user-turn indexing.')
         for line, raw in _bounded_lines(stream, before[2]):
             total_lines = line
             start, offset = offset, offset + len(raw)
+            if _live_listing and offset == before[2] and not raw.endswith(b'\n'):
+                try:
+                    json.loads(raw)
+                except (UnicodeError, json.JSONDecodeError):
+                    physical_digest = digest.copy()
+                    physical_digest.update(raw)
+                    deferred_tail = len(raw)
+                    offset, total_lines = start, line - 1
+                    break
             digest.update(raw)
             obj, repaired = _parse(raw, line)
             if repaired:
@@ -357,9 +396,11 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None) -> TurnI
             signal = _user_signal(obj)
             if signal is not None:
                 text, kind, explicit_turn_id, item_ids, timestamp = signal
-                if kind in ('response_item/message', 'generic/user') and is_injected_context(text):
+                if (is_internal_service_context(text) or
+                        (kind in ('response_item/message', 'generic/user') and is_injected_context(text))):
                     injected.append(line)
                     continue
+                effective_turn_id = explicit_turn_id or pending_turn_id
                 text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
                 duplicate = next((ids_seen[item_id] for item_id in item_ids
                                   if item_id in ids_seen and turns[ids_seen[item_id]].text_sha256 == text_hash
@@ -367,7 +408,7 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None) -> TurnI
                                        or explicit_turn_id == turns[ids_seen[item_id]].turn_id)), None)
                 if (duplicate is None and turns and not activity and kind not in active_kinds
                         and turns[-1].text_sha256 == text_hash
-                        and (not explicit_turn_id or not turns[-1].turn_id or explicit_turn_id == turns[-1].turn_id)):
+                        and (not effective_turn_id or not turns[-1].turn_id or effective_turn_id == turns[-1].turn_id)):
                     duplicate = len(turns) - 1
                 if duplicate is not None:
                     previous = turns[duplicate]
@@ -396,12 +437,44 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None) -> TurnI
                 reported = offset
         task.update(offset, detail=f'{len(turns):,} user turns; {total_lines:,} source lines')
     sha = digest.hexdigest()
-    if _signature(path) != before:
+    if _live_listing:
+        # Verify exactly the prefix already indexed; later appends are allowed.
+        # No snapshot file is needed because the result is a listing, never an
+        # input for source excerpting or archive publication.
+        verified = hashlib.sha256()
+        with _stage(progress, 'Verify indexed prefix', before[2]) as task, path.open('rb') as stream:
+            current = os.fstat(stream.fileno())
+            if (current.st_dev, current.st_ino) != before[:2] or current.st_size < before[2]:
+                raise SelectionError('Source was replaced or truncated while indexing user turns.')
+            remaining = before[2]
+            while remaining:
+                block = stream.read(min(CHUNK_BYTES, remaining))
+                if not block:
+                    raise SelectionError('Source was truncated while verifying the turn index.')
+                verified.update(block)
+                remaining -= len(block)
+                task.update(before[2] - remaining)
+            task.update(detail=f'Prefix verified; {deferred_tail:,} unparseable unterminated tail bytes deferred')
+        after = _signature(path)
+        if after[:2] != before[:2] or after[2] < before[2] or verified.digest() != (physical_digest or digest).digest():
+            raise SelectionError('Source prefix changed while indexing; no user-turn listing was produced.')
+    elif _signature(path) != before:
         raise SelectionError('Snapshot changed while indexing user turns; no selection was produced.')
     if isinstance(source, SourceSnapshot) and (source.size_bytes != offset or source.sha256 != sha):
         raise SelectionError('Snapshot checksum does not match its capture metadata; no selection was produced.')
     return TurnIndex(path, offset, total_lines, sha, tuple(turns), metadata, tuple(contexts),
-                     tuple(histories), tuple(injected), tuple(repairs), before)
+                     tuple(histories), tuple(injected), tuple(repairs), before,
+                     deferred_tail_bytes=deferred_tail, physical_size_bytes=before[2])
+
+
+def index_live_turns(path: Path, *, progress: Any = None) -> TurnIndex:
+    """Read-only, verified fixed-prefix listing with zero disk staging.
+
+    Do not use its result for resolve_since/excerpt functions. Those functions
+    require an owned immutable snapshot and keep their strict identity checks.
+    Compressed rollouts use the normal decoded snapshot route instead.
+    """
+    return index_turns(Path(path), progress=progress, _live_listing=True)
 
 
 def turn_rows(index: TurnIndex) -> list[dict[str, Any]]:
@@ -436,11 +509,9 @@ def parse_since_time(value: str) -> datetime:
 
 
 def _record_time(value: str) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + '+00:00' if value.endswith(('Z', 'z')) else value)
-        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
-    except ValueError:
-        return None
+    from .timestamps import parse_source_timestamp
+    parsed = parse_source_timestamp(value)
+    return parsed.astimezone(timezone.utc) if parsed is not None and parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
 def resolve_since(index: TurnIndex, selector: str, *, occurrence: int | None = None) -> TurnAnchor:
@@ -619,6 +690,8 @@ def excerpt_turns(snapshot: SourceSnapshot, start_turn: int | TurnAnchor, stop_t
         ranges = _with_context(ranges, index.session_meta, index.turn_contexts)
     return _copy_excerpt(snapshot, ranges, selection={
         'mode': 'turn_interval', 'start_turn': start_number, 'stop_turn': last,
+        'turn_index_policy': 'human_user_turns_v2',
+        'context_records_excluded_from_anchors': len(index.injected_context_lines),
         'source_turn_count': len(index.turns), 'selected_turn_count': last - start_number + 1,
         'start_turn_id': first.turn_id, 'start_timestamp': first.timestamp,
         'start_prompt_sha256': first.text_sha256,

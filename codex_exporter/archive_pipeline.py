@@ -44,11 +44,14 @@ class ArchiveSettings:
     review: bool = False
     review_chunk_bytes: int = 1_000_000
     max_bytes: int = 512_000_000
+    work_dir: str = ''
 
     def validate(self) -> None:
         from .review import _validate_chunk_bytes
         from .bounded_archive import validate_max_bytes
         validate_max_bytes(self.max_bytes)
+        if not isinstance(self.work_dir, (str, Path)):
+            raise ValueError('archive work_dir must be a directory path or empty for the output volume')
         if not isinstance(self.review, bool):
             raise ValueError('review must be a boolean')
         _validate_chunk_bytes(self.review_chunk_bytes)
@@ -211,8 +214,8 @@ def _verify_members(archive: Path, expected: dict[str, Path], method: str, *, re
             raise RuntimeError('Substantive ZIP uses Store for every member; '
                                'requested compression method was not demonstrated')
         total = sum(info.file_size for info in infos) * 2
-        with reporter.stage('Verify archive', total=total,
-                            detail='Decode every member and compare SHA-256 with its source') as meter:
+        with reporter.stage('Verify archive I/O (two passes)', total=total,
+                            detail='Processed bytes count ZIP decoding plus source reads; not export size') as meter:
             for number, info in enumerate(infos, 1):
                 digest = hashlib.sha256()
                 size = 0
@@ -261,7 +264,8 @@ def avoid_existing_archive(md_path: Path, collision: str) -> Path:
             return candidate
         n += 1
 
-def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporter=None) -> tuple[str, int, str]:
+def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporter=None,
+                         private: bool = False) -> tuple[str, int, str]:
     """Promote only an owned snapshot; Windows creates a fresh inherited-DACL file."""
     from .file_access import publish_file
     from .progress import ProgressReporter
@@ -281,9 +285,20 @@ def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporte
         digest = state.hexdigest()
     if (digest, size) != (snapshot.sha256, snapshot.size_bytes):
         raise RuntimeError('Snapshot content changed before source-copy staging')
-    if os.name == 'nt' and shutil.disk_usage(destination.parent).free < size + 8 * 1024 * 1024:
-        raise OSError('Insufficient free disk space to stage source copy')
-    publication = publish_file(snapshot.path, destination, reporter=reporter, stage_label='Stage native JSONL')
+    publication = None
+    if private:
+        try:
+            os.link(snapshot.path, destination)
+            publication = 'hardlink'
+        except FileExistsError:
+            raise
+        except OSError:
+            pass
+    if publication is None:
+        from .storage import require_space
+        if os.name == 'nt' or private:
+            require_space(destination.parent, size, stage='stage native JSONL copy')
+        publication = publish_file(snapshot.path, destination, reporter=reporter, stage_label='Stage native JSONL')
     after = snapshot.path.stat()
     if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
@@ -293,7 +308,8 @@ def _stage_snapshot_copy(snapshot: SourceSnapshot, destination: Path, *, reporte
 
 
 def _compress_archive(staged: Path, members: dict[str, Path], settings: ArchiveSettings, *,
-                      backend: str, archiver: Path | None, reporter=None) -> None:
+                      backend: str, archiver: Path | None, reporter=None,
+                      max_bytes: int | None = None) -> None:
     """Create a private flat ZIP with the exact requested codec configuration."""
     from .progress import ProgressReporter, run_seven_zip, SEVEN_ZIP_PROGRESS_ARGS
     reporter = reporter or ProgressReporter(enabled=False)
@@ -312,16 +328,22 @@ def _compress_archive(staged: Path, members: dict[str, Path], settings: ArchiveS
     with reporter.stage('Compress archive', unit='percent',
                         detail=f'{settings.method} level {settings.level}; '
                                f'{len(members)} files; requested threads {settings.threads}') as meter:
-        run = run_seven_zip(command, cwd=next(iter(parents)), progress=meter)
+        def monitor() -> None:
+            if max_bytes is not None and staged.exists() and staged.stat().st_size > max_bytes:
+                from .archive_stream import RangeTooLarge
+                raise RangeTooLarge(0, staged.stat().st_size, max_bytes)
+        run = run_seven_zip(command, cwd=next(iter(parents)), progress=meter,
+                            on_tick=monitor if max_bytes is not None else None)
         if run.returncode != 0:
             raise RuntimeError(f'Archiver error {run.returncode} ({archiver}): '
                                + (run.stderr or run.stdout)[-1600:])
 
 
-def package_export(result: dict[str, Any], original_source: Path,
+def _package_export_impl(result: dict[str, Any], original_source: Path,
                    settings: ArchiveSettings, *, snapshot: SourceSnapshot | None = None,
                    review: bool | None = None, review_chunk_bytes: int | None = None,
-                   reporter=None) -> dict[str, Any]:
+                   reporter=None, destination: Path | None = None,
+                   private_output: bool = False) -> dict[str, Any]:
     """Copy source; build/test a new flat ZIP; only then unlink three loose outputs.
 
     On an exception, originals are never touched, existing exports are kept,
@@ -372,7 +394,7 @@ def package_export(result: dict[str, Any], original_source: Path,
     if settings.copy_source:
         outputs['native JSONL'] = md.with_suffix('.jsonl')
     if settings.archive:
-        outputs['archive'] = md.with_suffix('.zip')
+        outputs['archive'] = Path(destination).resolve() if destination is not None else md.with_suffix('.zip')
     validate_export_paths(outputs, [original_source, *([snapshot.original_path] if snapshot else [])])
     members: dict[str, Path] = {md.name: md}
     if manifest and manifest.is_file():
@@ -384,12 +406,23 @@ def package_export(result: dict[str, Any], original_source: Path,
             raise RuntimeError('Unknown-event sidecar must be a distinct flat export file')
         members[unknown_sidecar.name] = unknown_sidecar
     source_copy: Path | None = None
+    borrowed_snapshot = False
     if snapshot is not None:
         if settings.copy_source:
             source_copy = md.with_suffix('.jsonl')
-            decoded_sha, decoded_bytes, strategy = _stage_snapshot_copy(snapshot, source_copy, reporter=reporter)
-            members[source_copy.name] = source_copy
-            result['source_copy'] = str(source_copy)
+            if settings.archive and settings.cleanup:
+                # The snapshot already owns the exact captured bytes. Archive
+                # them under the requested export name without a loose duplicate.
+                decoded_sha, decoded_bytes = snapshot.sha256, snapshot.size_bytes
+                strategy = 'borrowed_verified_snapshot'
+                borrowed_snapshot = True
+                members[source_copy.name] = snapshot.path
+                result['source_copy'] = None
+            else:
+                decoded_sha, decoded_bytes, strategy = _stage_snapshot_copy(
+                    snapshot, source_copy, reporter=reporter, private=private_output)
+                members[source_copy.name] = source_copy
+                result['source_copy'] = str(source_copy)
             result['source_copy_sha256'] = decoded_sha
             result['source_copy_bytes'] = decoded_bytes
             result['source_copy_strategy'] = strategy
@@ -404,8 +437,8 @@ def package_export(result: dict[str, Any], original_source: Path,
                     expected_bytes = int(detail.get('decoded_source_bytes') or expected_bytes)
                 except (ValueError, OSError, TypeError):
                     pass
-            if shutil.disk_usage(md.parent).free < expected_bytes + 8 * 1024 * 1024:
-                raise OSError('Insufficient free disk space to stage decoded source copy')
+            from .storage import require_space
+            require_space(md.parent, expected_bytes, stage='stage decoded native JSONL')
         source_stat_before_copy = original_source.stat()
         # Classic .zst manifests identify the physical compressed bytes; streamed
         # sources identify the decoded bytes. Hash the physical file only when
@@ -443,10 +476,10 @@ def package_export(result: dict[str, Any], original_source: Path,
     if not settings.archive:
         add_review()
         return result
-    if any(p.parent != md.parent for p in members.values()):
-        raise RuntimeError('Core ZIP members must reside in one export directory')
-    loose_members = dict(members)
-    archive = md.with_suffix('.zip')
+    loose_members = {name: path for name, path in members.items()
+                     if not (borrowed_snapshot and source_copy and name == source_copy.name)}
+    archive = Path(destination).resolve() if destination is not None else md.with_suffix('.zip')
+    archive.parent.mkdir(parents=True, exist_ok=True)
     backend = settings.effective_backend()
     archiver = find_archiver(settings.archiver) if backend == '7zip' else None
     if archive.exists():
@@ -456,6 +489,7 @@ def package_export(result: dict[str, Any], original_source: Path,
         'format': 'zip', 'method': settings.method, 'level': settings.level,
         'backend': backend,
         'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
+        'dictionary_policy': 'configured maximum, limited to known input length as with 7-Zip file input',
         'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
         'threads': settings.threads if backend == '7zip' else 1,
         'archive_filename': archive.name, 'members': sorted(members),
@@ -480,17 +514,15 @@ def package_export(result: dict[str, Any], original_source: Path,
         'dictionary': settings.dictionary if settings.method.upper() == 'LZMA' else None,
         'word_size': settings.word_size if settings.method.upper() == 'LZMA' else None,
         'threads': settings.threads if backend == '7zip' else 1,
-        'max_bytes': settings.max_bytes,
+        'max_bytes': settings.max_bytes, 'work_dir': str(settings.work_dir),
     }
-    with tempfile.TemporaryDirectory(prefix='.codex-archive-', dir=md.parent) as temporary:
+    from .storage import private_prefix, work_directory_parent
+    work_parent = work_directory_parent(archive.parent, settings.work_dir)
+    with tempfile.TemporaryDirectory(prefix=private_prefix(archive.stem, 'archive'), dir=work_parent) as temporary:
         work = Path(temporary)
-        staged = work / 'archive.zip'
-        compression_dir = md.parent
         if review:
             from .review import prepare_review_files, refresh_embedded_manifest
-            compression_dir = work / 'members'
-            compression_dir.mkdir()
-            prepared = prepare_review_files(md, manifest, directory=compression_dir,
+            prepared = prepare_review_files(md, manifest, directory=work / 'review-members',
                                              chunk_bytes=review_chunk_bytes, progress=reporter, embedded=True)
             extra_members = prepared['members']
             if set(members) & set(extra_members):
@@ -500,31 +532,18 @@ def package_export(result: dict[str, Any], original_source: Path,
             save_manifest()
             refresh_embedded_manifest(prepared, manifest)
             result.update({key: value for key, value in prepared.items() if key != 'members'})
-            # Flat members for external 7-Zip, without copying the live source.
-            # These links are private compression inputs, never published files.
-            for name, path in loose_members.items():
-                try:
-                    os.link(path, compression_dir / name)
-                except OSError:
-                    shutil.copyfile(path, compression_dir / name)
-        member_signatures = {name: _file_signature(path) for name, path in members.items()}
-        compression_members = ({name: compression_dir / name for name in members}
-                               if review else members)
-        _compress_archive(staged, compression_members, settings, backend=backend,
-                          archiver=archiver, reporter=reporter)
-        verified_checksums: dict[str, tuple[str, int]] = {}
-        _verify_members(staged, members, settings.method, reporter=reporter,
-                        checksums=verified_checksums)
+        expected_native = ({source_copy.name: (result['source_copy_sha256'], result['source_copy_bytes'])}
+                           if source_copy else {})
+        parts, member_signatures, strategy = _create_archive_parts(
+            members, settings, work=work, destination=archive, backend=backend,
+            archiver=archiver, reporter=reporter, expected_checksums=expected_native)
         _check_member_signatures(members, member_signatures)
-        from .bounded_archive import bound_archive, publish_parts
-        parts = bound_archive(
-            staged, members, max_bytes=settings.max_bytes, work=work / 'bounded',
-            compress=lambda path, inputs: _compress_archive(
-                path, inputs, settings, backend=backend, archiver=archiver, reporter=reporter),
-            method=settings.method, reporter=reporter, checksums=verified_checksums)
-        _check_member_signatures(members, member_signatures)
+        from .bounded_archive import publish_parts
         destinations, publications = publish_parts(parts, archive, max_bytes=settings.max_bytes,
-                                                   reporter=reporter, publisher=_publish_archive)
+                                                   reporter=reporter, publisher=_publish_archive,
+                                                   consume=True)
+        result['archive_work_strategy'] = strategy
+        result['archive_work_directory'] = str(work_parent)
         member_methods = {name: method for part in parts for name, method in part.member_methods.items()}
         payload_store = any(
             part.member_methods[name] == 'Store'
@@ -535,6 +554,8 @@ def package_export(result: dict[str, Any], original_source: Path,
         result.update({
             'archive': str(archive), 'archives': [str(path) for path in destinations],
             'archive_verified': True, 'archive_count': len(parts),
+            'archive_packing': parts[0].packing or {'parts': 1, 'fixed_piece_minimum_proved': True,
+                'scope': 'One complete archive; no multipart packing needed'},
             'archive_parts': [
                 {'archive': str(path), 'bytes': part.size_bytes, 'members': part.members,
                  'provenance': part.provenance}
@@ -544,6 +565,10 @@ def package_export(result: dict[str, Any], original_source: Path,
             'archive_publications': publications,
             'archive_method': settings.method, 'archive_members': sorted(member_methods),
             'archive_member_methods': member_methods,
+            'archive_member_dictionary_bytes': {name: size for part in parts
+                for name, size in part.lzma_dictionary_bytes.items()},
+            'archive_max_dictionary_bytes': max((size for part in parts
+                for size in part.lzma_dictionary_bytes.values()), default=0),
             'archive_used_store_fallback': payload_store,
             'archive_metadata_method': 'Store' if any(part.provenance for part in parts) else None,
             'archive_bytes': archive.stat().st_size,
@@ -569,3 +594,155 @@ def package_export(result: dict[str, Any], original_source: Path,
             result.update(loose_files_removed=True, file=None, manifest=None, source_copy=None,
                           unknown_sidecar=None)
     return result
+
+
+def _flat_private_inputs(members: dict[str, Path], directory: Path) -> dict[str, Path] | None:
+    """Alias small immutable inputs with private links; never duplicate raw bytes."""
+    if len({path.parent for path in members.values()}) == 1 and all(
+            name == path.name for name, path in members.items()):
+        return members
+    directory.mkdir()
+    aliases = {}
+    try:
+        for name, source in members.items():
+            target = directory / name
+            os.link(source, target)
+            aliases[name] = target
+        return aliases
+    except OSError:
+        # Cross-volume or hard-link-restricted filesystems use streamed ranges.
+        # Link creation/removal finishes before mutation signatures are captured.
+        shutil.rmtree(directory)
+        return None
+
+
+def _create_archive_parts(members: dict[str, Path], settings: ArchiveSettings, *,
+                          work: Path, destination: Path, backend: str,
+                          archiver: Path | None, reporter,
+                          expected_checksums: dict[str, tuple[str, int]] | None = None,
+                          compress_whole=None):
+    """Choose bounded streaming before creating an oversized whole archive."""
+    from .archive_stream import compress_range
+    from .bounded_archive import BoundedPart, build_bounded_archives
+    from .storage import require_space
+    expected_checksums = expected_checksums or {}
+    raw_bytes = sum(path.stat().st_size for path in members.values())
+    small = raw_bytes * 1.02 + len(members) * 512 + 22 <= settings.max_bytes
+    inputs = members
+    if backend == '7zip':
+        inputs = _flat_private_inputs(members, work / 'compression-inputs')
+    signatures = {name: _file_signature(path) for name, path in members.items()}
+    ratios = {}
+    if not small:
+        # A tiny real-codec probe avoids learning the first range's ratio by
+        # repeatedly overflowing a large candidate. It is planning only; every
+        # final archive still has an actual-size check and independent decoding.
+        for number, (name, source) in enumerate(members.items(), 1):
+            size = source.stat().st_size
+            if size <= min(65536, settings.max_bytes // 4):
+                ratios[name] = 1.02
+                continue
+            count = min(size, 256 * 1024, max(4096, settings.max_bytes // 8))
+            sample = work / f'ratio-sample-{number:04d}.zip'
+            try:
+                compress_range(sample, name, source, 0, count, count * 2 + 4096,
+                    settings=settings, backend=backend, archiver=archiver,
+                    reporter=reporter, adaptive=False, stage_label='Sample compression ratio')
+                with zipfile.ZipFile(sample) as archive:
+                    ratios[name] = archive.getinfo(name).compress_size / max(1, count)
+            finally:
+                sample.unlink(missing_ok=True)
+    estimated = sum(path.stat().st_size * ratios.get(name, 1.02)
+                    for name, path in members.items()) + len(members) * 512 + 22
+    whole = inputs is not None and (small or (backend == '7zip' and estimated < settings.max_bytes * .90))
+    checksums: dict[str, tuple[str, int]] = {}
+    if whole:
+        from .archive_stream import RangeTooLarge
+        staged = work / destination.name
+        require_space(work, len(members) * 512 + 22, stage='start export archive')
+        try:
+            (compress_whole or _compress_archive)(staged, inputs, settings, backend=backend,
+                archiver=archiver, reporter=reporter, max_bytes=None if small else settings.max_bytes)
+            fits = staged.stat().st_size <= settings.max_bytes
+        except RangeTooLarge:
+            fits = False
+        if fits:
+            _verify_members(staged, members, settings.method, reporter=reporter, checksums=checksums)
+            _check_member_signatures(members, signatures)
+            for name, expected in expected_checksums.items():
+                if checksums.get(name) != expected:
+                    raise RuntimeError(f'Native JSONL no longer matches its captured snapshot: {name}')
+            with zipfile.ZipFile(staged) as archive:
+                names = {zipfile.ZIP_LZMA: 'LZMA', zipfile.ZIP_DEFLATED: 'Deflate', zipfile.ZIP_STORED: 'Store'}
+                methods = {info.filename: names[info.compress_type] for info in archive.infolist()}
+            strategy = 'single_small_archive' if small else 'single_archive_after_ratio_probe'
+            parts = [BoundedPart(staged, methods)]
+            _record_archive_dictionaries(parts)
+            return parts, signatures, strategy
+        staged.unlink(missing_ok=True)
+    total = sum(path.stat().st_size for name, path in members.items() if name not in expected_checksums)
+    with reporter.stage('Checksum archive inputs', total=total,
+                        detail='Reuse captured native SHA-256; hash rendered members') as meter:
+        done = 0
+        for name, path in members.items():
+            if name in expected_checksums:
+                if path.stat().st_size != expected_checksums[name][1]:
+                    raise RuntimeError(f'Native JSONL size no longer matches its snapshot: {name}')
+                checksums[name] = expected_checksums[name]
+                continue
+            digest = hashlib.sha256()
+            size = 0
+            with path.open('rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(block)
+                    size += len(block)
+                    done += len(block)
+                    meter.update(done, detail=name)
+            checksums[name] = digest.hexdigest(), size
+    parts = build_bounded_archives(
+        members, work=work / 'bounded', basename=destination.name,
+        max_bytes=settings.max_bytes, method=settings.method, reporter=reporter, checksums=checksums,
+        estimated_ratios=ratios,
+        compress_range=lambda path, name, source, offset, count, limit: compress_range(
+            path, name, source, offset, count, limit, settings=settings,
+            backend=backend, archiver=archiver, reporter=reporter))
+    _check_member_signatures(members, signatures)
+    _record_archive_dictionaries(parts)
+    return parts, signatures, 'streamed_bounded_members'
+
+
+def package_export(result: dict[str, Any], original_source: Path,
+                   settings: ArchiveSettings, *, snapshot: SourceSnapshot | None = None,
+                   review: bool | None = None, review_chunk_bytes: int | None = None,
+                   reporter=None, destination: Path | None = None,
+                   private_output: bool = False) -> dict[str, Any]:
+    """Package generated files; the caller owns its render/snapshot transaction.
+
+    ``destination`` separates private rendering from final ZIP publication.
+    ``private_output`` permits private hard links for retained batch JSONL only;
+    publicly visible Windows exports always inherit the destination folder DACL.
+    """
+    from .storage import storage_failure
+    output = (Path(destination).parent if destination is not None else
+              Path(result.get('file') or original_source).parent)
+    work = Path(settings.work_dir).expanduser() if settings.work_dir else output
+    try:
+        return _package_export_impl(result, original_source, settings, snapshot=snapshot,
+            review=review, review_chunk_bytes=review_chunk_bytes, reporter=reporter,
+            destination=destination, private_output=private_output)
+    except BaseException as error:
+        enriched = storage_failure(error, stage='export packaging', work_dir=work, output_dir=output)
+        if enriched is not error:
+            raise enriched from error
+        raise
+
+
+def _record_archive_dictionaries(parts) -> None:
+    """Record encoded decoder-memory properties separately from requested limits."""
+    from .archive_diagnostics import _lzma_properties
+    for part in parts:
+        with zipfile.ZipFile(part.path) as archive:
+            for info in archive.infolist():
+                if info.compress_type == zipfile.ZIP_LZMA:
+                    value = _lzma_properties(archive.fp, info, archive.start_dir)
+                    part.lzma_dictionary_bytes[info.filename] = value['dictionary_bytes']

@@ -193,8 +193,8 @@ def snapshot_source(source: Path, *, directory: Path | None = None,
             before = os.fstat(original.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError('Codex rollout must be a regular file')
-            if shutil.disk_usage(staging).free < before.st_size + 8 * 1024 * 1024:
-                raise OSError('Insufficient free disk space to capture the Codex snapshot')
+            from .storage import require_space
+            require_space(staging, before.st_size, stage='capture verified source snapshot')
             with reporter.stage('Capture snapshot', total=before.st_size,
                                 detail='Fixed source prefix; later appends remain for the next export') as task:
                 with physical.open('xb') as output:

@@ -16,6 +16,8 @@ import json
 import re
 import zipfile
 
+from .timestamps import TimestampFormatter, extract_source_timestamp
+
 
 def safe_name(value: Any) -> str:
     s = re.sub(r'[^\w.\-]+', '_', str(value or 'chat').strip(), flags=re.U).strip('._')
@@ -181,6 +183,8 @@ def audit_chatgpt(path: Path, *, conversation_ids: list[str] | None = None,
             if len(matched) < 1000:
                 matched.append({'id': sid, 'title': str(conv.get('title') or ''),
                                 'project_id': conv.get('project_id'), 'source_member': name,
+                                'created_at': extract_source_timestamp({'create_time': conv.get('create_time')}),
+                                'updated_at': extract_source_timestamp({'create_time': conv.get('update_time')}),
                                 'mapping_nodes': len(conv.get('mapping') or {})})
         if progress and counts['scanned'] % 1000 == 0:
             print(f'ChatGPT backup audit: {counts["scanned"]:,} scanned; {counts["matched"]:,} matched',
@@ -235,8 +239,10 @@ def _choose_output(dest: Path) -> Path:
 
 
 def export_chatgpt(input_path: Path, out_dir: Path, *, conversation_ids: list[str],
-                   title_match: str, project_id: str = '', progress: bool = False) -> list[dict[str, Any]]:
+                   title_match: str, project_id: str = '', progress: bool = False,
+                   show_timestamps: bool = True, timestamp_timezone: str = 'local') -> list[dict[str, Any]]:
     """Convert an explicit account-export archive; never fetch account data remotely."""
+    timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
     wanted_ids = {x.casefold() for x in conversation_ids}
     pattern = re.compile(title_match, re.I) if title_match else None
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -277,9 +283,9 @@ def export_chatgpt(input_path: Path, out_dir: Path, *, conversation_ids: list[st
                 content = msg.get('content')
                 parts = _extract_text(content)
                 f.write(f'## Node {position}: {role}\n\n')
+                f.write(timestamps.markdown(msg.get('create_time')))
                 f.write(f'- Node ID: `{nid}`\n- Parent: `{node.get("parent") or "root"}`\n'
                         f'- Children: `{", ".join(map(str, node.get("children") or []))}`\n'
-                        f'- Timestamp (UTC): `{_date(msg.get("create_time"))}`\n'
                         f'- Channel: `{(msg.get("metadata") or {}).get("channel", "unspecified")}`\n\n')
                 if parts:
                     f.write('\n\n'.join(parts).rstrip() + '\n\n')
@@ -288,6 +294,7 @@ def export_chatgpt(input_path: Path, out_dir: Path, *, conversation_ids: list[st
         manifest = {'source_archive': str(input_path), 'source_member': source_member, 'conversation_id': sid, 'title': title,
                     'node_count': len(nodes), 'message_roles': dict(roles),
                     'nonmessage_nodes': missing_messages, 'source_project_id': conv.get('project_id'),
+                    'timestamp_policy': timestamps.metadata(),
                     'export_path': str(dest), 'source_fidelity': 'source archive retained externally; all mapping nodes visited'}
         man_path = dest.with_suffix('.manifest.json')
         man_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')

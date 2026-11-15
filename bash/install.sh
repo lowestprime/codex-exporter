@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install Codex Exporter 0.4+ on macOS/Linux.
+# Install Codex Exporter 0.5+ on macOS/Linux.
 set -euo pipefail
 
 install_dir=${CODEX_EXPORT_INSTALL_DIR:-"$HOME/.codex-tools"}

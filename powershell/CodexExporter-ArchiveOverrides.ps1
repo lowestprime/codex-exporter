@@ -1,4 +1,4 @@
-# Codex Exporter 0.4.0 archive, review and progress controls for existing PowerShell helpers.
+# Codex Exporter 0.5.0 archive, review and progress controls for existing PowerShell helpers.
 # This file is dot-sourced AFTER existing profile. Existing Invoker is retained.
 function Get-CodexArchiveCliArgs {
     param([System.Collections.IDictionary]$Bound)

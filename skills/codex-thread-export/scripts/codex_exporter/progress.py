@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable, Mapping, Sequence, TextIO
+from typing import Callable, Iterable, Mapping, Sequence, TextIO
 import unicodedata
 
 PROGRESS_STYLES = ('auto', 'rich', 'plain', 'json', 'off')
@@ -516,7 +516,8 @@ class _Tail:
                 self.size -= excess
 
     def text(self) -> str:
-        text = _ANSI.sub('', ''.join(self.parts))
+        # Normalize paired Windows line endings before translating lone progress CRs.
+        text = _ANSI.sub('', ''.join(self.parts)).replace('\r\n', '\n')
         return ''.join('\n' if ch in '\r\b' else ch for ch in text
                        if ch in '\n\r\t\b' or unicodedata.category(ch) not in ('Cc', 'Cf', 'Cs'))
 
@@ -542,7 +543,9 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
                   cwd: str | Path | None = None, progress: StageProgress | None = None,
                   env: Mapping[str, str] | None = None, output_limit: int = 65536,
                   heartbeat_interval: float = 0.2, timeout: float | None = None,
-                  cancel_event: threading.Event | None = None) -> subprocess.CompletedProcess[str]:
+                  cancel_event: threading.Event | None = None,
+                  input_chunks: Iterable[bytes] | None = None,
+                  on_tick: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
     """Run 7-Zip without deadlocking pipes or retaining unbounded diagnostic logs.
 
     Include SEVEN_ZIP_PROGRESS_ARGS in the command and omit ``-bd``.  Both output
@@ -550,6 +553,9 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
     ``stdout`` in the returned CompletedProcess is the bounded combined log;
     ``stderr`` is empty.  Nonzero exits are returned for the caller to handle.
     Ctrl+C, explicit cancellation, and timeouts terminate and reap the child.
+    Optional input chunks are streamed through a separate writer, so an input
+    range never needs a duplicate raw file. The monitor callback runs alongside
+    pipe draining and may stop input or raise to cancel an oversized candidate.
     A successful exit supplies the observed completion signal even when 7-Zip
     did not print a final 100% frame.  Archive verification remains a later stage.
     """
@@ -562,7 +568,8 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
     chunks: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=16)
     stop = threading.Event()
     args = [os.fspath(arg) for arg in command]
-    process = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+    process = subprocess.Popen(args, cwd=cwd, env=env,
+                               stdin=subprocess.PIPE if input_chunks is not None else subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     assert process.stdout is not None
 
@@ -586,12 +593,42 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
         finally:
             send(None)
 
+    def write_pipe() -> None:
+        assert process.stdin is not None and input_chunks is not None
+        try:
+            for chunk in input_chunks:
+                if stop.is_set():
+                    break
+                pending = memoryview(chunk)
+                while pending and not stop.is_set():
+                    written = process.stdin.write(pending)
+                    if not written:
+                        raise BrokenPipeError('7-Zip closed its input stream')
+                    pending = pending[written:]
+        except BrokenPipeError:
+            # Let the process exit and preserve its actionable diagnostic log.
+            # The caller also checks the number of bytes successfully supplied.
+            pass
+        except BaseException as error:
+            send(error)
+        finally:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
     reader = threading.Thread(target=read_pipe, name='codex-7zip-output', daemon=True)
+    writer = (threading.Thread(target=write_pipe, name='codex-7zip-input', daemon=True)
+              if input_chunks is not None else None)
     started = time.monotonic()
     reader.start()
+    if writer is not None:
+        writer.start()
     eof = False
     try:
         while not eof or process.poll() is None:
+            if on_tick is not None:
+                on_tick()
             if cancel_event is not None and cancel_event.is_set():
                 raise KeyboardInterrupt('Archive compression cancelled')
             if timeout is not None and time.monotonic() - started >= timeout:
@@ -631,5 +668,7 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
         try:
             _stop_process(process)
         finally:
+            if writer is not None:
+                writer.join(timeout=3)
             reader.join(timeout=1)
             process.stdout.close()
