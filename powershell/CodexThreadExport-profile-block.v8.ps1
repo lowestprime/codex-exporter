@@ -1,5 +1,5 @@
 # >>> Codex Thread Exporter helpers >>>
-# Codex Thread Exporter PowerShell 7+ helpers (exporter 0.4+).
+# Codex Thread Exporter PowerShell 7+ helpers (exporter 0.5+).
 # The Python exporter owns persistent output-directory and filename-template state.
 
 $script:CodexThreadExporter = if ($env:CODEX_THREAD_EXPORTER) {
@@ -204,6 +204,11 @@ function Invoke-CodexThreadExport {
     Invoke-CodexExporterRaw -ArgumentList ($arguments + $Rest)
 }
 
+# Listing controls pass through unchanged; quote comma-separated sort specifications.
+# cdx-sessions --sort 'project:asc,modified:desc' --pager auto
+# cdx-turns UUID --sort turn:desc --page-size 20
+function codex-exporter { Invoke-CodexExporterRaw -ArgumentList @($args) }
+function cdx-help { Invoke-CodexExporterRaw -ArgumentList (@('--help') + $args) }
 function cdx-sessions { Invoke-CodexExporterRaw -ArgumentList (@('--list-sessions') + $args) }
 function cdx-browse { Invoke-CodexExporterRaw -ArgumentList (@('--browse', '--mode', 'thread') + $args) }
 function cdx-config { Invoke-CodexExporterRaw -ArgumentList (@('--show-config') + $args) }

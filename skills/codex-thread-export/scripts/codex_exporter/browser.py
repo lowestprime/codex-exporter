@@ -14,6 +14,7 @@ import sys
 from typing import Any, TextIO
 
 from .progress import _cells, _clean, _clip, _windows_vt
+from .display import _isatty, _wrap_lines, read_command, sort_rows, validate_sort
 
 SORT_CHOICES = ('recent', 'oldest', 'size', 'title', 'project')
 STATUS_CHOICES = ('all', 'available', 'live', 'archived', 'missing')
@@ -104,9 +105,10 @@ class SessionBrowser:
                  input_stream: TextIO | None = None, output_stream: TextIO | None = None,
                  page_size: int | None = None, width: int | None = None,
                  query: str = '', status: str = 'all', sort: str = 'recent',
-                 color: bool | None = None):
-        if status not in STATUS_CHOICES or sort not in SORT_CHOICES:
+                 sort_order: str = 'auto', color: bool | None = None):
+        if status not in STATUS_CHOICES:
             raise ValueError('Unsupported browser status filter or sort order.')
+        validate_sort(sort, kind='sessions', order=sort_order)
         if page_size is not None and not 1 <= page_size <= 200:
             raise ValueError('Browser page size must be between 1 and 200.')
         if width is not None and width < 1:
@@ -117,6 +119,9 @@ class SessionBrowser:
         self.fixed_width = width
         self.page_size = page_size or max(5, min(20, (self._terminal_size().lines - 12) // 2))
         self.query, self.status, self.sort = query.strip(), status, sort
+        self.sort_order = sort_order
+        self.project_sort: str | None = None
+        self.requested_page_size = page_size
         self.page = 0
         self.view = 'sessions'
         self.active_project = ''
@@ -136,6 +141,8 @@ class SessionBrowser:
             tty = False
         self.color = (color is not False and tty and 'NO_COLOR' not in os.environ
                       and os.environ.get('TERM', '').lower() != 'dumb' and _windows_vt(self.output))
+        self.live_terminal = (_isatty(self.input) and tty and
+                              os.environ.get('TERM', '').lower() != 'dumb' and _windows_vt(self.output))
 
     def _terminal_size(self):
         try:
@@ -165,11 +172,9 @@ class SessionBrowser:
     def prompt(self, text: str = 'Select rows, command, or q > ') -> str:
         self.write(text.rstrip(), color='36', end=' ')
         try:
-            value = self.input.readline()
+            value = read_command(self.input, self.output)
         except (OSError, ValueError) as exc:
             raise EOFError('Browser input is unavailable') from exc
-        if not value:
-            raise EOFError
         # Piped scripts do not echo their input; keep subsequent output on its own line.
         try:
             terminal = self.input.isatty()
@@ -202,23 +207,22 @@ class SessionBrowser:
                                 ('title', 'cwd', 'project', 'session_id', 'path', 'db_rollout_path')).casefold()
             if all(word in haystack for word in words):
                 result.append(row)
-        functions = {
-            'recent': lambda r: (-r['mtime'], r['session_id'].casefold()),
-            'oldest': lambda r: (r['mtime'], r['session_id'].casefold()),
-            'size': lambda r: (-r['size'], -r['mtime'], r['session_id'].casefold()),
-            'title': lambda r: (r['title'].casefold(), r['session_id'].casefold()),
-            'project': lambda r: (_project_key(r), -r['mtime'], r['session_id'].casefold()),
-        }
-        return sorted(result, key=functions[self.sort])
+        return sort_rows(result, kind='sessions', sort=self.sort, order=self.sort_order)
 
     def render(self) -> None:
+        if self.live_terminal:
+            self.output.write('\x1b[H\x1b[2J')
+            available = max(1, (self._terminal_size().lines - 12) // 2)
+            self.page_size = min(self.requested_page_size or 20, available)
         rows = self.filtered()
         self.write()
         dash = '—' if self.unicode else '-'
         self.write(f'Codex session browser {dash} select before export starts', color='1;36')
         missing = sum(not _available(r) for r in self.rows)
         self.write(f'{len(self.rows)} sessions | {missing} missing | {len(self.selected)} selected', color='2')
-        context = f'View {self.view} | {self.status} | sort {self.sort}'
+        context = f'View {self.view} | {self.status} | sort {self.project_sort or self.sort if self.view == "projects" else self.sort}'
+        if self.sort_order != 'auto':
+            context += f' ({self.sort_order})'
         if self.query:
             context += f' | search: {self.query}'
         self.write(context)
@@ -228,13 +232,16 @@ class SessionBrowser:
             grouped: dict[str, list[Row]] = {}
             for row in rows:
                 grouped.setdefault(_project_key(row), []).append(row)
-            if self.sort in ('title', 'project'):
-                groups = sorted(grouped.items(), key=lambda x: (x[1][0]['project'].casefold(), x[0]))
-            elif self.sort == 'size':
-                groups = sorted(grouped.items(), key=lambda x: (-sum(r['size'] for r in x[1]), x[0]))
-            else:
-                groups = sorted(grouped.items(), key=lambda x: (
-                    (1 if self.sort == 'oldest' else -1) * max(r['mtime'] for r in x[1]), x[0]))
+            summaries = []
+            for key, items in grouped.items():
+                summaries.append({'id': key, 'project': items[0]['project'],
+                                  'cwd': items[0]['cwd'], 'path': items[0]['cwd'],
+                                  'size': sum(r['size'] for r in items),
+                                  'mtime': max(r['mtime'] for r in items),
+                                  'count': len(items), 'missing': sum(not _available(r) for r in items),
+                                  'archived': sum(r['archived'] for r in items), 'members': items})
+            ordered = sort_rows(summaries, kind='projects', sort=self.project_sort or self.sort, order=self.sort_order)
+            groups = [(r['id'], r['members']) for r in ordered]
             count = len(groups)
         else:
             groups = []
@@ -265,7 +272,7 @@ class SessionBrowser:
                 detail = f'        {row["session_id"][:8]} | {_size(row["size"])} | {row["project"]}'
             self.write(detail, color='2')
         self.write('Rows / ranges: export | +rows: add | -rows: remove | x: export basket')
-        self.write('n/p pages | m projects | /search | v row details | r refresh | ? help | q quit')
+        self.write('Enter/n/p or arrows/PgUp/PgDn pages | Home/End | /search | ? help | q quit')
 
     def help(self) -> None:
         for line in (
@@ -278,14 +285,17 @@ class SessionBrowser:
             '+page       Add every row on this page.',
             'x / export  Export the basket. No missing rollout is silently skipped.',
             'basket      View selected sessions; clear empties the basket.',
-            'n / p       Next / previous page. page N jumps to a page.',
+            'Enter/n/p   Next / previous page. page N jumps; Home/End or first/last jump.',
             'm           Toggle projects / sessions. b goes back.',
             '/words      Search ID, title, workspace, project, filename (all words).',
             '/           Clear the search. Searches are literal, not regular expressions.',
             'id PREFIX   Export an unambiguous ID or filename match; s prompts for it.',
             'v N         Inspect full session ID, workspace, file path and metadata.',
             'filter NAME all, available, live (unarchived), archived, missing.',
-            'sort NAME   recent, oldest, size, title, project.',
+            'sort SPEC   Comma-separated columns, e.g. project:asc,size:desc; recent/oldest.',
+            '            id/title/project/workspace/path/size/modified/status/archived/missing.',
+            'order DIR   auto, asc, desc. Explicit :asc/:desc per field takes precedence.',
+            'Arrows/PgUp/PgDn navigate pages at an empty prompt; type commands normally.',
             'size N      Set 1..200 rows per page. r refreshes the catalog.',
             'q / Ctrl+C / EOF  Cancel cleanly without an export.',
         ):
@@ -312,16 +322,8 @@ class SessionBrowser:
                   ('Title source', row.get('title_source') or 'catalog')]
         for name, value in fields:
             text = f'{name}: {_clean(value, limit=4096)}'
-            while text:
-                piece = ''
-                for ch in text:
-                    if _cells(piece + ch) > self.width:
-                        break
-                    piece += ch
-                if not piece:
-                    piece = text[0]
+            for piece in _wrap_lines([text], self.width):
                 self.write(piece)
-                text = text[len(piece):]
         if len(str(row['title'])) > 4096:
             self.write('Title preview limited to 4096 characters; export retains its configured title.')
 
@@ -350,12 +352,15 @@ class SessionBrowser:
             self.write('Browser cancelled; no export requested.', color='2')
             return [], False
         if not raw:
-            return None, False
+            self.page = min(self.pages - 1, self.page + 1)
+            return None, True
         if lower in ('?', 'help'):
             self.help()
             return None, False
         if lower in ('n', 'next', 'p', 'prev'):
             self.page = min(self.pages - 1, max(0, self.page + (1 if lower in ('n', 'next') else -1)))
+        elif lower in ('first', 'last'):
+            self.page = 0 if lower == 'first' else self.pages - 1
         elif command == 'page':
             if not value.isdigit() or not 1 <= int(value) <= self.pages:
                 raise ValueError(f'Page must be between 1 and {self.pages}.')
@@ -375,13 +380,21 @@ class SessionBrowser:
                 raise ValueError('Filter must be all, available, live, archived, or missing.')
             self.status, self.page = value.casefold(), 0
         elif command == 'sort':
-            if value.casefold() not in SORT_CHOICES:
-                raise ValueError('Sort must be recent, oldest, size, title, or project.')
-            self.sort, self.page = value.casefold(), 0
+            validate_sort(value, kind='projects' if self.view == 'projects' else 'sessions', order=self.sort_order)
+            if self.view == 'projects':
+                self.project_sort = value.casefold()
+            else:
+                self.sort = value.casefold()
+            self.page = 0
+        elif command == 'order':
+            if value.casefold() not in ('auto', 'asc', 'desc'):
+                raise ValueError('Sort order must be auto, asc, or desc.')
+            self.sort_order, self.page = value.casefold(), 0
         elif command == 'size':
             if not value.isdigit() or not 1 <= int(value) <= 200:
                 raise ValueError('Page size must be between 1 and 200.')
             self.page_size, self.page = int(value), 0
+            self.requested_page_size = int(value)
         elif lower in ('r', 'refresh'):
             self.refresh()
         elif lower in ('c', 'clear'):
@@ -433,6 +446,9 @@ class SessionBrowser:
 
     def run(self) -> list[str]:
         try:
+            if self.live_terminal:
+                self.output.write('\x1b[?1049h')
+                self.output.flush()
             self.refresh()
             if not self.rows:
                 self.write('No Codex sessions found. Inspect --audit-sessions or select --jsonl PATH.')
@@ -455,13 +471,20 @@ class SessionBrowser:
             except (EOFError, OSError, ValueError):
                 pass
             return []
+        finally:
+            if self.live_terminal:
+                try:
+                    self.output.write('\x1b[?1049l')
+                    self.output.flush()
+                except (OSError, ValueError):
+                    pass
 
 
 def browse_sessions(rows_provider: Callable[[], Iterable[Mapping[str, Any]]], *,
                     input_stream: TextIO | None = None, output_stream: TextIO | None = None,
                     page_size: int | None = None, width: int | None = None,
                     query: str = '', status: str = 'all', sort: str = 'recent',
-                    color: bool | None = None) -> list[str]:
+                    sort_order: str = 'auto', color: bool | None = None) -> list[str]:
     """Select IDs interactively; q, EOF and Ctrl+C return an empty selection.
 
     Input may also be a finite line-command script. The UI and flushed prompt
@@ -469,4 +492,4 @@ def browse_sessions(rows_provider: Callable[[], Iterable[Mapping[str, Any]]], *,
     """
     return SessionBrowser(rows_provider, input_stream=input_stream, output_stream=output_stream,
                           page_size=page_size, width=width, query=query, status=status,
-                          sort=sort, color=color).run()
+                          sort=sort, sort_order=sort_order, color=color).run()

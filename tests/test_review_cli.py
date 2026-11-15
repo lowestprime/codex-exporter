@@ -219,8 +219,9 @@ def test_retrofit_rejects_flags_that_would_misstate_scope_or_privacy(
     assert not output.exists() or not list(output.iterdir())
 
 
-def test_review_failure_retains_loose_outputs_without_publishing_incomplete_zip(
-    synthetic_source: Path, tmp_path: Path, monkeypatch, capsys,
+@pytest.mark.parametrize('keep_loose', [False, True])
+def test_review_failure_cleans_private_work_and_respects_explicit_loose_retention(
+    synthetic_source: Path, tmp_path: Path, monkeypatch, capsys, keep_loose,
 ):
     before = synthetic_source.read_bytes()
     output = tmp_path / 'export'
@@ -230,13 +231,16 @@ def test_review_failure_retains_loose_outputs_without_publishing_incomplete_zip(
 
     monkeypatch.setattr(review, 'prepare_review_files', fail_review)
     with pytest.raises(RuntimeError, match='Synthetic review creation failure'):
-        _export(monkeypatch, capsys, synthetic_source, output)
+        _export(monkeypatch, capsys, synthetic_source, output,
+                extra=('--no-archive-cleanup',) if keep_loose else ())
     assert not list(output.glob('*.zip'))
-    assert len(list(output.glob('*.md'))) == 1
-    assert len(list(output.glob('*.manifest.json'))) == 1
-    source_copies = list(output.glob('*.jsonl'))
-    assert len(source_copies) == 1
-    assert source_copies[0].read_bytes() == before
+    if keep_loose:
+        assert len(list(output.glob('*.md'))) == 1
+        assert len(list(output.glob('*.manifest.json'))) == 1
+        source_copies = list(output.glob('*.jsonl'))
+        assert len(source_copies) == 1 and source_copies[0].read_bytes() == before
+    else:
+        assert not list(output.iterdir())
     assert synthetic_source.read_bytes() == before
     assert not list(output.glob('*.review'))
 

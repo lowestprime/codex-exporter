@@ -231,7 +231,7 @@ def test_corrupt_part_is_detected_before_publication(tmp_path, monkeypatch):
     assert members['data.bin'].exists()
 
 
-def test_complete_pipeline_cleans_only_after_all_parts_verified(tmp_path, monkeypatch):
+def test_complete_pipeline_cleans_only_after_all_parts_verified(tmp_path, monkeypatch, fake_range_compressor):
     randomizer = random.Random(53)
     source = tmp_path / 'live.jsonl'
     source.write_bytes(b'{"text":"' + randomizer.randbytes(70_000).hex().encode() + b'"}\n')

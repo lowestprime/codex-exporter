@@ -24,7 +24,7 @@ def compress(path, members, settings, **kwargs):
 
 
 @pytest.fixture
-def backend(monkeypatch):
+def backend(monkeypatch, fake_range_compressor):
     monkeypatch.setattr(batch_archive, 'find_archiver', lambda _: Path('synthetic-7z'))
     monkeypatch.setattr(batch_archive, '_compress_archive', compress)
 

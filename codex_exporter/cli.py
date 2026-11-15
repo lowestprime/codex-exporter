@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
@@ -28,7 +29,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -433,10 +434,11 @@ class Record:
         # Keep every native line behind merged call/output cards and duplicates.
         if not self.source_seqs and self.seq > 0:
             self.source_seqs = (self.seq,)
-        if (self.kind == 'message' and self.role == 'user'
-                and self.source_type.casefold() not in ('user_message', 'usermessage')):
-            from codex_exporter.selection import is_injected_context
-            if is_injected_context(self.text):
+        if self.kind == 'message' and self.role == 'user':
+            from codex_exporter.selection import is_injected_context, is_internal_service_context
+            if (is_internal_service_context(self.text) or
+                    (self.source_type.casefold() not in ('user_message', 'usermessage')
+                     and is_injected_context(self.text))):
                 self.kind, self.role, self.source_type = 'note', 'system', 'injected_context'
 
 
@@ -1327,11 +1329,8 @@ def extract_action_record(
 
 
 def get_timestamp(obj: dict[str, Any]) -> str:
-    for key in ("timestamp", "time", "created_at", "createdAt"):
-        value = obj.get(key)
-        if value:
-            return str(value)
-    return ""
+    from codex_exporter.timestamps import extract_source_timestamp
+    return extract_source_timestamp(obj)
 
 
 def event_type_blob(obj: dict[str, Any]) -> tuple[str, dict[str, Any], str, dict[str, Any], str]:
@@ -2133,7 +2132,11 @@ def render_thread_export(
     fence_turns: bool = False,
     source_sha: str | None = None,
     source_snapshot: dict[str, Any] | None = None,
+    show_timestamps: bool = True,
+    timestamp_timezone: str = "local",
 ) -> str:
+    from codex_exporter.timestamps import TimestampFormatter
+    timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
     source_sha = source_sha if source_sha is not None else source_file_sha256(source)
     summary = export_summary(records, meta)
     parts: list[str] = []
@@ -2181,6 +2184,8 @@ def render_thread_export(
             [
                 f"## Turn {idx:03d}",
                 "",
+                timestamps.markdown(prompt.timestamp).rstrip(),
+                "",
                 f"### Prompt {idx:03d}",
                 "",
                 "| Field | Value |",
@@ -2202,6 +2207,8 @@ def render_thread_export(
             [
                 "",
                 f"### Response {idx:03d}",
+                "",
+                timestamps.markdown(response_start).rstrip(),
                 "",
                 "| Field | Value |",
                 "|---|---:|",
@@ -2433,17 +2440,17 @@ def write_manifest(manifest: dict[str, Any], output_path: Path | None, explicit_
     return path
 
 
-def report_event_audit(meta: dict[str, Any]) -> None:
-    print("\nEvent audit:", file=sys.stderr)
-    for label, key in (
-        ("recognized", "_recognized_event_types"),
-        ("ignored", "_ignored_event_types"),
-        ("unknown", "_unknown_event_types"),
-    ):
-        values = counter_to_dict(meta.get(key))
-        print(f"  {label}: {sum(values.values())}", file=sys.stderr)
-        for name, count in values.items():
-            print(f"    {count:>8}  {name}", file=sys.stderr)
+def report_event_audit(meta: dict[str, Any], *, settings=None) -> None:
+    from codex_exporter.display import DisplaySettings, sort_rows, print_listing
+    settings = settings or DisplaySettings()
+    rows = [{'event': name, 'count': count, 'status': label}
+            for label, key in (('recognized', '_recognized_event_types'),
+                               ('ignored', '_ignored_event_types'), ('unknown', '_unknown_event_types'))
+            for name, count in counter_to_dict(meta.get(key)).items()]
+    rows = sort_rows(rows, kind='events', sort=settings.sort, order=settings.sort_order)
+    lines = ['Event audit:', '| status | count | event schema |', '|---|---:|---|']
+    lines.extend(f"| {row['status']} | {row['count']:,} | {row['event']} |" for row in rows)
+    print_listing(lines, settings=settings, title='Event audit', output_stream=sys.stderr)
 
 
 def parse_session(
@@ -2835,83 +2842,93 @@ def compact_session_cell(value: str, *, limit: int = 140) -> str:
     return display.replace("|", "\\|")
 
 
-def print_session_list(*, full_titles: bool = False) -> None:
-    rows = list_session_descriptors()
-    if not rows:
-        print(f"_No Codex session JSONLs found under {codex_home()}._")
-        return
-    print("| # | session_id | size | modified | project | archived | title |")
-    print("|---:|---|---:|---|---|---|---|")
+def print_session_list(*, full_titles: bool = False, settings=None, json_output: bool = False) -> list[dict[str, Any]]:
+    from codex_exporter.display import DisplaySettings, sort_rows, print_listing
+    settings = settings or DisplaySettings()
+    rows = sort_rows(list_session_descriptors(), kind='sessions', sort=settings.sort, order=settings.sort_order)
+    if json_output:
+        print(json.dumps(rows, ensure_ascii=False, default=str))
+        return rows
+    lines = ["| # | session_id | size | modified | project | archived | title |",
+             "|---:|---|---:|---|---|---|---|"]
     for index, row in enumerate(rows, 1):
         title = compact_session_cell(str(row['title']), limit=1000000 if full_titles else 140)
         project = compact_session_cell(str(row['project']), limit=140)
         missing = ' [ROLLOUT MISSING]' if row.get('missing_rollout') else ''
-        print(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{missing} |")
+        lines.append(f"| {index} | {row['session_id']} | {human_size(row['size'])} | {row['modified']} | {project} | {str(row['archived']).lower()} | {title}{missing} |")
+    print_listing(lines if rows else [f"_No Codex session JSONLs found under {codex_home()}._"],
+                  settings=settings, title='Codex sessions')
+    return rows
 
 
-def print_message_list(records: list[Record]) -> None:
-    messages = [r for r in records if r.kind == "message"]
-    print("| # | role | timestamp | chars | preview |")
-    print("|---:|---|---|---:|---|")
-    for i, rec in enumerate(messages, 1):
-        preview = rec.text.strip().replace("\n", " ")
-        preview = re.sub(r"\s+", " ", preview)
-        if len(preview) > 120:
-            preview = preview[:117] + "..."
-        preview = preview.replace("|", "\\|")
-        print(f"| {i} | {rec.role} | {rec.timestamp or ''} | {len(rec.text):,} | {preview} |")
+def print_message_list(records: list[Record], *, settings=None, json_output: bool = False) -> list[dict[str, Any]]:
+    from codex_exporter.display import DisplaySettings, sort_rows, print_listing
+    settings = settings or DisplaySettings()
+    rows = [{'index': i, 'role': rec.role, 'timestamp': rec.timestamp, 'chars': len(rec.text),
+             'preview': compact_session_cell(rec.text, limit=120), 'line': rec.seq}
+            for i, rec in enumerate((r for r in records if r.kind == 'message'), 1)]
+    rows = sort_rows(rows, kind='messages', sort=settings.sort, order=settings.sort_order)
+    if not json_output:
+        lines = ["| # | role | timestamp | chars | preview |", "|---:|---|---|---:|---|"]
+        lines.extend(f"| {r['index']} | {r['role']} | {r['timestamp']} | {r['chars']:,} | {r['preview']} |" for r in rows)
+        print_listing(lines, settings=settings, title='Messages (original message numbers)')
+    return rows
 
 
-def print_response_list(records: list[Record]) -> None:
-    blocks = split_prompt_response_blocks(records)
-    print(f"| response | user message # | records | assistant chars | response lines | {token_field_label()} | action records | edited | created | first assistant preview |")
-    print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
-    for block in blocks:
-        idx = block["index"]
-        response = block["response"]
-        a_chars = sum(len(r.text) for r in response if r.kind == "message" and r.role == "assistant")
-        action_count = sum(1 for r in response if r.kind == "action")
-        edited = count_file_cards(response, "Edited file")
-        created = count_file_cards(response, "Created file")
-        lines = record_line_count(response)
-        tokens = record_token_count(response)
-        preview = next((r.text.strip().splitlines()[0] for r in response if r.kind == "message" and r.role == "assistant"), "")
-        preview = re.sub(r"\s+", " ", preview)
-        if len(preview) > 100:
-            preview = preview[:97] + "..."
-        preview = preview.replace("|", "\\|")
-        print(f"| {idx} | {idx} | {len(response)} | {a_chars:,} | {lines:,} | {tokens:,} | {action_count:,} | {edited:,} | {created:,} | {preview} |")
+def print_response_list(records: list[Record], *, settings=None, json_output: bool = False) -> list[dict[str, Any]]:
+    from codex_exporter.display import DisplaySettings, sort_rows, print_listing
+    settings = settings or DisplaySettings()
+    rows = []
+    for block in split_prompt_response_blocks(records):
+        response = block['response']
+        preview = next((r.text.strip().splitlines()[0] for r in response
+                        if r.kind == 'message' and r.role == 'assistant' and r.text.strip()), '')
+        rows.append({'index': block['index'], 'user_message': block['index'], 'records': len(response),
+            'assistant_chars': sum(len(r.text) for r in response if r.kind == 'message' and r.role == 'assistant'),
+            'lines': record_line_count(response), 'tokens': record_token_count(response),
+            'actions': sum(r.kind == 'action' for r in response),
+            'edited': count_file_cards(response, 'Edited file'), 'created': count_file_cards(response, 'Created file'),
+            'timestamp': block['prompt'].timestamp, 'preview': compact_session_cell(preview, limit=100)})
+    rows = sort_rows(rows, kind='responses', sort=settings.sort, order=settings.sort_order)
+    if not json_output:
+        lines = [f"| response | user message # | records | assistant chars | response lines | {token_field_label()} | action records | edited | created | first assistant preview |",
+                 "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+        lines.extend(f"| {r['index']} | {r['user_message']} | {r['records']} | {r['assistant_chars']:,} | {r['lines']:,} | {r['tokens']:,} | {r['actions']:,} | {r['edited']:,} | {r['created']:,} | {r['preview']} |" for r in rows)
+        print_listing(lines, settings=settings, title='Responses (original response numbers)')
+    return rows
 
-def render_record(rec: Record, index: int | None, plain: bool, ui_style: bool) -> str:
+
+def render_record(rec: Record, index: int | None, plain: bool, ui_style: bool, *, timestamps=None) -> str:
+    from codex_exporter.timestamps import TimestampFormatter
+    formatter = timestamps or TimestampFormatter()
+    stamp = formatter.markdown(rec.timestamp)
     if plain or ui_style:
-        return rec.text.rstrip()
+        return stamp + rec.text.rstrip()
     heading_role = rec.role.capitalize()
-    stamp = f" · {rec.timestamp}" if rec.timestamp else ""
     idx = f"{index}. " if index is not None else ""
-    return f"## {idx}{heading_role}{stamp}\n\n{rec.text.rstrip()}"
+    return f"## {idx}{heading_role}\n\n{stamp}{rec.text.rstrip()}"
 
 
-def render_export(records: list[Record], title: str, source: Path, mode: str, plain: bool, ui_style: bool, include_meta: bool, *, source_sha: str | None = None) -> str:
+def render_export(records: list[Record], title: str, source: Path, mode: str, plain: bool, ui_style: bool, include_meta: bool, *, source_sha: str | None = None, show_timestamps: bool = True, timestamp_timezone: str = 'local') -> str:
+    from codex_exporter.timestamps import TimestampFormatter
+    timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
     if plain or ui_style:
-        return "\n\n".join(r.text.rstrip() for r in records if r.text.strip()).rstrip() + "\n"
-
+        return "\n\n".join(render_record(r, None, plain, ui_style, timestamps=timestamps)
+                            for r in records if r.text.strip()).rstrip() + "\n"
     parts: list[str] = [f"# {title}", ""]
     if include_meta:
         sha = source_sha if source_sha is not None else source_file_sha256(source)
-        parts.extend(
-            [
-                "## Export metadata",
-                f"- Source JSONL: `{source}`",
-                f"- Source SHA256: `{sha}`",
-                f"- Mode: `{mode}`",
-                f"- Token count method: `{token_counter_info().get('method')}`",
-                f"- Token encoding: `{token_counter_info().get('encoding')}`",
-                f"- Exported: `{datetime.now().isoformat(timespec='seconds')}`",
-                "",
-            ]
-        )
+        parts.extend([
+            "## Export metadata",
+            f"- Source JSONL: `{source}`",
+            f"- Source SHA256: `{sha}`",
+            f"- Mode: `{mode}`",
+            f"- Token count method: `{token_counter_info().get('method')}`",
+            f"- Token encoding: `{token_counter_info().get('encoding')}`",
+            f"- Exported: `{datetime.now().isoformat(timespec='seconds')}`", "",
+        ])
     for i, rec in enumerate(records, 1):
-        parts.append(render_record(rec, i, plain=False, ui_style=False))
+        parts.append(render_record(rec, i, plain=False, ui_style=False, timestamps=timestamps))
         parts.append("")
     return "\n".join(parts).rstrip() + "\n"
 
@@ -3207,7 +3224,7 @@ def resolve_source_paths(args: argparse.Namespace, parser: argparse.ArgumentPars
     return result
 
 
-def main() -> int:
+def _main() -> int:
     configure_utf8_standard_streams()
     ap = argparse.ArgumentParser(
         prog="codex-export",
@@ -3225,7 +3242,7 @@ def main() -> int:
     ap.add_argument("--browse-query", default="", help="Initial literal browser search; words are AND matched")
     ap.add_argument("--browse-page-size", type=int, default=None, help="Browser rows per page (default: terminal height)")
     ap.add_argument("--browse-status", choices=['all', 'available', 'live', 'archived', 'missing'], default='all')
-    ap.add_argument("--browse-sort", choices=['recent', 'oldest', 'size', 'title', 'project'], default='recent')
+    ap.add_argument("--browse-sort", metavar="SPEC", default="recent")
     ap.add_argument("--project", metavar="NAME_OR_PATH", help="Export all indexed local rollouts for a project name or exact workspace path")
     ap.add_argument("--chatgpt-export", type=Path, metavar="ZIP_DIR_OR_JSON", help="Convert account-export ZIP, extracted directory, conversations.json or numbered shards")
     ap.add_argument("--chatgpt-audit", action="store_true", help="Read-only inventory of account-export conversation shards; no Markdown written")
@@ -3358,7 +3375,96 @@ def main() -> int:
     ap.add_argument("--tool-outputs", choices=["none", "summary", "tail", "full"], default="full")
     ap.add_argument("--max-tool-chars", type=int, default=20_000)
     ap.add_argument("--json", dest="json_result", action="store_true")
+    display = ap.add_argument_group('listing and Markdown presentation')
+    display.add_argument('--sort', metavar='FIELDS', default=None)
+    display.add_argument('--sort-order', choices=['auto', 'asc', 'desc'], default=None)
+    display.add_argument('--pager', choices=['auto', 'always', 'never'], default=None)
+    display.add_argument('--page-size', type=int, default=None, metavar='ROWS')
+    display.add_argument('--timestamps', action='store_true', default=None)
+    display.add_argument('--no-timestamps', dest='timestamps', action='store_false')
+    display.add_argument('--timestamp-timezone', default=None, metavar='ZONE')
+    config_group.add_argument('--set-default', action='append', metavar='KEY=VALUE')
+    pipeline.add_argument('--work-dir', type=Path, metavar='DIRECTORY', default=None)
+    from dataclasses import asdict
+    from codex_exporter.archive_pipeline import ArchiveSettings, package_export
+    from codex_exporter.preferences import DEFAULTS as DISPLAY_DEFAULTS, validate_preferences, update_preferences
+    from codex_exporter.cli_help import configure_help
+    configuration_error = None
+    try:
+        cfg = load_config()
+    except (RuntimeError, OSError) as exc:
+        cfg, configuration_error = {}, exc
+    saved_display = cfg.get('display_defaults') or {}
+    preferences = {**DISPLAY_DEFAULTS, **(saved_display if isinstance(saved_display, dict) else {})}
+    help_archive_fields = {key: value for key, value in (cfg.get('archive_defaults') or {}).items()
+                          if key in ArchiveSettings.__dataclass_fields__} if isinstance(cfg.get('archive_defaults') or {}, dict) else {}
+    help_archive = ArchiveSettings(**help_archive_fields)
+    archive_arg_fields = (('archive_enabled', 'archive'), ('copy_source', 'copy_source'),
+        ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'), ('archive_backend', 'backend'),
+        ('archive_level', 'level'), ('archive_method', 'method'), ('archive_dictionary', 'dictionary'),
+        ('archive_word_size', 'word_size'), ('archive_threads', 'threads'), ('archive_max_bytes', 'max_bytes'),
+        ('review', 'review'), ('review_chunk_bytes', 'review_chunk_bytes'), ('work_dir', 'work_dir'))
+    try:
+        help_output_directory = str(configured_out_dir(cfg))
+    except (TypeError, ValueError, OSError):
+        help_output_directory = str(FALLBACK_OUT_DIR) + ' (saved output path is invalid; inspect --show-config)'
+    configure_help(ap, version=__version__, defaults={**preferences, 'fast': None, 'progress': True,
+        'mode': 'last-response (thread with --browse or --since)',
+        **{argument: getattr(help_archive, field) for argument, field in archive_arg_fields},
+        'out_dir': help_output_directory,
+        'filename_template': cfg.get('filename_template') or DEFAULT_FILENAME_TEMPLATE})
+    if len(sys.argv) == 1:
+        ap.print_help()
+        return 0
     args = ap.parse_args()
+    if args.reset_config:
+        config_path().unlink(missing_ok=True)
+        print(config_path())
+        return 0
+    if configuration_error is not None:
+        ap.error(f'{configuration_error}. Use --reset-config to restore defaults or repair that file.')
+    if args.show_config:
+        print(json.dumps({"config_path": str(config_path()), **cfg}, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.stdout and args.json_result:
+        ap.error('--stdout emits Markdown and cannot share stdout with --json; choose one output representation')
+    if args.manifest_path:
+        args.manifest_path = args.manifest_path.expanduser().resolve()
+    if args.set_default:
+        try:
+            updated = update_preferences(cfg, args.set_default)
+        except ValueError as exc:
+            ap.error(str(exc))
+        save_config(cfg)
+        print(json.dumps(updated, indent=2, sort_keys=True))
+        return 0
+    for key in DISPLAY_DEFAULTS:
+        if getattr(args, key) is None:
+            setattr(args, key, preferences[key])
+    config_only = any((args.set_archive_default, args.show_archive_config, args.print_out_dir,
+        args.set_default_out_dir, args.choose_default_out_dir, args.set_filename_template,
+        args.print_filename_template, args.reset_filename_template, args.diagnose_archive,
+        args.diagnose_access, args.repair_access))
+    from codex_exporter.display import DisplaySettings, sort_rows, print_listing, validate_sort
+    try:
+        if not config_only:
+            if not isinstance(saved_display, dict) or set(saved_display) - set(DISPLAY_DEFAULTS):
+                raise ValueError('Saved display_defaults contains unknown keys or is not an object; inspect --show-config')
+            validate_preferences({key: getattr(args, key) for key in DISPLAY_DEFAULTS})
+        display_settings = DisplaySettings() if config_only else DisplaySettings(args.sort, args.sort_order, args.pager, args.page_size)
+        listing_kind = ('turns' if args.list_turns else 'messages' if args.list else
+                        'responses' if args.list_responses else 'sessions' if
+                        (args.list_sessions or args.audit_sessions or args.browse or args.chatgpt_audit) else 'events' if args.report_events else None)
+        if listing_kind:
+            validate_sort(args.sort, kind=listing_kind)
+        from codex_exporter.timestamps import TimestampFormatter
+        timestamp_formatter = TimestampFormatter() if config_only else TimestampFormatter(args.timestamps, args.timestamp_timezone)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if not any((args.session_ids, args.session_id, args.jsonl, args.project, args.sessions_file,
+                args.latest_session, args.chatgpt_export, args.review_from)) and any(
+                flag.startswith('--browse-') for flag in sys.argv[1:]):
+        args.browse = True
     if args.diagnose_archive:
         if any((args.session_ids, args.session_id, args.jsonl, args.project, args.sessions_file,
                 args.latest_session, args.browse, args.chatgpt_export, args.review_from,
@@ -3395,10 +3501,6 @@ def main() -> int:
     if args.session_ids:
         args.session_id = list(args.session_id or []) + args.session_ids
 
-    from dataclasses import asdict
-    from codex_exporter.archive_pipeline import ArchiveSettings, package_export
-
-    cfg = load_config()
     if args.set_archive_default:
         defaults = dict(cfg.get('archive_defaults') or {})
         conversions = {'archive': ('archive', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
@@ -3408,7 +3510,8 @@ def main() -> int:
                        'method': ('method', str), 'dictionary': ('dictionary', str),
                        'word_size': ('word_size', int), 'threads': ('threads', int),
                        'review': ('review', lambda x: x.lower() in ('true', 'yes', 'on', '1')),
-                       'review_chunk_bytes': ('review_chunk_bytes', int), 'max_bytes': ('max_bytes', int)}
+                       'review_chunk_bytes': ('review_chunk_bytes', int), 'max_bytes': ('max_bytes', int),
+                       'work_dir': ('work_dir', str)}
         for setting in args.set_archive_default:
             if '=' not in setting:
                 ap.error('--set-archive-default must use KEY=VALUE')
@@ -3433,24 +3536,6 @@ def main() -> int:
     if args.show_archive_config:
         print(json.dumps(asdict(ArchiveSettings(**(cfg.get('archive_defaults') or {}))), indent=2, sort_keys=True))
         return 0
-
-    archive_options = dict(cfg.get('archive_defaults') or {})
-    for argument, field in (('archive_enabled', 'archive'), ('copy_source', 'copy_source'),
-                            ('archive_cleanup', 'cleanup'), ('archiver_path', 'archiver'),
-                            ('archive_backend', 'backend'), ('archive_level', 'level'), ('archive_method', 'method'),
-                            ('archive_dictionary', 'dictionary'), ('archive_word_size', 'word_size'),
-                            ('archive_threads', 'threads'), ('archive_max_bytes', 'max_bytes'), ('review', 'review'),
-                            ('review_chunk_bytes', 'review_chunk_bytes')):
-        value = getattr(args, argument)
-        if value is not None:
-            archive_options[field] = value
-    try:
-        archive_settings = ArchiveSettings(**archive_options)
-        archive_settings.validate()
-    except (TypeError, ValueError) as exc:
-        ap.error(f'Invalid archive configuration: {exc}')
-    args.review = archive_settings.review
-    args.review_chunk_bytes = archive_settings.review_chunk_bytes
 
     if args.reset_config:
         config_path().unlink(missing_ok=True)
@@ -3490,12 +3575,28 @@ def main() -> int:
     if args.print_out_dir:
         print(configured_out_dir(cfg).resolve())
         return 0
+    archive_options = dict(cfg.get('archive_defaults') or {})
+    for argument, field in archive_arg_fields:
+        value = getattr(args, argument)
+        if value is not None:
+            archive_options[field] = str(value) if field == 'work_dir' else value
+    try:
+        archive_settings = ArchiveSettings(**archive_options)
+        archive_settings.validate()
+    except (TypeError, ValueError) as exc:
+        ap.error(f'Invalid archive configuration: {exc}')
+    args.review = archive_settings.review
+    args.review_chunk_bytes = archive_settings.review_chunk_bytes
+
     if args.list_sessions:
-        print_session_list(full_titles=args.full_session_titles)
+        print_session_list(full_titles=args.full_session_titles, settings=display_settings, json_output=args.json_result)
         return 0
     if args.audit_sessions:
         from codex_exporter.modern import audit
-        print(json.dumps(audit(codex_home(), args.project or ''), ensure_ascii=False, indent=2, default=str))
+        report = audit(codex_home(), args.project or '')
+        report['threads'] = sort_rows(report['threads'], kind='sessions', sort=args.sort, order=args.sort_order)
+        print_listing(json.dumps(report, ensure_ascii=False, indent=2, default=str).splitlines(),
+                      settings=display_settings, title='Session audit', json_output=args.json_result)
         return 0
     # Resolve interactive choices before a progress stage can redraw its prompt.
     if args.browse:
@@ -3504,7 +3605,7 @@ def main() -> int:
             ap.error('--browse cannot be combined with another source selector')
         try:
             chosen = browse_sessions(query=args.browse_query, page_size=args.browse_page_size,
-                                     status=args.browse_status, sort=args.browse_sort)
+                                     status=args.browse_status, sort=args.sort or args.browse_sort, sort_order=args.sort_order)
         except ValueError as exc:
             ap.error(str(exc))
         if not chosen:
@@ -3543,7 +3644,7 @@ def main() -> int:
     from codex_exporter.progress import ProgressReporter
     reporter = ProgressReporter(style=args.progress_style,
                                 enabled=args.progress if args.progress is not None else True)
-    with reporter:
+    with reporter, ExitStack() as job:
         from codex_exporter.review import review_existing_export, _validate_chunk_bytes
         try:
             _validate_chunk_bytes(args.review_chunk_bytes)
@@ -3563,6 +3664,8 @@ def main() -> int:
                         print(path)
 
         bundle_batch = False
+        private_outputs = False
+        publish_destinations: dict[str, Path] = {}
 
         def finish_export(result: dict[str, Any], snapshot: Any) -> dict[str, Any]:
             if result.get('file') and not result.get('skipped'):
@@ -3570,7 +3673,9 @@ def main() -> int:
                 settings = replace(archive_settings, archive=False, review=False) if bundle_batch else archive_settings
                 result = package_export(result, snapshot.path, settings, snapshot=snapshot,
                                         review=False if bundle_batch else args.review,
-                                        review_chunk_bytes=args.review_chunk_bytes, reporter=reporter)
+                                        review_chunk_bytes=args.review_chunk_bytes, reporter=reporter,
+                                        destination=publish_destinations.get(str(result['file'])),
+                                        private_output=private_outputs)
             return result
 
         if args.review_from:
@@ -3620,13 +3725,16 @@ def main() -> int:
                     conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
                     project_id=args.chatgpt_project_id,
                     progress=args.progress if args.progress is not None else sys.stderr.isatty())
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+                report['matched'] = sort_rows(report['matched'], kind='sessions', sort=args.sort or 'native', order=args.sort_order)
+                print_listing(json.dumps(report, ensure_ascii=False, indent=2).splitlines(),
+                    settings=display_settings, title='ChatGPT account export audit', json_output=args.json_result)
                 return 0
             out = args.out_dir.expanduser().resolve() if args.out_dir else configured_out_dir(cfg).expanduser().resolve()
             exported = export_chatgpt(args.chatgpt_export.expanduser().resolve(), out,
                 conversation_ids=args.chatgpt_id, title_match=args.chatgpt_title_regex,
                 project_id=args.chatgpt_project_id,
-                progress=args.progress if args.progress is not None else sys.stderr.isatty())
+                progress=args.progress if args.progress is not None else sys.stderr.isatty(),
+                show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
             if args.json_result:
                 print(json.dumps(exported, ensure_ascii=False))
             else:
@@ -3662,6 +3770,9 @@ def main() -> int:
             outputs = {'Markdown': destination}
             if args.manifest:
                 outputs['manifest'] = args.manifest_path or destination.with_suffix('.manifest.json')
+                if (archive_settings.archive and args.manifest_path
+                        and args.manifest_path.parent.resolve() != destination.parent.resolve()):
+                    ap.error('--manifest-path must be in the Markdown output directory for a flat archive; use --no-archive for a separate directory')
             if archive_settings.copy_source:
                 outputs['native JSONL'] = destination.with_suffix('.jsonl')
             if archive_settings.archive:
@@ -3694,6 +3805,11 @@ def main() -> int:
             DEFAULT_STABLE_FILENAME_TEMPLATE if args.stable_filenames
             else args.filename_template or str(cfg.get("filename_template") or DEFAULT_FILENAME_TEMPLATE)
         )
+        if bundle_batch:
+            from string import Formatter
+            aggregate_fields = {field for _, field, _, _ in Formatter().parse(template) if field}
+            if aggregate_fields & {'lines', 'tokens'}:
+                ap.error('An aggregate archive has per-session metrics; its filename template cannot use {lines} or {tokens}. Use {title}, {mode}, {stamp}, or --separate-archives.')
         if args.save_filename_template:
             cfg["filename_template"] = template
             save_config(cfg)
@@ -3704,16 +3820,115 @@ def main() -> int:
             if args.clipboard or args.stdout or args.no_file or args.wrap_md or args.save_as or not args.manifest or args.no_frontmatter or args.fence_turns or args.no_map or args.manifest_path is not None:
                 ap.error('--fast requires a normal file export with manifest (no clipboard/stdout/save-as/wrap)')
 
+        private_outputs = (archive_settings.archive and archive_settings.cleanup
+                           and not any((args.no_file, args.list, args.list_responses, args.list_turns)))
+        job_directory = None
+        if private_outputs:
+            from codex_exporter.storage import work_directory_parent, require_space
+            require_space(out_dir, 0, stage='final archive publication headroom')
+            work_parent = work_directory_parent(out_dir, archive_settings.work_dir)
+            job_directory = Path(job.enter_context(tempfile.TemporaryDirectory(prefix='.codex-job-', dir=work_parent)))
+
+        from codex_exporter.storage import error_context
+        error_work = job_directory or (Path(archive_settings.work_dir).expanduser() if archive_settings.work_dir else
+            Path(tempfile.gettempdir()) if any((args.no_file, args.list, args.list_responses, args.list_turns)) else out_dir)
+        job.enter_context(error_context(stage='snapshot or rendering', work_dir=error_work, output_dir=out_dir))
+
+        def archive_candidate(public_path: Path) -> Path | None:
+            from codex_exporter.archive_pipeline import avoid_existing_archive
+            try:
+                return avoid_existing_archive(public_path, args.collision)
+            except FileExistsError:
+                if args.collision != 'skip':
+                    raise
+                return None
+
+        reserved_output_paths: set[str] = set()
+
+        def claim_output(public_path: Path) -> Path | None:
+            original = public_path
+            counter = 1
+            while True:
+                candidate = archive_candidate(public_path) if archive_settings.archive else public_path
+                if candidate is None:
+                    return None
+                candidate = resolve_collision(candidate, args.collision)
+                if candidate is None:
+                    return None
+                key = str(candidate.resolve()).casefold()
+                if key not in reserved_output_paths:
+                    reserved_output_paths.add(key)
+                    return candidate
+                if args.collision == 'skip':
+                    return None
+                if args.collision != 'rename':
+                    raise FileExistsError('Two selected sources resolve to the same output name; use --collision rename or a unique filename template: ' + str(candidate))
+                counter += 1
+                public_path = original.with_name(f'{original.stem}-{counter}{original.suffix}')
+
+        def skip_export(public_path: Path, session_id: str) -> None:
+            results.append({'file': None, 'skipped': True, 'requested_output': str(public_path),
+                            'session_id': session_id, 'skip_reason': 'An output already exists'})
+            if not args.json_result:
+                print(f'Skipped existing output: {public_path}', file=sys.stderr)
+
+        def rendered_path(public_path: Path) -> Path:
+            if not private_outputs:
+                return public_path
+            assert job_directory is not None
+            # One private subdirectory per source prevents collision with explicit
+            # manifest names and batch members while retaining the public basename.
+            folder = job_directory / f'export-{len(publish_destinations) + 1:04d}'
+            folder.mkdir()
+            staged = folder / public_path.name
+            publish_destinations[str(staged)] = public_path.with_suffix('.zip')
+            return staged
+
+        def record_turn_listing(index, source_path, session_id):
+            rows = sort_rows(turn_rows(index), kind='turns', sort=args.sort, order=args.sort_order)
+            excluded = len(index.injected_context_lines)
+            turn_listings.append({'source': str(source_path), 'session_id': session_id,
+                'turn_index_policy': 'human_user_turns_v2', 'source_prefix_sha256': index.sha256,
+                'source_prefix_bytes': index.size_bytes,
+                'source_physical_bytes_at_open': index.physical_size_bytes,
+                'deferred_tail_bytes': index.deferred_tail_bytes,
+                'context_records_excluded_from_anchors': excluded,
+                'turns': rows})
+            if excluded:
+                print(f'NOTE: {excluded:,} complete injected/service context records remain in the source but are not user-turn anchors. '
+                      'Inspect this listing before reusing numeric selectors from older versions; native IDs and source lines stay stable.', file=sys.stderr)
+            if not args.json_result:
+                lines = [f'User turns: {source_path}']
+                for row in rows:
+                    stamp = ''.join(c for c in (row['timestamp'] or '-') if c.isprintable())
+                    turn_id = ''.join(c for c in (row['turn_id'] or '-') if c.isprintable())
+                    lines.append(f"{row['turn']:>5}  {stamp}  {turn_id}  {row['preview']}")
+                print_listing(lines, settings=display_settings, title=f'User turns: {source_path}')
+
         results: list[dict[str, Any]] = []
         clipboard_parts: list[str] = []
         fast_catalog = None
         base_args = args
         turn_listings: list[dict[str, Any]] = []
+        record_listings: list[dict[str, Any]] = []
         for source_path, supplied_sid in sources:
             args = copy.copy(base_args)
             from codex_exporter.snapshot import snapshot_source
-            from codex_exporter.selection import index_turns, resolve_since, excerpt_turns, excerpt_records, turn_rows
-            staging_dir = out_dir if not (args.no_file or args.list or args.list_responses or args.list_turns) else None
+            from codex_exporter.selection import index_turns, index_live_turns, resolve_since, excerpt_turns, excerpt_records, turn_rows
+            if args.list_turns and source_path.suffix.casefold() != '.zst':
+                try:
+                    turn_index = index_live_turns(source_path, progress=reporter)
+                except ValueError as exc:
+                    ap.error(str(exc))
+                record_turn_listing(turn_index, source_path, supplied_sid)
+                continue
+            if job_directory is not None:
+                staging_dir = job_directory
+            elif archive_settings.work_dir:
+                from codex_exporter.storage import work_directory_parent
+                staging_dir = work_directory_parent(out_dir, archive_settings.work_dir)
+            else:
+                staging_dir = out_dir if not (args.no_file or args.list or args.list_responses or args.list_turns) else None
             with snapshot_source(source_path, directory=staging_dir, reporter=reporter) as snapshot:
                 preselected = False
                 needs_turns = args.list_turns or args.since or (not args.live_context and not (args.list or args.list_responses)
@@ -3725,15 +3940,11 @@ def main() -> int:
                     except ValueError as exc:
                         ap.error(str(exc))
                     if args.list_turns:
-                        rows = turn_rows(turn_index)
-                        turn_listings.append({'source': str(source_path), 'session_id': supplied_sid, 'turns': rows})
-                        if not args.json_result:
-                            print(f'User turns: {source_path}')
-                            for row in rows:
-                                stamp = ''.join(c for c in (row['timestamp'] or '-') if c.isprintable())
-                                turn_id = ''.join(c for c in (row['turn_id'] or '-') if c.isprintable())
-                                print(f"{row['turn']:>5}  {stamp}  {turn_id}  {row['preview']}")
+                        record_turn_listing(turn_index, source_path, supplied_sid)
                         continue
+                    if turn_index.injected_context_lines:
+                        print(f'NOTE: Turn indexing excluded {len(turn_index.injected_context_lines):,} complete context envelopes from human turn anchors; '
+                              'their native bytes remain in the selected interval. Numeric selectors may differ from older versions.', file=sys.stderr)
                     start_turn, stop_turn = None, None
                     descriptor = mode_descriptor(args)
                     try:
@@ -3804,8 +4015,12 @@ def main() -> int:
                     if sid[-8:].lower() not in filename.lower():
                         filename = safe_export_filename(Path(filename).stem + '_' + sid[-8:] + '.md')
                     from codex_exporter.archive_pipeline import avoid_existing_archive
-                    stream_path = avoid_existing_archive(fast_out / filename, args.collision) if archive_settings.archive else fast_out / filename
+                    stream_path = claim_output(fast_out / filename)
+                    if stream_path is None:
+                        skip_export(fast_out / filename, sid)
+                        continue
                     validate_destination(stream_path)
+                    stream_path = rendered_path(stream_path)
                     result = stream_export(snapshot.path, stream_path, session_id=sid, title=title,
                         title_source=title_source, snapshot=snapshot, mode=mode_descriptor(args),
                         include_reasoning_summaries=args.reasoning_summaries,
@@ -3814,7 +4029,8 @@ def main() -> int:
                         max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines,
                         source_truncation=args.source_truncation, unknown_events=args.unknown_events,
                         collision=args.collision, redact=args.redact, strict_events=args.strict_events,
-                        reporter=reporter, protected_sources=protected_sources)
+                        reporter=reporter, protected_sources=protected_sources,
+                        show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
                     validate_destination(Path(result["file"]))
                     result = finish_export(result, snapshot)
                     results.append(result)
@@ -3843,14 +4059,19 @@ def main() -> int:
                         progress=meter,
                     )
                 if args.report_events:
-                    report_event_audit(meta)
+                    event_settings = display_settings if not any((args.list, args.list_responses, args.list_turns)) else DisplaySettings(pager=args.pager, page_size=args.page_size)
+                    report_event_audit(meta, settings=DisplaySettings(sort=event_settings.sort,
+                        sort_order=event_settings.sort_order, pager='never' if args.json_result else event_settings.pager,
+                        page_size=event_settings.page_size))
                 if args.strict_events and sum(counter_to_dict(meta.get("_unknown_event_types")).values()):
                     raise RuntimeError("Unknown event schemas were detected; inspect --report-events or the manifest.")
                 if args.list:
-                    print_message_list(records)
+                    rows = print_message_list(records, settings=display_settings, json_output=args.json_result)
+                    record_listings.append({'source': str(source_path), 'messages': rows})
                     continue
                 if args.list_responses:
-                    print_response_list(records)
+                    rows = print_response_list(records, settings=display_settings, json_output=args.json_result)
+                    record_listings.append({'source': str(source_path), 'responses': rows})
                     continue
 
                 scoped = select_last_n_turns(records, args.last_n_turns)
@@ -3873,11 +4094,11 @@ def main() -> int:
                 descriptor = mode_descriptor(args)
                 with reporter.stage("Render selected records", unit="records", detail=f"{len(selected_records):,} selected records"):
                     if args.mode == "thread" and not args.plain:
-                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
                     elif args.mode == "turn" and not args.plain and not args.ui_style:
-                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
                     else:
-                        text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256)
+                        text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
                 with reporter.stage("Normalize rendered text", unit="steps"):
                     if not args.keep_mojibake:
                         text = cp437_cp1252_mojibake_repair(text)
@@ -3904,12 +4125,13 @@ def main() -> int:
                         if args.remember_out_dir:
                             cfg["last_out_dir"] = str(candidate.parent.resolve())
                             save_config(cfg)
-                    if archive_settings.archive:
-                        from codex_exporter.archive_pipeline import avoid_existing_archive
-                        candidate = avoid_existing_archive(candidate, args.collision)
-                    output_path = resolve_collision(candidate, args.collision)
+                    output_path = claim_output(candidate)
+                    if output_path is None:
+                        skip_export(candidate, effective_sid)
+                        continue
                     if output_path is not None:
                         validate_destination(output_path)
+                        output_path = rendered_path(output_path)
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         with reporter.stage("Write Markdown", unit="files", total=1) as meter:
                             output_path.write_text(text, encoding="utf-8", newline="\n")
@@ -3919,7 +4141,12 @@ def main() -> int:
                 if args.manifest:
                     with reporter.stage("Write manifest", unit="files", total=1) as meter:
                         manifest = build_manifest(source=source_path, output=output_path, session_id=effective_sid, title=title, mode=descriptor, records=selected_records, meta=meta, text=text, redacted=args.redact, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata)
-                        manifest_path = write_manifest(manifest, output_path, args.manifest_path)
+                        manifest['timestamp_policy'] = timestamp_formatter.metadata()
+                        if output_path and private_outputs:
+                            manifest['output']['path'] = str(publish_destinations[str(output_path)].with_suffix('.md'))
+                        explicit_manifest = (output_path.parent / args.manifest_path.name
+                            if private_outputs and output_path and args.manifest_path else args.manifest_path)
+                        manifest_path = write_manifest(manifest, output_path, explicit_manifest)
                         meter.update(1)
                 if args.stdout:
                     if len(sources) > 1:
@@ -3949,13 +4176,28 @@ def main() -> int:
         if bundle_batch and results:
             from codex_exporter.batch_archive import package_batch
             from codex_exporter.archive_pipeline import avoid_existing_archive
-            label = safe_slug(args.project or 'batch', max_len=50)
-            candidate = avoid_existing_archive(out_dir / f'codex_{label}_{export_stamp()}.md', args.collision)
-            bundled = package_batch(results, candidate.with_suffix('.zip'), archive_settings, reporter=reporter)
-            results = [bundled]
-            report_output(bundled)
-            if args.open_after and preferred_output(bundled):
-                open_in_file_manager(Path(preferred_output(bundled)), select=True)
+            batch_template = template.replace('{counts}', '')
+            batch_name = render_filename(batch_template, title=args.project or 'selected_sessions', mode='batch',
+                session_id='', text='', include_session_short_id=False)
+            candidate = archive_candidate(out_dir / batch_name)
+            if candidate is None:
+                skipped_sources = results
+                results = [{'skipped': True, 'skip_reason': 'An aggregate archive already exists',
+                            'requested_output': str((out_dir / batch_name).with_suffix('.zip')),
+                            'exports': skipped_sources}]
+                if not args.json_result:
+                    print(f'Skipped existing batch archive: {out_dir / batch_name}', file=sys.stderr)
+            else:
+                bundled = package_batch(results, candidate.with_suffix('.zip'), archive_settings, reporter=reporter)
+                results = [bundled]
+                report_output(bundled)
+                if args.open_after and preferred_output(bundled):
+                    open_in_file_manager(Path(preferred_output(bundled)), select=True)
+        if args.list or args.list_responses:
+            reporter.finish(detail=f'{len(record_listings):,} source listing(s)')
+            if args.json_result:
+                print(json.dumps(record_listings[0] if len(record_listings) == 1 else record_listings, ensure_ascii=False))
+            return 0
         if args.list_turns:
             reporter.finish(detail=f"{sum(len(item['turns']) for item in turn_listings):,} user turns")
             if args.json_result:
@@ -3967,6 +4209,19 @@ def main() -> int:
         if args.json_result:
             print(json.dumps(results[0] if len(results) == 1 else results, ensure_ascii=False))
         return 0
+
+
+def main() -> int:
+    try:
+        return _main()
+    except OSError as exc:
+        import errno
+        if exc.errno not in (errno.ENOSPC, getattr(errno, 'EDQUOT', -1)):
+            raise
+        print(f'ERROR: {exc}\nThe current job stopped and its owned temporary files were cleaned. '
+              'Choose a work drive with more free space using --work-dir DIRECTORY, '
+              'and verify free space on the output drive. Original Codex sources were not deleted.', file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

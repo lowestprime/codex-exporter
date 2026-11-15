@@ -25,6 +25,8 @@ function Assert-Forward {
     }
 }
 $cases = @(
+    @{ Name='codex-exporter alias'; Call={ codex-exporter --codex-home $homeOption } },
+    @{ Name='help'; Call={ cdx-help --codex-home $homeOption } },
     @{ Name='sessions'; Call={ cdx-sessions --codex-home $homeOption } },
     @{ Name='browse'; Call={ cdx-browse --browse-query 'anchor words' --browse-page-size 5 --codex-home $homeOption } },
     @{ Name='config'; Call={ cdx-config --codex-home $homeOption } },
@@ -65,7 +67,13 @@ foreach ($stage in @('base','overrides')) {
     Assert-Forward "$stage turns" {
         cdx-turns $id --codex-home $homeOption
     } @('--list-turns')
-    Write-Host "PASS: $stage helper forwarding ($($cases.Count + 2) checks)"
+    Assert-Forward "$stage listing controls" {
+        cdx-sessions --sort 'project:asc,modified:desc' --sort-order asc --pager auto --page-size 20 --codex-home $homeOption
+    } @('--sort','project:asc,modified:desc','--sort-order','asc','--pager','auto','--page-size','20')
+    Assert-Forward "$stage turn paging" {
+        cdx-turns $id --sort turn:desc --pager never --codex-home $homeOption
+    } @('--list-turns','--sort','turn:desc','--pager','never')
+    Write-Host "PASS: $stage helper forwarding ($($cases.Count + 4) checks)"
 }
 Assert-Forward 'Invoke-CodexThreadExport typed selectors' {
     Invoke-CodexThreadExport $id -Mode thread -SinceText 'exact anchor' -SinceOccurrence 2 -ArchiveMaxBytes 512000000 --codex-home $homeOption

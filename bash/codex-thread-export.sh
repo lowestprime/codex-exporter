@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Exporter bash/zsh helper functions (v0.4+).
+# Codex Exporter bash/zsh helper functions (v0.5+).
 # Source from ~/.bashrc, ~/.zshrc, or another shell profile.
 
 _codex_export_resolve_script() {
@@ -82,6 +82,11 @@ _codex_export_require() {
     fi
 }
 
+# Listing controls are forwarded verbatim. Quote a multi-key sort in every shell:
+# cdx-sessions --sort 'project:asc,modified:desc' --pager auto
+# cdx-turns UUID --sort turn:desc --page-size 20
+codex-exporter() { _codex_export_run "$@"; }
+cdx-help() { _codex_export_run --help "$@"; }
 cdx-sessions() { _codex_export_run --list-sessions "$@"; }
 cdx-browse() { _codex_export_run --browse --mode thread "$@"; }
 cdx-config() { _codex_export_run --show-config "$@"; }

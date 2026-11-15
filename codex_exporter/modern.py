@@ -19,6 +19,7 @@ import sys
 import time
 
 from .progress import ProgressReporter
+from .timestamps import TimestampFormatter
 
 if TYPE_CHECKING:
     from .snapshot import SourceSnapshot
@@ -191,6 +192,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                   collision: str = 'rename', progress: bool = True, redact: bool = False, strict_events: bool = False,
                   source_truncation: str = 'annotate', unknown_events: str = 'report',
                   mode: str = 'thread',
+                  show_timestamps: bool = True, timestamp_timezone: str = 'local',
                   snapshot: SourceSnapshot | None = None,
                   reporter: ProgressReporter | None = None,
                   protected_sources=()) -> dict[str, Any]:
@@ -200,6 +202,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
     string, full source read_bytes(), whole-thread tokenization, or source write.
     """
     from . import cli
+    timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
     reporter = reporter if reporter is not None else ProgressReporter(enabled=progress)
     if unknown_events not in {'report', 'sidecar'}:
         raise ValueError('unknown_events must be report or sidecar')
@@ -371,8 +374,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                             marker_locations.append({'source_line': line_no, 'rendered_record': counts['rendered_records']})
                     label = (rec.role or rec.kind or 'event').replace('\n', ' ').strip()
                     output.write(f'### Event {line_no} — {label} ({rec.kind})\n\n')
-                    if rec.timestamp:
-                        output.write(f'Timestamp: `{rec.timestamp}`  \n')
+                    output.write(timestamps.markdown(rec.timestamp))
                     output.write(f'Event schema: `{key}`  \nSource JSONL line: `{line_no}`\n\n')
                     output.write(cli.redact(rec.text, redact).rstrip() + '\n\n')
                 output.write('\n## Export integrity and truncation notes\n\n')
@@ -418,6 +420,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                         'parse_error_samples': error_samples, 'truncation_marker_locations': marker_locations,
                         'upstream_truncations': upstream_truncations,
                         'source_truncation_policy': source_truncation, 'redacted': redact,
+                        'timestamp_policy': timestamps.metadata(),
                         'unknown_events_policy': unknown_events, 'unknown_sidecar': str(sidecar) if sidecar else None,
                         'text_fidelity': 'rendered_text_only; original JSONL remains authoritative',
                         'partial_final_line_possible': counts['parse_errors'] > 0}

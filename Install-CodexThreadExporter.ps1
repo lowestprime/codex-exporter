@@ -1,4 +1,4 @@
-# Installs Codex Exporter 0.4+ and safely replaces its marked PowerShell profile block.
+# Installs Codex Exporter 0.5+ and safely replaces its marked PowerShell profile block.
 [CmdletBinding()]
 param(
     [string]$InstallDir = 'C:\projects\CodexTools',
@@ -58,7 +58,7 @@ $pythonLiteral = $PythonPath.Replace("'", "''")
 $helper = (Get-Content -LiteralPath $sourceHelper -Raw).Trim()
 $helper = $helper.Replace("'C:\projects\CodexTools\Export-CodexThread.py'", $scriptLiteral)
 $helper = $helper.Replace('__CODEX_EXPORT_PYTHON__', $pythonLiteral)
-$overrideLoader = "# CodexExporter-ArchiveOverrides (v0.4.0)`r`n. '$($installedOverrides.Replace("'", "''"))'`r`n"
+$overrideLoader = "# CodexExporter-ArchiveOverrides (v0.5.0)`r`n. '$($installedOverrides.Replace("'", "''"))'`r`n"
 $helper = $helper.Replace('# <<< Codex Thread Exporter helpers <<<', $overrideLoader + '# <<< Codex Thread Exporter helpers <<<')
 Set-Content -LiteralPath $installedHelper -Value $helper -Encoding utf8NoBOM
 

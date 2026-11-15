@@ -99,10 +99,13 @@ class BoundedPart:
     member_methods: dict[str, str]
     provenance: dict[str, Any] | None = None
     _pieces: list[_Piece] = field(default_factory=list, repr=False)
+    _size_bytes: int | None = field(default=None, repr=False)
+    packing: dict[str, Any] | None = None
+    lzma_dictionary_bytes: dict[str, int] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
-        return self.path.stat().st_size
+        return self._size_bytes if self._size_bytes is not None else self.path.stat().st_size
 
     @property
     def members(self) -> list[str]:
@@ -262,9 +265,7 @@ def _segment(original: _Piece, *, base: dict, index_name: str, max_bytes: int,
                 suffix = Path(original.original).suffix
                 # Avoid path-length growth from an already-long export basename.
                 extension = suffix if starts and ends and suffix.lower() in ('.jsonl', '.md', '.txt') else suffix + '.bytes'
-                name = f'segment-{number:04d}-{ordinal:06d}{extension}'
-                while name in used_names:
-                    name = '_' + name
+                name = unique_segment_member_name(original.original, ordinal, extension, used_names)
                 chunk = work / name
                 digest = _copy_range(original.source, chunk, offset, end - offset)
                 zipped = work / f'compressed-{number:04d}-{ordinal:06d}-{attempts:02d}.zip'
@@ -489,9 +490,10 @@ def archive_destinations(base: Path, count: int) -> list[Path]:
 
 
 def publish_parts(parts: list[BoundedPart], destination: Path, *, max_bytes: int,
-                  reporter=None, publisher=None) -> tuple[list[Path], list[str]]:
+                  reporter=None, publisher=None, consume: bool = False) -> tuple[list[Path], list[str]]:
     """Publish only a fully verified set, rolling back our own files on failure."""
-    from .file_access import publish_file
+    from .file_access import publish_file, hardlink_publication_allowed
+    from .storage import require_space, same_volume
     validate_max_bytes(max_bytes)
     publisher = publisher or publish_file
     destinations = archive_destinations(destination, len(parts))
@@ -500,6 +502,13 @@ def publish_parts(parts: list[BoundedPart], destination: Path, *, max_bytes: int
             raise RuntimeError('Refusing to publish an archive over its byte limit')
         if target.exists():
             raise FileExistsError(f'Refusing to replace an existing ZIP: {target}')
+    total_bytes = sum(part.size_bytes for part in parts)
+    colocated = all(same_volume(part.path.parent, Path(destination).parent) for part in parts)
+    # Consuming verified private parts bounds Windows publication overhead to
+    # one part instead of another full archive set. POSIX links allocate no data.
+    needed = (0 if colocated and hardlink_publication_allowed() else
+              max(part.size_bytes for part in parts) if colocated and consume else total_bytes)
+    require_space(Path(destination).parent, needed, stage='publish verified archive set')
     published: list[tuple[Path, tuple]] = []
     strategies: list[str] = []
     try:
@@ -508,6 +517,17 @@ def publish_parts(parts: list[BoundedPart], destination: Path, *, max_bytes: int
             info = target.stat()
             signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             published.append((target, signature))
+            if consume:
+                if part.path.resolve() == target.resolve():
+                    raise ValueError('Cannot consume an archive at its own destination')
+                part._size_bytes = part.size_bytes
+                part.path.unlink()
+                part.path = target
+                # Removing a POSIX hard link changes the destination inode's
+                # ctime. Track the post-consumption identity for safe rollback.
+                info = target.stat()
+                signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                published[-1] = (target, signature)
             if info.st_size > max_bytes:
                 raise RuntimeError('Published archive exceeded its byte limit')
     except BaseException:
@@ -521,3 +541,367 @@ def publish_parts(parts: list[BoundedPart], destination: Path, *, max_bytes: int
                 pass
         raise
     return destinations, strategies
+
+
+def segment_member_name(original: str, ordinal: int, extension: str | None = None) -> str:
+    """Keep each segment's original export stem, suffix and stable identity."""
+    original_path = Path(original)
+    suffix = extension if extension is not None else original_path.suffix
+    tail = f'.segment{ordinal:06d}{suffix}'
+    stem = original_path.stem
+    name = stem + tail
+    if len(name.encode('utf-8')) > 255:
+        tail = '-' + hashlib.sha256(original.encode('utf-8')).hexdigest()[:12] + tail
+        budget = 255 - len(tail.encode('utf-8'))
+        if budget < 1:
+            raise ValueError('Segment suffix exceeds the filename limit')
+        name = stem.encode('utf-8')[:budget].decode('utf-8', errors='ignore').rstrip(' .') + tail
+    return name
+
+
+
+def unique_segment_member_name(original: str, ordinal: int, extension: str,
+                               used_names: set[str]) -> str:
+    name = segment_member_name(original, ordinal, extension)
+    collision = 1
+    while name in used_names:
+        collision += 1
+        path = Path(original)
+        alternate = f'{path.stem}-{collision}{path.suffix}'
+        name = segment_member_name(alternate, ordinal, extension)
+    return name
+
+
+def _provenance_base(members: dict[str, Path], checksums: dict[str, tuple[str, int]],
+                     max_bytes: int, method: str) -> tuple[dict, str]:
+    index_name = _INDEX_NAME
+    while index_name in members:
+        index_name = '_' + index_name
+    inventory = [(name, *checksums[name]) for name in sorted(members)]
+    return {
+        'schema': 'codex-export.archive-part.v1', 'export_id': uuid.uuid4().hex,
+        'max_archive_bytes': max_bytes, 'requested_method': method,
+        'original_member_count': len(members),
+        'inventory_encoding': 'UTF-8 JSON [filename,sha256,bytes] rows sorted by filename; ensure_ascii=false; no spaces',
+        'inventory_sha256': hashlib.sha256(json.dumps(inventory, ensure_ascii=False,
+                                                     separators=(',', ':')).encode('utf-8')).hexdigest(),
+        'packing_strategy': 'measured compressed sizes; first-fit decreasing with bounded exact packing for modest inventories',
+        'reassembly': 'Collect all parts with this export_id. For each original filename, concatenate members '
+                      'in offset order; require no gaps/overlaps and verify original_bytes and original_sha256. '
+                      'Byte fragments may split a record or UTF-8 character; reassemble them before parsing.',
+    }, index_name
+
+
+def _pack_pieces(pieces: list[_Piece], base: dict, index_name: str,
+                 max_bytes: int, *, diagnostics: dict | None = None) -> list[list[_Piece]]:
+    bins: list[list[_Piece]] = []
+    sizes: list[int] = []
+    weighted = [(piece, _info_weight(piece.info) + len(_json_bytes(piece.record())))
+                for piece in pieces]
+    for piece, weight in sorted(weighted, key=lambda item: item[1], reverse=True):
+        for index, group in enumerate(bins):
+            extra_zip64 = 76 if len(group) + 1 == zipfile.ZIP_FILECOUNT_LIMIT else 0
+            proposed = sizes[index] + weight + extra_zip64
+            if proposed <= max_bytes:
+                group.append(piece)
+                sizes[index] = proposed
+                break
+        else:
+            proposed = _planned_size(base, [piece], index_name)
+            if proposed > max_bytes:
+                raise RuntimeError('A compressed segment plus its provenance exceeds the archive cap')
+            bins.append([piece])
+            sizes.append(proposed)
+    initial_count = len(bins)
+    payload_lower = max(1, (sum(piece.info.compress_size for piece in pieces) + max_bytes - 1) // max_bytes)
+    stats = {'algorithm': 'first_fit_decreasing', 'initial_parts': initial_count,
+             'compressed_payload_lower_bound': payload_lower, 'search_nodes': 0,
+             'search_exhausted': False, 'fixed_piece_minimum_proved': initial_count == payload_lower}
+    # ZIP compression streams are already fixed. For modest inventories, search
+    # the remaining packing problem with actual final counter widths and a hard
+    # node budget. This can improve FFD without any extra compression or disk I/O.
+    ordered = sorted(weighted, key=lambda item: item[1], reverse=True)
+    if len(pieces) <= 28 and len(pieces) < zipfile.ZIP_FILECOUNT_LIMIT and initial_count > payload_lower:
+        total_weight = sum(weight for _, weight in ordered)
+        node_budget = 100_000
+        all_smaller_excluded = True
+        for desired in range(payload_lower, initial_count):
+            capacities = []
+            for number in range(1, desired + 1):
+                content = _json_bytes(_metadata(base, [], number, desired))
+                empty_size = 22 + 30 + 46 + 2 * len(index_name.encode('ascii')) + len(content)
+                capacities.append(max_bytes - empty_size + 1)
+            if total_weight > sum(capacities) or ordered[0][1] > max(capacities):
+                continue
+            remaining = list(capacities)
+            groups: list[list[_Piece]] = [[] for _ in capacities]
+            failed = set()
+            exhausted = False
+
+            def place(index: int) -> bool:
+                nonlocal exhausted
+                stats['search_nodes'] += 1
+                if stats['search_nodes'] > node_budget:
+                    exhausted = True
+                    return False
+                if index == len(ordered):
+                    return True
+                state = (index, tuple(sorted(remaining)))
+                if state in failed:
+                    return False
+                piece, weight = ordered[index]
+                seen_capacity = set()
+                for group_index in sorted(range(desired), key=lambda k: remaining[k]):
+                    available = remaining[group_index]
+                    if available < weight or available in seen_capacity:
+                        continue
+                    seen_capacity.add(available)
+                    remaining[group_index] -= weight
+                    groups[group_index].append(piece)
+                    if place(index + 1):
+                        return True
+                    groups[group_index].pop()
+                    remaining[group_index] += weight
+                    if exhausted:
+                        return False
+                failed.add(state)
+                return False
+
+            if place(0):
+                bins = groups
+                stats['algorithm'] = 'bounded_exact_packing'
+                stats['fixed_piece_minimum_proved'] = all_smaller_excluded
+                break
+            if exhausted:
+                stats['search_exhausted'] = True
+                all_smaller_excluded = False
+                break
+        else:
+            # All smaller counts were excluded for these encoded pieces and
+            # their actual metadata, even if the payload-only lower bound was loose.
+            stats['fixed_piece_minimum_proved'] = all_smaller_excluded
+    stats['parts'] = len(bins)
+    stats['scope'] = 'Already encoded pieces, independent ZIP headers and reconstruction metadata; not alternative codecs or segmentation choices'
+    if diagnostics is not None:
+        diagnostics.update(stats)
+    return bins
+
+
+def _verify_standalone(part: BoundedPart, checksums: dict[str, tuple[str, int]],
+                       method: str, reporter) -> None:
+    requested = zipfile.ZIP_LZMA if method.upper() == 'LZMA' else zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(part.path) as archive:
+        infos = archive.infolist()
+        if (len(infos) != len(checksums) or {info.filename for info in infos} != set(checksums)
+                or any(not _safe_name(info.filename) or info.is_dir() or info.flag_bits & 1
+                       or info.compress_type not in (requested, zipfile.ZIP_STORED) for info in infos)):
+            raise RuntimeError('ZIP member inventory or requested codec mismatch')
+        if (sum(info.file_size for info in infos) >= 65_536
+                and all(info.compress_type == zipfile.ZIP_STORED for info in infos)):
+            raise RuntimeError('Archive compressor stored all substantial payloads without the requested codec')
+        part.member_methods = {info.filename: _METHODS[info.compress_type] for info in infos}
+        with _stage(reporter, 'Verify complete archive', total=sum(size for _, size in checksums.values()),
+                    detail='Decode every member; verify CRC, byte counts and SHA-256') as meter:
+            done = 0
+            for info in infos:
+                digest = hashlib.sha256()
+                size = 0
+                with archive.open(info) as source:
+                    for block in iter(lambda: source.read(CHUNK_BYTES), b''):
+                        digest.update(block)
+                        size += len(block)
+                        done += len(block)
+                        if meter is not None:
+                            meter.update(done, detail=info.filename)
+                if (digest.hexdigest(), size) != checksums[info.filename]:
+                    raise RuntimeError(f'Archive member content mismatch: {info.filename}')
+
+
+def build_bounded_archives(members: dict[str, Path], *, work: Path, basename: str,
+                           max_bytes: int, method: str, compress_range: Callable,
+                           reporter=None, checksums: dict[str, tuple[str, int]] | None = None,
+                           consume_candidates: bool = True,
+                           estimated_ratios: dict[str, float] | None = None) -> list[BoundedPart]:
+    """Compress bounded ranges directly, then copy their encoded streams once.
+
+    A highly compressible large input remains a complete member and can still
+    produce one ordinary ZIP. No full oversized ZIP or raw range copies are
+    required. Compressed candidates are released as their assembled ZIP takes
+    ownership of the payload. Every original byte is decoded and checked before
+    any final publication. Packing uses actual sizes; global optimality is not
+    claimed for either arbitrary compression ratios or the bin-packing problem.
+    """
+    from .archive_stream import RangeTooLarge
+    from .storage import require_space
+    validate_max_bytes(max_bytes)
+    if not members or any(not _safe_name(name) for name in members):
+        raise ValueError('Bounded archiving requires distinct flat filenames')
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    if checksums is None:
+        checksums = {}
+        total = sum(path.stat().st_size for path in members.values())
+        with _stage(reporter, 'Checksum archive inputs', total=total,
+                    detail='Hash original members before compression; no duplicate source files') as meter:
+            done = 0
+            for name, source in members.items():
+                digest = hashlib.sha256()
+                size = 0
+                with source.open('rb') as stream:
+                    for block in iter(lambda: stream.read(CHUNK_BYTES), b''):
+                        digest.update(block)
+                        size += len(block)
+                        done += len(block)
+                        if meter is not None:
+                            meter.update(done, detail=name)
+                checksums[name] = (digest.hexdigest(), size)
+    if set(checksums) != set(members):
+        raise ValueError('Checksums must describe exactly the archive members')
+    base, index_name = _provenance_base(members, checksums, max_bytes, method)
+    pieces: list[_Piece] = []
+    candidates: set[Path] = set()
+    used_names = set(members) | {index_name}
+    def encode_member(original_name: str, source: Path, number: int, *,
+                      force_piece_budget: bool = False) -> list[_Piece]:
+        encoded = []
+        original_hash, original_size = checksums[original_name]
+        offset = 0
+        ordinal = 0
+        ratio_estimate = (estimated_ratios or {}).get(original_name)
+        next_target = None
+        if ratio_estimate and original_size * ratio_estimate > max_bytes * .95:
+            next_target = max(1, int(max_bytes / max(ratio_estimate, .000001) * .97))
+        while offset < original_size or (original_size == 0 and ordinal == 0):
+            ordinal += 1
+            remaining = original_size - offset
+            target = min(remaining, next_target) if next_target is not None else remaining
+            attempts = 0
+            # Only partial pieces need reconstruction metadata. A complete
+            # original near the cap must first get a chance to fit an ordinary
+            # ZIP, without paying for unnecessary multipart metadata.
+            provisional_name = segment_member_name(original_name, ordinal, Path(original_name).suffix + '.bytes')
+            placeholder = zipfile.ZipInfo(provisional_name)
+            placeholder.file_size = original_size
+            placeholder.compress_size = 0
+            proposed = _Piece(provisional_name, original_name, source, original_size,
+                              original_size, '0' * 64, original_size, original_hash,
+                              work / 'unused', placeholder, False, False)
+            metadata_budget = _planned_size(base, [proposed], index_name) - _info_weight(placeholder)
+            piece_limit = max_bytes - metadata_budget - max(0, len(provisional_name.encode('utf-8')) * 2)
+            if piece_limit < 256:
+                raise ValueError('Archive byte limit is too small for required member provenance')
+            while True:
+                end = _line_end(source, offset, target, original_size) if original_size else 0
+                count = end - offset
+                whole_attempt = offset == 0 and count == original_size and not force_piece_budget
+                limit = max_bytes if whole_attempt else piece_limit
+                marker = 'refined' if force_piece_budget else 'candidate'
+                candidate = work / f'{marker}-{number:04d}-{ordinal:06d}-{attempts:02d}.zip'
+                try:
+                    compressed = compress_range(candidate, original_name, source, offset, count, limit)
+                    actual = compressed.size_bytes
+                    if actual > count or (remaining and actual < 1):
+                        raise RuntimeError('Range compressor returned an invalid source byte count')
+                    end = offset + actual
+                    starts, ends = _line_boundaries(source, offset, end, original_size)
+                    whole = offset == 0 and actual == original_size
+                    extension = Path(original_name).suffix
+                    if not whole and not (starts and ends and extension.lower() in ('.jsonl', '.md', '.txt')):
+                        extension += '.bytes'
+                    name = original_name if whole else unique_segment_member_name(
+                        original_name, ordinal, extension, used_names)
+                    info = _read_info(candidate, original_name)
+                    info.filename = name
+                    info.orig_filename = name
+                    piece = _Piece(name, original_name, source, offset, actual, compressed.sha256,
+                                   original_size, original_hash, candidate, info, starts, ends)
+                    planned = _planned_size(base, [piece], index_name)
+                    if planned > max_bytes and not (whole and whole_attempt):
+                        raise RangeTooLarge(actual, planned, max_bytes)
+                except RangeTooLarge as overflow:
+                    candidate.unlink(missing_ok=True)
+                    attempts += 1
+                    if count <= 1:
+                        raise ValueError('Archive byte limit cannot hold member metadata and one source byte') from overflow
+                    consumed = overflow.input_bytes or min(count, max_bytes // 2)
+                    target = max(1, min(count - 1,
+                        int(consumed * piece_limit / max(piece_limit + 1, overflow.output_bytes) * .94)))
+                    if attempts >= 3:
+                        target = min(target, max(1, max_bytes // 2))
+                    continue
+                encoded.append(piece)
+                candidates.add(candidate)
+                used_names.add(name)
+                offset = end
+                # Carry an observed ratio forward instead of repeatedly feeding
+                # the whole remaining source into another oversized candidate.
+                if actual:
+                    overhead = candidate.stat().st_size - info.compress_size
+                    ratio = max(info.compress_size / actual, 0.000001)
+                    next_target = max(1, int(max(1, piece_limit - overhead) / ratio * .985))
+                break
+        return encoded
+
+    for number, (original_name, source) in enumerate(members.items(), 1):
+        pieces.extend(encode_member(original_name, source, number))
+    whole = all(piece.offset == 0 and piece.size == piece.original_size for piece in pieces)
+    plain_size = 22 + sum(_info_weight(piece.info) for piece in pieces)
+    if len(pieces) > zipfile.ZIP_FILECOUNT_LIMIT:
+        plain_size += 76
+
+    def release(group: list[_Piece]) -> None:
+        if not consume_candidates:
+            return
+        for piece in group:
+            if piece.archive in candidates:
+                piece.archive.unlink()
+                candidates.remove(piece.archive)
+
+    if whole and plain_size <= max_bytes:
+        path = work / Path(basename).name
+        require_space(work, plain_size, stage='assemble single verified archive')
+        with _stage(reporter, 'Assemble archive', total=len(pieces), unit='files',
+                    detail='Reuse compressed members; ordinary ZIP with original filenames') as meter:
+            with zipfile.ZipFile(path, 'x', allowZip64=True) as archive:
+                for number, piece in enumerate(pieces, 1):
+                    _copy_compressed(archive, piece)
+                    if meter is not None:
+                        meter.update(number, detail=piece.name)
+        if path.stat().st_size > max_bytes:
+            raise RuntimeError('Final archive exceeded the byte cap; nothing published')
+        release(pieces)
+        part = BoundedPart(path, {}, _pieces=pieces)
+        _verify_standalone(part, checksums, method, reporter)
+        return [part]
+    # A complete member just below the byte cap might fit by itself but not
+    # with the per-part index. Resegment only that rare boundary offender, after
+    # proving that all complete members cannot share one ordinary archive.
+    refined = []
+    for number, piece in enumerate(pieces, 1):
+        if _planned_size(base, [piece], index_name) > max_bytes:
+            piece.archive.unlink()
+            candidates.remove(piece.archive)
+            refined.extend(encode_member(piece.original, piece.source, len(members) + number,
+                                         force_piece_budget=True))
+        else:
+            refined.append(piece)
+    pieces = refined
+    packing = {}
+    groups = _pack_pieces(pieces, base, index_name, max_bytes, diagnostics=packing)
+    paths = archive_destinations(work / Path(basename).name, len(groups))
+    parts: list[BoundedPart] = []
+    with _stage(reporter, 'Assemble independent ZIP parts', total=len(groups), unit='files',
+                detail='Copy compressed streams once; retire each owned candidate after use') as meter:
+        for number, (path, group) in enumerate(zip(paths, groups), 1):
+            require_space(work, _planned_size(base, group, index_name),
+                          stage=f'assemble archive part {number} of {len(groups)}')
+            metadata = _metadata(base, group, number, len(groups))
+            _assemble(path, group, index_name, metadata)
+            if path.stat().st_size > max_bytes:
+                raise RuntimeError('Final ZIP size exceeded the cap; nothing published')
+            release(group)
+            parts.append(BoundedPart(path, {}, metadata, group, packing=packing))
+            if meter is not None:
+                meter.update(number, detail=f'{path.name}: {path.stat().st_size:,} bytes')
+    _verify_parts(parts, checksums, index_name, max_bytes, method, reporter)
+    return parts

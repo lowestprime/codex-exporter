@@ -234,3 +234,26 @@ def test_empty_catalog_and_invalid_options_do_not_start_input_loop():
     for options in ({'page_size': 0}, {'page_size': 201}, {'status': 'unknown'}, {'sort': 'unknown'}, {'width': 0}):
         with pytest.raises(ValueError):
             browser.browse_sessions(lambda: [], **options)
+
+
+def test_multikey_sort_and_order_preserve_displayed_selection_ids():
+    rows = [row(1, project='alpha', mtime=10), row(2, project='beta', mtime=20),
+            row(3, project='alpha', mtime=5)]
+    choices, output = run('1\n', rows, sort='project:asc,modified:desc', sort_order='desc')
+    assert choices == [row(1)['session_id']]
+    assert 'project:asc,modified:desc' in output
+    choices, _ = run('sort size:asc\norder desc\n1\n', rows)
+    assert choices == [row(1)['session_id']]  # per-field asc overrides global desc
+
+
+def test_project_count_sort_is_independent_of_session_sort():
+    rows = [row(1), row(2), row(3, project='other', cwd='/work/other')]
+    choices, output = run('m\nsort count:desc\n1\na\n', rows)
+    assert choices == [row(2)['session_id'], row(1)['session_id']]
+    assert 'sort count:desc' in output
+
+
+def test_enter_first_and_last_page_commands():
+    choices, output = run('\nfirst\nlast\n1\n')
+    assert choices == [row(1)['session_id']]
+    assert 'Page 2/2' in output

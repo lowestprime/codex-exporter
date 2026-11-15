@@ -32,7 +32,7 @@ def _ps_quote(value):
 
 @pytest.mark.skipif(not BASH, reason='Bash not installed')
 @pytest.mark.parametrize('command', [
-    'cdx-sessions', 'cdx-browse', 'cdx-config', 'cdx-tokenizer',
+    'codex-exporter', 'cdx-help', 'cdx-sessions', 'cdx-browse', 'cdx-config', 'cdx-tokenizer',
     'cdx-set-dir', 'cdx-set-dir "a directory"',
     'cdx-set-template', 'cdx-set-template "a template"',
     'cdx-latest', 'cdx-latest actions', 'cdx-list session',

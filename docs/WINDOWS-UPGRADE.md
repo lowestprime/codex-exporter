@@ -1,4 +1,4 @@
-# Windows upgrade to Codex Exporter 0.4.0
+# Windows upgrade to Codex Exporter 0.5.0
 
 Upgrade both the Python package and the PowerShell helpers. A wheel updates the
 exporter, while the source release supplies the installer and the new
@@ -15,7 +15,7 @@ backing up the exporter files/profile entries it replaces.
 
 ## Download, verify, and install the wheel and helpers
 
-Use the wheel and source distribution from the **same v0.4.0 release**. The code
+Use the wheel and source distribution from the **same v0.5.0 release**. The code
 checks both downloaded artifacts against that release's `SHA256SUMS.txt` before
 installing or extracting them. A checksum obtained from the same release verifies
 consistency with the published artifact list; it is not an independent
@@ -24,7 +24,7 @@ with separately verified pinned hashes, compare against those exact hashes.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$releaseVersion = '0.4.0'
+$releaseVersion = '0.5.0'
 $py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
 $archiver = 'C:\Program Files\7-Zip-Zstandard\7z.exe'
 $installDir = Join-Path $env:LOCALAPPDATA 'codex-exporter\tools'
@@ -99,7 +99,7 @@ with tarfile.open(sys.argv[1], 'r:gz') as archive:
     if ($helperVersion -ne $packageVersion) {
         throw "Helper routing differs: $helperVersion. Inspect CODEX_EXPORT_PYTHON and CODEX_THREAD_EXPORTER."
     }
-    foreach ($helperName in @('cdx-since', 'cdx-turns', 'cdx-browse')) {
+    foreach ($helperName in @('cdx-since', 'cdx-turns', 'cdx-browse', 'cdx-help', 'codex-exporter')) {
         Get-Command $helperName -CommandType Function -ErrorAction Stop | Out-Null
     }
     Write-Host "PASS: $packageVersion and current helpers installed."
@@ -268,3 +268,21 @@ A valid archive within the size ceiling does not guarantee that a receiving
 ChatGPT conversation materializes the upload, supports its decoder, parses every
 member, or reads all its contents. Diagnose the actual receiving runtime and use
 matching native excerpts or optional bounded review text for the needed scope.
+
+
+## New storage and listing preferences
+
+The upgrade preserves existing compression settings. `--work-dir` chooses an
+export-owned temporary workspace on another volume; it does not move the final
+output directory or purge existing files. For example, if D: is available:
+
+```powershell
+cdx-thread 'SESSION-ID' --work-dir 'D:\CodexExportWork'
+cdx-sessions --sort 'modified:desc,title:asc'
+cdx-turns 'SESSION-ID' --sort 'turn:desc' --page-size 24
+codex-export --set-default pager=auto --set-default timestamps=true
+```
+
+See [storage and presentation settings](LOW-DISK-EXPORTS-AND-LISTINGS.md) for all
+controls and timestamp-zone choices. A fitting archive still has the ordinary
+three members and no public review folder unless requested explicitly.

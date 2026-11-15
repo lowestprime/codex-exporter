@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import zipfile
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / 'Export-CodexThread.py'
@@ -92,18 +93,22 @@ def test_disable_archive_keep_copy(tmp_path):
     assert Path(result['file']).exists()
 
 
-def test_failure_keeps_export_triplet(tmp_path):
-    src,digest,arch,env=prepare(tmp_path,broken=True)
-    r=run(env,'--session-id',SID,'--mode','thread','--fast','--no-progress',
-          '--archiver-path',str(arch),'--out-dir',str(tmp_path/'out'))
-    assert r.returncode!=0
-    files=list((tmp_path/'out').iterdir())
-    assert len(list((tmp_path/'out').glob('*.md')))==1
-    assert len(list((tmp_path/'out').glob('*.jsonl')))==1
-    assert len(list((tmp_path/'out').glob('*.manifest.json')))==1
-    assert not [path for path in (tmp_path/'out').glob('*.zip')
-                if not path.name.endswith('.review.zip')]
-    assert src.exists()
+@pytest.mark.parametrize('keep_loose', [False, True])
+def test_failure_cleans_private_outputs_unless_loose_retention_was_requested(tmp_path, keep_loose):
+    src, digest, arch, env = prepare(tmp_path, broken=True)
+    extra = ('--no-archive-cleanup',) if keep_loose else ()
+    result = run(env, '--session-id', SID, '--mode', 'thread', '--fast', '--no-progress',
+                 '--archiver-path', str(arch), '--out-dir', str(tmp_path / 'out'), *extra)
+    assert result.returncode != 0
+    output = tmp_path / 'out'
+    if keep_loose:
+        assert len(list(output.glob('*.md'))) == 1
+        assert len(list(output.glob('*.jsonl'))) == 1
+        assert len(list(output.glob('*.manifest.json'))) == 1
+    else:
+        assert not list(output.iterdir())
+    assert not list(output.glob('*.zip'))
+    assert src.exists() and hashlib.sha256(src.read_bytes()).hexdigest() == digest
 
 
 def test_source_copy_disabled_two_member_archive(tmp_path):

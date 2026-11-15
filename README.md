@@ -1,4 +1,4 @@
-# Codex Exporter 0.4.0 — bounded live archives and exact turn selection
+# Codex Exporter 0.5.0 — low-disk live archives and navigable listings
 
 Export a running Codex thread with **every final ZIP at most 512,000,000 bytes**.
 A fitting single-session export contains the familiar three files: Markdown,
@@ -26,6 +26,31 @@ A verified fixed snapshot allows the session to keep running. The original rollo
 is never moved, deleted or modified. Read the [bounded archive, selection and
 browser guide](docs/BOUNDED-EXPORTS-AND-SELECTION.md) for exact guarantees, controls,
 configuration and the limits of remote ChatGPT compatibility.
+
+## New in 0.5.0
+
+Default archive jobs now render privately, borrow their verified native snapshot,
+and stream multipart ranges without staging raw segment copies. Failed jobs clean
+their owned temporary files. Choose a separate work volume with `--work-dir` when
+needed; final ZIPs keep their configured LZMA profile and hard size ceiling.
+
+Listings support multi-column `--sort`, `--sort-order`, and terminal-aware paging.
+Recorded human-readable timestamps appear in Markdown by default and can be
+disabled with `--no-timestamps` or saved preferences. Bare `codex-export` and the new
+`codex-exporter` alias show versioned help with effective defaults.
+
+```powershell
+cdx-sessions --sort 'project:asc,modified:desc'
+cdx-turns 'SESSION-ID' --sort 'turn:desc' --page-size 24
+cdx-thread 'SESSION-ID' --work-dir 'D:\CodexExportWork'
+codex-export --set-default timestamps=false
+codex-exporter
+```
+
+Complete known service-context envelopes no longer count as new human turns. Their
+content remains preserved. Re-run `cdx-turns` before reusing numeric selectors from
+older versions. See the [storage, listings and timestamps guide](docs/LOW-DISK-EXPORTS-AND-LISTINGS.md)
+for exact semantics, controls, work-volume requirements and configuration recovery.
 
 ## Diagnose a receiving application's archive failure
 
@@ -105,7 +130,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.4.0/codex_exporter-0.4.0-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.0/codex_exporter-0.5.0-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }
