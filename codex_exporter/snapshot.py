@@ -133,6 +133,29 @@ def _decode_zstd(source: Path, target: Path, *, progress: StageProgress | None =
     return state
 
 
+def is_complete_jsonl_record(raw: bytes) -> bool:
+    """Use one EOF boundary policy for exports and read-only turn listings.
+
+    Retain complete UTF-8 JSON, blank tails, and the renderer's narrow legacy
+    repairs. This checks completeness, not record shape: callers still reject
+    non-object records where indexing requires objects. Original bytes are never
+    repaired here, and missing braces or partial UTF-8 remain deferred.
+    """
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeError:
+        return False
+    if not text.strip():
+        return True
+    try:
+        json.loads(text)
+        return True
+    except ValueError:
+        from .cli import parse_jsonl_line
+        parsed = parse_jsonl_line(text)
+        return parsed is not None and parsed[0] is not None
+
+
 def _finish_records(path: Path, state: _Digest) -> tuple[str, int, int, str | None]:
     """Keep valid EOF JSON, defer an invalid unterminated tail with an audit hash."""
     if state.size == state.complete_size:
@@ -140,23 +163,7 @@ def _finish_records(path: Path, state: _Digest) -> tuple[str, int, int, str | No
     with path.open('r+b') as stream:
         stream.seek(state.complete_size)
         tail = stream.read()  # At most one JSONL record; never the whole thread by design.
-        valid = False
-        try:
-            text = tail.decode('utf-8')
-            if not text.strip():
-                valid = True
-            else:
-                json.loads(text)
-                valid = True
-        except UnicodeError:
-            pass
-        except ValueError:
-            # Keep the renderer's narrowly repairable complete EOF records too;
-            # otherwise adding a newline would unexpectedly change coverage.
-            from .cli import parse_jsonl_line
-            repaired, _ = parse_jsonl_line(text)
-            valid = repaired is not None
-        if valid:
+        if is_complete_jsonl_record(tail):
             return state.digest.hexdigest(), state.size, 0, None
         if not state.complete_size:
             raise RuntimeError('No complete JSONL record is available at the snapshot boundary; retry after the writer finishes a record')

@@ -1,4 +1,4 @@
-# Windows upgrade to Codex Exporter 0.5.0
+# Windows upgrade to Codex Exporter 0.5.1
 
 Upgrade both the Python package and the PowerShell helpers. A wheel updates the
 exporter, while the source release supplies the installer and the new
@@ -15,7 +15,7 @@ backing up the exporter files/profile entries it replaces.
 
 ## Download, verify, and install the wheel and helpers
 
-Use the wheel and source distribution from the **same v0.5.0 release**. The code
+Use the wheel and source distribution from the **same v0.5.1 release**. The code
 checks both downloaded artifacts against that release's `SHA256SUMS.txt` before
 installing or extracting them. A checksum obtained from the same release verifies
 consistency with the published artifact list; it is not an independent
@@ -24,7 +24,7 @@ with separately verified pinned hashes, compare against those exact hashes.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$releaseVersion = '0.5.0'
+$releaseVersion = '0.5.1'
 $py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
 $archiver = 'C:\Program Files\7-Zip-Zstandard\7z.exe'
 $installDir = Join-Path $env:LOCALAPPDATA 'codex-exporter\tools'

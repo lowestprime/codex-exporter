@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -3703,7 +3703,7 @@ def _main() -> int:
             output = args.out_dir.expanduser().resolve() if args.out_dir else source.parent
             result = review_existing_export(source, output, chunk_bytes=args.review_chunk_bytes, progress=reporter,
                                             archive=archive_settings.archive, max_bytes=archive_settings.max_bytes)
-            reporter.finish(detail="Standalone review conversion")
+            reporter.set_detail("Standalone review conversion")
             if args.json_result:
                 print(json.dumps(result, ensure_ascii=False))
             else:
@@ -4194,16 +4194,16 @@ def _main() -> int:
                 if args.open_after and preferred_output(bundled):
                     open_in_file_manager(Path(preferred_output(bundled)), select=True)
         if args.list or args.list_responses:
-            reporter.finish(detail=f'{len(record_listings):,} source listing(s)')
+            reporter.set_detail(f'{len(record_listings):,} source listing(s)')
             if args.json_result:
                 print(json.dumps(record_listings[0] if len(record_listings) == 1 else record_listings, ensure_ascii=False))
             return 0
         if args.list_turns:
-            reporter.finish(detail=f"{sum(len(item['turns']) for item in turn_listings):,} user turns")
+            reporter.set_detail(f"{sum(len(item['turns']) for item in turn_listings):,} user turns")
             if args.json_result:
                 print(json.dumps(turn_listings[0] if len(turn_listings) == 1 else turn_listings, ensure_ascii=False))
             return 0
-        reporter.finish(detail=f"{len(results):,} export(s)")
+        reporter.set_detail(f"{len(results):,} export(s)")
         if args.clipboard and clipboard_parts:
             copy_to_clipboard("\n\n".join(clipboard_parts))
         if args.json_result:

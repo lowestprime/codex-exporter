@@ -21,7 +21,7 @@ from typing import Any, Iterable
 import unicodedata
 
 from .progress import ProgressReporter
-from .snapshot import CHUNK_BYTES, SourceSnapshot
+from .snapshot import CHUNK_BYTES, SourceSnapshot, is_complete_jsonl_record
 
 PREVIEW_CHARS = 240
 
@@ -362,15 +362,13 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_li
         for line, raw in _bounded_lines(stream, before[2]):
             total_lines = line
             start, offset = offset, offset + len(raw)
-            if _live_listing and offset == before[2] and not raw.endswith(b'\n'):
-                try:
-                    json.loads(raw)
-                except (UnicodeError, json.JSONDecodeError):
-                    physical_digest = digest.copy()
-                    physical_digest.update(raw)
-                    deferred_tail = len(raw)
-                    offset, total_lines = start, line - 1
-                    break
+            if (_live_listing and offset == before[2] and not raw.endswith(b'\n')
+                    and not is_complete_jsonl_record(raw)):
+                physical_digest = digest.copy()
+                physical_digest.update(raw)
+                deferred_tail = len(raw)
+                offset, total_lines = start, line - 1
+                break
             digest.update(raw)
             obj, repaired = _parse(raw, line)
             if repaired:

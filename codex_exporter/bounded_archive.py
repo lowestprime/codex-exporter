@@ -102,6 +102,7 @@ class BoundedPart:
     _size_bytes: int | None = field(default=None, repr=False)
     packing: dict[str, Any] | None = None
     lzma_dictionary_bytes: dict[str, int] = field(default_factory=dict)
+    compression_planning: dict[str, Any] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
@@ -721,7 +722,8 @@ def build_bounded_archives(members: dict[str, Path], *, work: Path, basename: st
                            max_bytes: int, method: str, compress_range: Callable,
                            reporter=None, checksums: dict[str, tuple[str, int]] | None = None,
                            consume_candidates: bool = True,
-                           estimated_ratios: dict[str, float] | None = None) -> list[BoundedPart]:
+                           estimated_ratios: dict[str, float] | None = None,
+                           compression_profiles: dict[str, Any] | None = None) -> list[BoundedPart]:
     """Compress bounded ranges directly, then copy their encoded streams once.
 
     A highly compressible large input remains a complete member and can still
@@ -768,12 +770,19 @@ def build_bounded_archives(members: dict[str, Path], *, work: Path, basename: st
         offset = 0
         ordinal = 0
         ratio_estimate = (estimated_ratios or {}).get(original_name)
+        profile = (compression_profiles or {}).get(original_name)
+        correction = 1.0
         next_target = None
         if ratio_estimate and original_size * ratio_estimate > max_bytes * .95:
             next_target = max(1, int(max_bytes / max(ratio_estimate, .000001) * .97))
         while offset < original_size or (original_size == 0 and ordinal == 0):
             ordinal += 1
             remaining = original_size - offset
+            if profile is not None:
+                next_target = profile.range_bytes(offset, max_bytes * .95, correction=correction)
+                # Give a plausibly fitting complete member the ordinary ZIP path.
+                if offset == 0 and profile.estimate() * correction <= max_bytes * .95:
+                    next_target = remaining
             target = min(remaining, next_target) if next_target is not None else remaining
             attempts = 0
             # Only partial pieces need reconstruction metadata. A complete
@@ -819,6 +828,8 @@ def build_bounded_archives(members: dict[str, Path], *, work: Path, basename: st
                     if planned > max_bytes and not (whole and whole_attempt):
                         raise RangeTooLarge(actual, planned, max_bytes)
                 except RangeTooLarge as overflow:
+                    if overflow.cleanup_error is not None:
+                        raise
                     candidate.unlink(missing_ok=True)
                     attempts += 1
                     if count <= 1:
@@ -838,6 +849,9 @@ def build_bounded_archives(members: dict[str, Path], *, work: Path, basename: st
                 if actual:
                     overhead = candidate.stat().st_size - info.compress_size
                     ratio = max(info.compress_size / actual, 0.000001)
+                    if profile is not None:
+                        predicted = profile.estimate(piece.offset, actual)
+                        correction = max(.5, min(4.0, info.compress_size / max(1, predicted)))
                     next_target = max(1, int(max(1, piece_limit - overhead) / ratio * .985))
                 break
         return encoded
