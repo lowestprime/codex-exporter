@@ -148,7 +148,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.0/codex_exporter-0.5.0-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.1/codex_exporter-0.5.1-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }

@@ -113,6 +113,23 @@ paging, and identical versioned help for bare aliases. Live source snapshots,
 selected native excerpts, source-copy options, collision protection and output
 permissions remain covered.
 
+## Recorded validation
+
+The implementation in commit `25420a78311b9c475f15686a153fb4d019b86449`
+passed [all seven CI jobs](https://github.com/lowestprime/codex-exporter/actions/runs/43788909075):
+Python 3.10 and 3.13 on Windows, Linux and macOS, plus distribution packaging.
+Each Windows job passed 635 tests with six platform/optional skips; each Linux
+and macOS job passed 636 tests with five skips. The local integrated run passed
+628 tests with thirteen platform/optional skips. Canonical and bundled modules
+passed synchronization checks.
+
+The [reproducible synthetic benchmark](BENCHMARK-v0.5.1.md) includes every run,
+source identity, setting, timing range and a complete reproduction harness. Both
+chosen heterogeneous-data cases retained two parts, eliminated rejected
+candidates, preserved exact source bytes and corrected the final success status.
+One case added 34 ZIP bytes and the other removed 58 bytes. Timings came from a
+shared Linux runner and are not a general performance guarantee.
+
 ## Primary technical references
 
 - [Python zipfile](https://docs.python.org/3.13/library/zipfile.html): supported

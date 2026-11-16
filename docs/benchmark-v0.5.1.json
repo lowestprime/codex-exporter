@@ -1,0 +1,1652 @@
+{
+  "schema": "codex-exporter.synthetic-planning-benchmark.v1",
+  "tested_revisions": {
+    "baseline": {
+      "label": "v0.5.0",
+      "git_commit": "abb1fe0585131055f81d89dba77b0e5f2d16164d",
+      "package_inventory_sha256": "3ea0bbd54932019c61f8f702feeeb1074bfaacf020d6ebcb950d07ba1f5236f2",
+      "package_inventory": [
+        [
+          "codex_exporter/__init__.py",
+          "0b3c8e0a168963c4717eca28f07409c8f7632a48e87769b6e9aa2a6574a27e33"
+        ],
+        [
+          "codex_exporter/__main__.py",
+          "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+        ],
+        [
+          "codex_exporter/archive_diagnostics.py",
+          "39cfd1395535d2a12c32d380ea83a607bd7c5778da85d96d09d5812b143a8ce2"
+        ],
+        [
+          "codex_exporter/archive_pipeline.py",
+          "6df8f0de40438d3462cb1b524792b06ad2fdc0f3330cfba9df8b9952550c5853"
+        ],
+        [
+          "codex_exporter/archive_stream.py",
+          "ff42b3d273595c9b908f80b25151e2e33829a23fa33e7473703c58432240f45d"
+        ],
+        [
+          "codex_exporter/batch_archive.py",
+          "389209e75c1bed6f30f5db7acad2090b62e7f650a1df3d8460f274f7a1933af0"
+        ],
+        [
+          "codex_exporter/bounded_archive.py",
+          "4e0bcd1891aa8e0bf3c3115793534e5414103f073f9e813fa392e6519924b97f"
+        ],
+        [
+          "codex_exporter/browser.py",
+          "fffb0cb89ba39366cc233b7028b7d6335043f429c5b6660d472b5d5dd3c4f99b"
+        ],
+        [
+          "codex_exporter/chatgpt_archive.py",
+          "a43c29c111696750c639208e97bc87db740a18b6ffe140ebd0fb5f43e2413058"
+        ],
+        [
+          "codex_exporter/cli.py",
+          "ffb56064a8e1d782eec8f542ab64b3880142c53c4ee603d31bd6568afd0ad62d"
+        ],
+        [
+          "codex_exporter/cli_help.py",
+          "1b2d00b7e858d9f8ad616abe10a954fb77dfae148f91bac89edc8fb0ee400838"
+        ],
+        [
+          "codex_exporter/display.py",
+          "23cdc0fb37cdac03f7696fd9a60813e98b6d14a85b2a6c32e72400875fb60389"
+        ],
+        [
+          "codex_exporter/file_access.py",
+          "1d0534c41bfc4f36fca943b0ec4f90fa60b52f0f063dc691ec996eee024f3569"
+        ],
+        [
+          "codex_exporter/modern.py",
+          "277b2520be1c26920e010da4a6f7771a6f7a75412c9271f97293061ab68706f8"
+        ],
+        [
+          "codex_exporter/preferences.py",
+          "223e503074f31a4798e8e9f1c3594c398a74862004bf8c8cd5e144ccf6e3453b"
+        ],
+        [
+          "codex_exporter/progress.py",
+          "9b9e973c1093bc618ec01516358ff87469c040e6f51e8bf3911717ff780bb479"
+        ],
+        [
+          "codex_exporter/review.py",
+          "a840da6ab9694fdcf1f6b23d168360efbef481c35729f7027be0e0292e37d881"
+        ],
+        [
+          "codex_exporter/selection.py",
+          "67d3a6db85c36a0e33602ecba24df32870f3bbac8ee484e9a0cab0ffc83ea0b3"
+        ],
+        [
+          "codex_exporter/snapshot.py",
+          "342ec574b56a4eccd9f53a2bce8127372db24fb66fb01d112a0b752c25557cd5"
+        ],
+        [
+          "codex_exporter/storage.py",
+          "a84f20e45bce5750ab8a33c5924750b8dc96c4d9ffc62067a4cebee23874888e"
+        ],
+        [
+          "codex_exporter/timestamps.py",
+          "2bd1b6bf52167ed02c5109675e18a41f2ecc43bcc5c0613eab2735334fbaba5f"
+        ]
+      ]
+    },
+    "candidate": {
+      "label": "v0.5.1 candidate",
+      "git_commit": "25420a78311b9c475f15686a153fb4d019b86449",
+      "pull_request": 12,
+      "package_inventory_sha256": "59e7dcde331d753be2749d41cca2efd8f15ee6891b413792444354cfdb31f263",
+      "package_inventory": [
+        [
+          "codex_exporter/__init__.py",
+          "0b3c8e0a168963c4717eca28f07409c8f7632a48e87769b6e9aa2a6574a27e33"
+        ],
+        [
+          "codex_exporter/__main__.py",
+          "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+        ],
+        [
+          "codex_exporter/archive_diagnostics.py",
+          "39cfd1395535d2a12c32d380ea83a607bd7c5778da85d96d09d5812b143a8ce2"
+        ],
+        [
+          "codex_exporter/archive_pipeline.py",
+          "ca91db08343e6240cfe382f3e6eb76141415e02f4461ebe2407801c2acd3b1b5"
+        ],
+        [
+          "codex_exporter/archive_stream.py",
+          "744bb03dc09a000640cca2909481720bdb6f48a0d0b076d15f1c9769e9e300a7"
+        ],
+        [
+          "codex_exporter/batch_archive.py",
+          "fe2a35b75201b616729e7e114e77a1fc87143a3f698f37fcad47bd5ae58a6b94"
+        ],
+        [
+          "codex_exporter/bounded_archive.py",
+          "be7a1901a11e363ab1d153cbdbe374ff51190bf0beffbb811abc97d3fa5fec2d"
+        ],
+        [
+          "codex_exporter/browser.py",
+          "fffb0cb89ba39366cc233b7028b7d6335043f429c5b6660d472b5d5dd3c4f99b"
+        ],
+        [
+          "codex_exporter/chatgpt_archive.py",
+          "a43c29c111696750c639208e97bc87db740a18b6ffe140ebd0fb5f43e2413058"
+        ],
+        [
+          "codex_exporter/cli.py",
+          "32dbe60bea8b3dbdfdbd180ada3917d884231c07bb02a9a19a6a3ca257d911ce"
+        ],
+        [
+          "codex_exporter/cli_help.py",
+          "1b2d00b7e858d9f8ad616abe10a954fb77dfae148f91bac89edc8fb0ee400838"
+        ],
+        [
+          "codex_exporter/compression_plan.py",
+          "d291c614ca83f957a4dcae0e1a903bfe449718a40cb480e32bc511a236eb344f"
+        ],
+        [
+          "codex_exporter/display.py",
+          "23cdc0fb37cdac03f7696fd9a60813e98b6d14a85b2a6c32e72400875fb60389"
+        ],
+        [
+          "codex_exporter/file_access.py",
+          "1d0534c41bfc4f36fca943b0ec4f90fa60b52f0f063dc691ec996eee024f3569"
+        ],
+        [
+          "codex_exporter/modern.py",
+          "277b2520be1c26920e010da4a6f7771a6f7a75412c9271f97293061ab68706f8"
+        ],
+        [
+          "codex_exporter/preferences.py",
+          "223e503074f31a4798e8e9f1c3594c398a74862004bf8c8cd5e144ccf6e3453b"
+        ],
+        [
+          "codex_exporter/progress.py",
+          "ffc8f083d526e1ec9b1b7d40c01006faf538b39622a4d64e113eb0105caacf16"
+        ],
+        [
+          "codex_exporter/review.py",
+          "a840da6ab9694fdcf1f6b23d168360efbef481c35729f7027be0e0292e37d881"
+        ],
+        [
+          "codex_exporter/selection.py",
+          "281a893c49e5865d77cdf87d03859ab7142c7d3a35278a953edc64b6b695858c"
+        ],
+        [
+          "codex_exporter/snapshot.py",
+          "0dccf5e2aefa78664836d38ff1789886ee968fa79ebb928c865393b728e33fca"
+        ],
+        [
+          "codex_exporter/storage.py",
+          "a84f20e45bce5750ab8a33c5924750b8dc96c4d9ffc62067a4cebee23874888e"
+        ],
+        [
+          "codex_exporter/timestamps.py",
+          "2bd1b6bf52167ed02c5109675e18a41f2ecc43bcc5c0613eab2735334fbaba5f"
+        ]
+      ]
+    }
+  },
+  "archiver": {
+    "executable_name": "7zz",
+    "version_header": "7-Zip (z) 26.06 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-11-06\n 64-bit locale=C.UTF-8 Threads:9 OPEN_MAX:16384, ASM",
+    "sha256": "f94066e93f9a807547a3bff1021b3ec79d5ea4f57dfead018e9698182ad283b5"
+  },
+  "runtime": {
+    "python_version": "3.12.14",
+    "implementation": "CPython",
+    "os": "Linux",
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "processor_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "logical_processors_reported": 9,
+    "affinity_processor_count": 9
+  },
+  "settings": {
+    "method": "LZMA",
+    "level": 9,
+    "dictionary": "256m",
+    "word_size": 64,
+    "threads": 19,
+    "backend": "7zip",
+    "max_bytes": 2500000
+  },
+  "workload_model": {
+    "random_generator": "Python random.Random(20261115).randbytes",
+    "seed": 20261115,
+    "random_draw_order_bytes": [
+      4194304,
+      2097152,
+      2097152
+    ],
+    "source_size_each_bytes": 8388608,
+    "cases": {
+      "misleading_prefix": {
+        "regions": [
+          {
+            "kind": "repeat",
+            "ascii_byte": "A",
+            "bytes": 2097152
+          },
+          {
+            "kind": "pseudorandom",
+            "draw": 1,
+            "bytes": 4194304
+          },
+          {
+            "kind": "repeat",
+            "ascii_byte": "B",
+            "bytes": 2097152
+          }
+        ],
+        "sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28"
+      },
+      "alternating_entropy": {
+        "regions": [
+          {
+            "kind": "repeat",
+            "ascii_byte": "C",
+            "bytes": 2097152
+          },
+          {
+            "kind": "pseudorandom",
+            "draw": 2,
+            "bytes": 2097152
+          },
+          {
+            "kind": "repeat",
+            "ascii_byte": "D",
+            "bytes": 2097152
+          },
+          {
+            "kind": "pseudorandom",
+            "draw": 3,
+            "bytes": 2097152
+          }
+        ],
+        "sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664"
+      }
+    }
+  },
+  "method": {
+    "repetitions_per_case_and_revision": 3,
+    "order_by_repetition": [
+      [
+        "v050",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "v050"
+      ],
+      [
+        "v050",
+        "candidate"
+      ]
+    ],
+    "timed_scope": "_create_archive_parts including sampling, compression, assembly, internal content verification, normal candidate cleanup, and progress finalization",
+    "independent_reconstruction": "Additional full CRC/SHA decoding and offset reconstruction; excluded from pipeline_seconds",
+    "dictionary_policy": "Same requested 256 MiB maximum; effective streamed dictionary is limited to known range size by the existing policy in both revisions"
+  },
+  "limitations": [
+    "Another compression workload was active on the shared runner; scheduling and I/O contention affected timings.",
+    "All timings and ranges are disclosed; percentages describe only these runs and are not predictive speed guarantees.",
+    "Two selected heterogeneous workloads do not establish performance on uniformly compressible or uniformly incompressible files.",
+    "The candidate increases archive size by 34 bytes in the first case and decreases it by 58 bytes in the second; no universal size improvement or global optimum is claimed.",
+    "Actual elapsed time and byte totals can vary across operating systems, 7-Zip builds, scheduling and adaptive polling boundaries."
+  ],
+  "summary": [
+    {
+      "v050": {
+        "median_pipeline_seconds": 1.067525051001212,
+        "min_pipeline_seconds": 1.0463643849998334,
+        "max_pipeline_seconds": 1.1562457920008455,
+        "pipeline_seconds_in_repetition_order": [
+          1.1562457920008455,
+          1.0463643849998334,
+          1.067525051001212
+        ],
+        "total_archive_bytes": [
+          4255074
+        ],
+        "part_count": [
+          2
+        ],
+        "rejected_attempts": [
+          3
+        ],
+        "final_progress": [
+          "export_failed"
+        ]
+      },
+      "candidate": {
+        "median_pipeline_seconds": 0.5762466430005588,
+        "min_pipeline_seconds": 0.5575868129999435,
+        "max_pipeline_seconds": 0.7654690130002564,
+        "pipeline_seconds_in_repetition_order": [
+          0.5762466430005588,
+          0.7654690130002564,
+          0.5575868129999435
+        ],
+        "total_archive_bytes": [
+          4255108
+        ],
+        "part_count": [
+          2
+        ],
+        "rejected_attempts": [
+          0
+        ],
+        "final_progress": [
+          "export_complete"
+        ]
+      },
+      "scenario": "misleading_prefix",
+      "observed_median_time_reduction_percent": 46.02031657616767,
+      "observed_median_speedup": 1.8525488416601097,
+      "archive_byte_delta": 34
+    },
+    {
+      "v050": {
+        "median_pipeline_seconds": 2.1120363589998306,
+        "min_pipeline_seconds": 0.9408076620002248,
+        "max_pipeline_seconds": 3.146805341999425,
+        "pipeline_seconds_in_repetition_order": [
+          0.9408076620002248,
+          2.1120363589998306,
+          3.146805341999425
+        ],
+        "total_archive_bytes": [
+          4255132
+        ],
+        "part_count": [
+          2
+        ],
+        "rejected_attempts": [
+          2
+        ],
+        "final_progress": [
+          "export_failed"
+        ]
+      },
+      "candidate": {
+        "median_pipeline_seconds": 0.6597161580011743,
+        "min_pipeline_seconds": 0.580779091000295,
+        "max_pipeline_seconds": 1.5234526559997903,
+        "pipeline_seconds_in_repetition_order": [
+          0.6597161580011743,
+          0.580779091000295,
+          1.5234526559997903
+        ],
+        "total_archive_bytes": [
+          4255074
+        ],
+        "part_count": [
+          2
+        ],
+        "rejected_attempts": [
+          0
+        ],
+        "final_progress": [
+          "export_complete"
+        ]
+      },
+      "scenario": "alternating_entropy",
+      "observed_median_time_reduction_percent": 68.76397723031684,
+      "observed_median_speedup": 3.201431908836271,
+      "archive_byte_delta": -58
+    }
+  ],
+  "runs": [
+    {
+      "version": "v050",
+      "scenario": "misleading_prefix",
+      "repetition": 1,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 4,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 2,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.015892274999714573
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.2659432279997418
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252232,
+          "seconds": 0.22210435299894016
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4631362,
+          "budget": 2498561,
+          "status": "rejected_budget",
+          "consumed_bytes": 4631362,
+          "output_bytes": 2569261,
+          "seconds": 0.14266803299869935
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4233568,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4233568,
+          "archive_bytes": 2166040,
+          "seconds": 0.12307923200023652
+        },
+        {
+          "kind": "range",
+          "offset": 4233568,
+          "requested_bytes": 4155040,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4155040,
+          "archive_bytes": 2086480,
+          "seconds": 0.10786679299962998
+        }
+      ],
+      "pipeline_seconds": 1.1562457920008455,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2167314,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254494,
+      "reconstruction_seconds": 0.22096047999912116,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 1.1559637859991199,
+        "stages_completed": 6,
+        "stages_failed": 3,
+        "stages_total": 9,
+        "detail": ""
+      },
+      "rejected_attempts": 3,
+      "stage_failed_count": 3,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "misleading_prefix",
+      "repetition": 1,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.011533711000083713
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265951,
+          "seconds": 0.026207453000097303
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265991,
+          "seconds": 0.02639527400060615
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.00842017200011469
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4438460,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4438460,
+          "archive_bytes": 2373726,
+          "seconds": 0.2119867070014152
+        },
+        {
+          "kind": "range",
+          "offset": 4438460,
+          "requested_bytes": 3950148,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 3950148,
+          "archive_bytes": 1878828,
+          "seconds": 0.09352928399857774
+        }
+      ],
+      "pipeline_seconds": 0.5762466430005588,
+      "part_count": 2,
+      "total_archive_bytes": 4255108,
+      "max_part_bytes": 2375000,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254528,
+      "reconstruction_seconds": 0.17434048600080132,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 0.5760152559996641,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "misleading_prefix",
+      "repetition": 2,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.009043975000167848
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265951,
+          "seconds": 0.020606220999979996
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265991,
+          "seconds": 0.02907511999910639
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.009168905000478844
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4438460,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4438460,
+          "archive_bytes": 2373726,
+          "seconds": 0.14689355100017565
+        },
+        {
+          "kind": "range",
+          "offset": 4438460,
+          "requested_bytes": 3950148,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 3950148,
+          "archive_bytes": 1878828,
+          "seconds": 0.16906517700044787
+        }
+      ],
+      "pipeline_seconds": 0.7654690130002564,
+      "part_count": 2,
+      "total_archive_bytes": 4255108,
+      "max_part_bytes": 2375000,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254528,
+      "reconstruction_seconds": 0.16609679300017888,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 0.7652037930001825,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "v050",
+      "scenario": "misleading_prefix",
+      "repetition": 2,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 4,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 2,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.011524437000844046
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.23736987100164697
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252232,
+          "seconds": 0.24320450000050187
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4631362,
+          "budget": 2498561,
+          "status": "rejected_budget",
+          "consumed_bytes": 4631362,
+          "output_bytes": 2569261,
+          "seconds": 0.14276770499964186
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4233568,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4233568,
+          "archive_bytes": 2166040,
+          "seconds": 0.1174454619995231
+        },
+        {
+          "kind": "range",
+          "offset": 4233568,
+          "requested_bytes": 4155040,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4155040,
+          "archive_bytes": 2086480,
+          "seconds": 0.11750444199969934
+        }
+      ],
+      "pipeline_seconds": 1.0463643849998334,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2167314,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254494,
+      "reconstruction_seconds": 0.1972425479998492,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 1.0460858130009,
+        "stages_completed": 6,
+        "stages_failed": 3,
+        "stages_total": 9,
+        "detail": ""
+      },
+      "rejected_attempts": 3,
+      "stage_failed_count": 3,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "v050",
+      "scenario": "misleading_prefix",
+      "repetition": 3,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 4,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 2,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.010643350999089307
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.22368675700090535
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252232,
+          "seconds": 0.2579203250006685
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4631362,
+          "budget": 2498561,
+          "status": "rejected_budget",
+          "consumed_bytes": 4631362,
+          "output_bytes": 2569261,
+          "seconds": 0.14387681200059887
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4233568,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4233568,
+          "archive_bytes": 2166040,
+          "seconds": 0.14109032199849025
+        },
+        {
+          "kind": "range",
+          "offset": 4233568,
+          "requested_bytes": 4155040,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4155040,
+          "archive_bytes": 2086480,
+          "seconds": 0.1112711189998663
+        }
+      ],
+      "pipeline_seconds": 1.067525051001212,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2167314,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254494,
+      "reconstruction_seconds": 0.16673991000061505,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 1.0672794439997233,
+        "stages_completed": 6,
+        "stages_failed": 3,
+        "stages_total": 9,
+        "detail": ""
+      },
+      "rejected_attempts": 3,
+      "stage_failed_count": 3,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "misleading_prefix",
+      "repetition": 3,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.009438335999220726
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265951,
+          "seconds": 0.02210595599899534
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265991,
+          "seconds": 0.02155317300093884
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 318,
+          "seconds": 0.008990791999167413
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4438460,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 4438460,
+          "archive_bytes": 2373726,
+          "seconds": 0.21297294199939643
+        },
+        {
+          "kind": "range",
+          "offset": 4438460,
+          "requested_bytes": 3950148,
+          "budget": 2498561,
+          "status": "completed",
+          "consumed_bytes": 3950148,
+          "archive_bytes": 1878828,
+          "seconds": 0.10578623400033393
+        }
+      ],
+      "pipeline_seconds": 0.5575868129999435,
+      "part_count": 2,
+      "total_archive_bytes": 4255108,
+      "max_part_bytes": 2375000,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254528,
+      "reconstruction_seconds": 0.18063188300038746,
+      "reconstructed_sha256": "ead24480fd55c7d90254f8ea7e53f5bcd83ab55a541c8f7e7f99c6f4c1a12d28",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 0.5573859670003003,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "v050",
+      "scenario": "alternating_entropy",
+      "repetition": 1,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 3,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 1,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.011711140999977943
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.2197412080004142
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252257,
+          "seconds": 0.2743438409997907
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4194274,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194274,
+          "archive_bytes": 2126279,
+          "seconds": 0.12860751100015477
+        },
+        {
+          "kind": "range",
+          "offset": 4194274,
+          "requested_bytes": 4194334,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194334,
+          "archive_bytes": 2126291,
+          "seconds": 0.1288964980012679
+        }
+      ],
+      "pipeline_seconds": 0.9408076620002248,
+      "part_count": 2,
+      "total_archive_bytes": 4255132,
+      "max_part_bytes": 2127575,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254544,
+      "reconstruction_seconds": 0.1703813120002451,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 0.9405453600011242,
+        "stages_completed": 6,
+        "stages_failed": 2,
+        "stages_total": 8,
+        "detail": ""
+      },
+      "rejected_attempts": 2,
+      "stage_failed_count": 2,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "alternating_entropy",
+      "repetition": 1,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.009701341999971191
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265965,
+          "seconds": 0.023413932998664677
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.00834248600040155
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265948,
+          "seconds": 0.021611481000945787
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 6534626,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 6534626,
+          "archive_bytes": 2373100,
+          "seconds": 0.2361969859994133
+        },
+        {
+          "kind": "range",
+          "offset": 6534626,
+          "requested_bytes": 1853982,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 1853982,
+          "archive_bytes": 1879412,
+          "seconds": 0.16770754699973622
+        }
+      ],
+      "pipeline_seconds": 0.6597161580011743,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2374378,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254486,
+      "reconstruction_seconds": 0.17328616300073918,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 0.6594571469995572,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "alternating_entropy",
+      "repetition": 2,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.011922591000256944
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265965,
+          "seconds": 0.024918936000176473
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.008742766000068514
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265948,
+          "seconds": 0.018868298999223043
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 6534626,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 6534626,
+          "archive_bytes": 2373100,
+          "seconds": 0.23626307099948463
+        },
+        {
+          "kind": "range",
+          "offset": 6534626,
+          "requested_bytes": 1853982,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 1853982,
+          "archive_bytes": 1879412,
+          "seconds": 0.09084666099988681
+        }
+      ],
+      "pipeline_seconds": 0.580779091000295,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2374378,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254486,
+      "reconstruction_seconds": 0.18554334500004188,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 0.5804494279982464,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "v050",
+      "scenario": "alternating_entropy",
+      "repetition": 2,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 3,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 1,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.008630735999759054
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.22493707299872767
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252257,
+          "seconds": 0.5153317139993305
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4194274,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194274,
+          "archive_bytes": 2126279,
+          "seconds": 0.49478033400009735
+        },
+        {
+          "kind": "range",
+          "offset": 4194274,
+          "requested_bytes": 4194334,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194334,
+          "archive_bytes": 2126291,
+          "seconds": 0.3991242290012451
+        }
+      ],
+      "pipeline_seconds": 2.1120363589998306,
+      "part_count": 2,
+      "total_archive_bytes": 4255132,
+      "max_part_bytes": 2127575,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254544,
+      "reconstruction_seconds": 0.4105085640003381,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 2.111773106000328,
+        "stages_completed": 6,
+        "stages_failed": 2,
+        "stages_total": 8,
+        "detail": ""
+      },
+      "rejected_attempts": 2,
+      "stage_failed_count": 2,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "v050",
+      "scenario": "alternating_entropy",
+      "repetition": 3,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 3,
+      "probe_calls": 1,
+      "whole_calls": 1,
+      "rejected_range_attempts": 1,
+      "rejected_whole_attempts": 1,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.0419586280004296
+        },
+        {
+          "kind": "whole",
+          "status": "rejected_budget",
+          "seconds": 0.9164949989990419
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 8388608,
+          "budget": 2500000,
+          "status": "rejected_budget",
+          "consumed_bytes": 8388608,
+          "output_bytes": 4252130,
+          "seconds": 0.8815854139993462
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 4194274,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194274,
+          "archive_bytes": 2126279,
+          "seconds": 0.4503576810002414
+        },
+        {
+          "kind": "range",
+          "offset": 4194274,
+          "requested_bytes": 4194334,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 4194334,
+          "archive_bytes": 2126291,
+          "seconds": 0.4442925270013802
+        }
+      ],
+      "pipeline_seconds": 3.146805341999425,
+      "part_count": 2,
+      "total_archive_bytes": 4255132,
+      "max_part_bytes": 2127575,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254544,
+      "reconstruction_seconds": 0.4442153639993194,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_failed",
+        "status": "failed",
+        "elapsed_seconds": 3.1465165699992212,
+        "stages_completed": 6,
+        "stages_failed": 2,
+        "stages_total": 8,
+        "detail": ""
+      },
+      "rejected_attempts": 2,
+      "stage_failed_count": 2,
+      "stage_retry_count": 0
+    },
+    {
+      "version": "candidate",
+      "scenario": "alternating_entropy",
+      "repetition": 3,
+      "requested_settings": {
+        "method": "LZMA",
+        "level": 9,
+        "dictionary": "256m",
+        "word_size": 64,
+        "threads": 19,
+        "backend": "7zip",
+        "max_bytes": 2500000
+      },
+      "source_bytes": 8388608,
+      "source_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "range_calls": 2,
+      "probe_calls": 4,
+      "whole_calls": 0,
+      "rejected_range_attempts": 0,
+      "rejected_whole_attempts": 0,
+      "calls": [
+        {
+          "kind": "sample",
+          "offset": 0,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.061243325000759796
+        },
+        {
+          "kind": "sample",
+          "offset": 3014656,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265965,
+          "seconds": 0.06132690599952184
+        },
+        {
+          "kind": "sample",
+          "offset": 5111808,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 322,
+          "seconds": 0.05389423100132262
+        },
+        {
+          "kind": "sample",
+          "offset": 8126464,
+          "requested_bytes": 262144,
+          "budget": 528384,
+          "status": "completed",
+          "consumed_bytes": 262144,
+          "archive_bytes": 265948,
+          "seconds": 0.06450589000087348
+        },
+        {
+          "kind": "range",
+          "offset": 0,
+          "requested_bytes": 6534626,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 6534626,
+          "archive_bytes": 2373100,
+          "seconds": 0.5128323190001538
+        },
+        {
+          "kind": "range",
+          "offset": 6534626,
+          "requested_bytes": 1853982,
+          "budget": 2498553,
+          "status": "completed",
+          "consumed_bytes": 1853982,
+          "archive_bytes": 1879412,
+          "seconds": 0.26325059500049974
+        }
+      ],
+      "pipeline_seconds": 1.5234526559997903,
+      "part_count": 2,
+      "total_archive_bytes": 4255074,
+      "max_part_bytes": 2374378,
+      "strategy": "streamed_bounded_members",
+      "under_cap": true,
+      "crc_verified": true,
+      "sha256_verified": true,
+      "no_gaps_or_overlaps": true,
+      "source_unchanged": true,
+      "compressed_payload_bytes": 4254486,
+      "reconstruction_seconds": 0.3960405769994395,
+      "reconstructed_sha256": "8b7d23bd7d18c080ea18afb3904c54b3c786d98cb5b366a7dd45e00834860664",
+      "final_progress": {
+        "event": "export_complete",
+        "status": "complete",
+        "elapsed_seconds": 1.5231848399998853,
+        "stages_completed": 6,
+        "stages_failed": 0,
+        "stages_retried": 0,
+        "stages_settled": 6,
+        "stages_total": 6,
+        "detail": ""
+      },
+      "rejected_attempts": 0,
+      "stage_failed_count": 0,
+      "stage_retry_count": 0
+    }
+  ]
+}
