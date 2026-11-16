@@ -1,4 +1,4 @@
-# Codex Exporter 0.5.0 — low-disk live archives and navigable listings
+# Codex Exporter 0.5.1 — accurate export outcomes and adaptive archive planning
 
 Export a running Codex thread with **every final ZIP at most 512,000,000 bytes**.
 A fitting single-session export contains the familiar three files: Markdown,
@@ -26,6 +26,24 @@ A verified fixed snapshot allows the session to keep running. The original rollo
 is never moved, deleted or modified. Read the [bounded archive, selection and
 browser guide](docs/BOUNDED-EXPORTS-AND-SELECTION.md) for exact guarantees, controls,
 configuration and the limits of remote ChatGPT compatibility.
+
+## New in 0.5.1
+
+A compression range that exceeds its planning budget is now an explicit **retry**,
+not a permanent failed stage. Successful recovery ends with `Export complete`
+and a retry count; actual compressor, verification, cleanup and cancellation
+errors still fail. The final summary is emitted after resource cleanup completes.
+
+Bounded stratified probes sample across large members, and completed ranges
+calibrate later size estimates. These estimates guide segmentation; final ZIP
+sizes and complete CRC/SHA-256 reconstruction remain independently checked.
+The codec, compression preferences, upload cap and one-ZIP-when-it-fits behavior
+are unchanged. Read the [v0.5.1 fixes and validation guide](docs/RECOVERED-EXPORTS-v0.5.1.md).
+
+Read-only `cdx-turns` listings and full exports now use the same EOF policy:
+a complete final record with supported legacy JSON repairs stays selectable even
+without a final newline. Incomplete UTF-8/JSON tails remain deferred and native
+bytes stay unchanged.
 
 ## New in 0.5.0
 
@@ -130,7 +148,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.0/codex_exporter-0.5.0-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.1/codex_exporter-0.5.1-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }

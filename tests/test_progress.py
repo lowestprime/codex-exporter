@@ -396,3 +396,160 @@ def test_runner_normalizes_crlf_without_duplicate_log_lines():
     result = run_seven_zip([sys.executable, '-c', program], timeout=10)
     assert result.returncode == 0
     assert result.stdout == 'first\nsecond\nthird\n'
+
+
+def test_recovered_attempt_is_explicit_and_does_not_poison_export_success():
+    from codex_exporter.archive_stream import RangeTooLarge
+    stream, clock = io.StringIO(), Clock()
+    with ProgressReporter(style='json', stream=stream, clock=clock) as reporter:
+        with pytest.raises(RangeTooLarge):
+            with reporter.stage('Candidate', retry_exceptions=(RangeTooLarge,)) as task:
+                task.update(123)
+                clock.advance(5)
+                raise RangeTooLarge(123, 110, 100)
+        with reporter.stage('Verify and publish', total=1, unit='files') as task:
+            clock.advance(1)
+            task.update(1)
+    result = events(stream)
+    retry = next(row for row in result if row['event'] == 'stage_retry')
+    assert retry['status'] == 'retry'
+    assert retry['completed'] == 123 and retry['elapsed_seconds'] == 5
+    assert retry['eta_seconds'] is None
+    assert not any(row['event'] == 'stage_failed' for row in result)
+    assert result[-1] == {
+        'event': 'export_complete', 'status': 'complete', 'elapsed_seconds': 6,
+        'stages_completed': 1, 'stages_failed': 0, 'stages_retried': 1,
+        'stages_settled': 2, 'stages_total': 2, 'detail': ''}
+
+
+@pytest.mark.parametrize('manual_finish', [False, True])
+def test_unrecovered_retry_exception_still_fails_the_export(manual_finish):
+    from codex_exporter.archive_stream import RangeTooLarge
+    stream = io.StringIO()
+    reporter = ProgressReporter(style='json', stream=stream)
+    if manual_finish:
+        with pytest.raises(RangeTooLarge):
+            with reporter.stage('Candidate', retry_exceptions=(RangeTooLarge,)):
+                raise RangeTooLarge(123, 110, 100)
+        reporter.finish(success=False, detail='No smaller candidate can fit')
+    else:
+        with pytest.raises(RangeTooLarge):
+            with reporter:
+                with reporter.stage('Candidate', retry_exceptions=(RangeTooLarge,)):
+                    raise RangeTooLarge(123, 110, 100)
+    result = events(stream)
+    assert result[-1]['event'] == 'export_failed'
+    assert result[-1]['stages_retried'] == 1
+    assert result[-1]['stages_completed'] == 0
+
+
+@pytest.mark.parametrize('error', [OSError('Disk full'), RuntimeError('Encoder failed'), KeyboardInterrupt()])
+def test_retry_eligible_stage_does_not_hide_other_failures(error):
+    from codex_exporter.archive_stream import RangeTooLarge
+    stream = io.StringIO()
+    reporter = ProgressReporter(style='json', stream=stream)
+    with pytest.raises(type(error)):
+        with reporter.stage('Candidate', retry_exceptions=(RangeTooLarge,)):
+            raise error
+    reporter.finish(success=True)
+    result = events(stream)
+    assert result[-2]['event'] == 'stage_failed'
+    assert result[-1]['event'] == 'export_failed'
+    assert result[-1]['stages_failed'] == 1
+    assert result[-1]['stages_retried'] == 0
+
+
+@pytest.mark.parametrize('invalid', [(KeyboardInterrupt,), (BaseException,), (3,), [ValueError]])
+def test_retry_exception_configuration_cannot_catch_base_exceptions(invalid):
+    reporter = ProgressReporter(enabled=False)
+    with pytest.raises(TypeError, match='Exception subclasses'):
+        reporter.stage('Candidate', retry_exceptions=invalid)
+    assert reporter._stages == []
+
+
+@pytest.mark.parametrize('style,encoding', [('plain', 'utf-8'), ('rich', 'utf-8'), ('rich', 'ascii')])
+def test_retry_is_visible_in_terminal_output(style, encoding, capable_terminal):
+    from codex_exporter.archive_stream import RangeTooLarge
+    stream = Terminal(encoding)
+    with ProgressReporter(style=style, stream=stream, width=200) as reporter:
+        with pytest.raises(RangeTooLarge):
+            with reporter.stage('Candidate', retry_exceptions=(RangeTooLarge,)):
+                raise RangeTooLarge(123, 110, 100)
+        with reporter.stage('Publish'):
+            pass
+    result = stream.getvalue()
+    assert 'Export complete | 2/2 stages | 1 retried attempt' in result
+    assert '[retry]' in result or '↻' in result or 'RETRY' in result
+    assert 'Export failed' not in result
+    if encoding == 'ascii':
+        result.encode('ascii')
+
+
+def test_deferred_summary_observes_late_exitstack_cleanup_failure():
+    from contextlib import ExitStack
+    stream = io.StringIO()
+    reporter = ProgressReporter(style='json', stream=stream)
+
+    def fail_cleanup():
+        raise PermissionError('Synthetic private directory remains locked')
+
+    with pytest.raises(PermissionError, match='remains locked'):
+        with reporter, ExitStack() as job:
+            with reporter.stage('Publish archive', total=1, unit='files') as task:
+                task.update(1)
+            reporter.set_detail('1 export(s)')
+            job.callback(fail_cleanup)
+            assert not any(row['event'].startswith('export_') for row in events(stream))
+    result = events(stream)
+    assert result[-1]['event'] == 'export_failed'
+    assert result[-1]['detail'] == '1 export(s)'
+    assert sum(row['event'].startswith('export_') for row in result) == 1
+
+
+def test_deferred_summary_finishes_after_stack_cleanup_once():
+    from contextlib import ExitStack
+    stream = io.StringIO()
+    reporter = ProgressReporter(style='json', stream=stream)
+    cleaned = []
+
+    def cleanup():
+        assert not any(row['event'].startswith('export_') for row in events(stream))
+        cleaned.append(True)
+
+    with reporter, ExitStack() as job:
+        job.callback(cleanup)
+        reporter.set_detail('safe\x1b]52;clipboard;secret\x07\nsummary')
+    assert cleaned == [True]
+    result = events(stream)
+    assert result[-1]['event'] == 'export_complete'
+    assert result[-1]['detail'] == 'safe summary'
+    reporter.finish(success=False)
+    assert len(events(stream)) == len(result)
+
+
+@pytest.mark.parametrize('failed_thread', ['codex-7zip-output', 'codex-7zip-input'])
+def test_thread_start_failure_reaps_child_and_closes_owned_pipes(monkeypatch, failed_thread):
+    children = []
+    real_popen = subprocess.Popen
+    real_start = threading.Thread.start
+
+    def popen(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    def start(thread):
+        if thread.name == failed_thread:
+            raise RuntimeError('Synthetic worker thread unavailable')
+        return real_start(thread)
+
+    monkeypatch.setattr('codex_exporter.progress.subprocess.Popen', popen)
+    monkeypatch.setattr('codex_exporter.progress.threading.Thread.start', start)
+    with pytest.raises(RuntimeError, match='worker thread unavailable'):
+        run_seven_zip([sys.executable, '-c', 'import time;time.sleep(30)'],
+                      input_chunks=[b'captured source'], timeout=10)
+    assert len(children) == 1
+    child = children[0]
+    assert child.poll() is not None
+    assert child.stdout.closed
+    assert child.stdin.closed

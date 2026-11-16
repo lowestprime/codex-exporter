@@ -312,6 +312,7 @@ def _compress_archive(staged: Path, members: dict[str, Path], settings: ArchiveS
                       max_bytes: int | None = None) -> None:
     """Create a private flat ZIP with the exact requested codec configuration."""
     from .progress import ProgressReporter, run_seven_zip, SEVEN_ZIP_PROGRESS_ARGS
+    from .archive_stream import RangeTooLarge
     reporter = reporter or ProgressReporter(enabled=False)
     if backend == 'python':
         _write_python_archive(staged, members, settings.level, reporter=reporter)
@@ -326,11 +327,11 @@ def _compress_archive(staged: Path, members: dict[str, Path], settings: ArchiveS
         command.extend(['-md=' + settings.dictionary, '-mfb=' + str(settings.word_size)])
     command.extend([str(staged), *members.keys()])
     with reporter.stage('Compress archive', unit='percent',
+                        retry_exceptions=(RangeTooLarge,) if max_bytes is not None else (),
                         detail=f'{settings.method} level {settings.level}; '
                                f'{len(members)} files; requested threads {settings.threads}') as meter:
         def monitor() -> None:
             if max_bytes is not None and staged.exists() and staged.stat().st_size > max_bytes:
-                from .archive_stream import RangeTooLarge
                 raise RangeTooLarge(0, staged.stat().st_size, max_bytes)
         run = run_seven_zip(command, cwd=next(iter(parents)), progress=meter,
                             on_tick=monitor if max_bytes is not None else None)
@@ -554,6 +555,7 @@ def _package_export_impl(result: dict[str, Any], original_source: Path,
         result.update({
             'archive': str(archive), 'archives': [str(path) for path in destinations],
             'archive_verified': True, 'archive_count': len(parts),
+            'archive_compression_planning': parts[0].compression_planning,
             'archive_packing': parts[0].packing or {'parts': 1, 'fixed_piece_minimum_proved': True,
                 'scope': 'One complete archive; no multipart packing needed'},
             'archive_parts': [
@@ -633,25 +635,15 @@ def _create_archive_parts(members: dict[str, Path], settings: ArchiveSettings, *
         inputs = _flat_private_inputs(members, work / 'compression-inputs')
     signatures = {name: _file_signature(path) for name, path in members.items()}
     ratios = {}
+    profiles = {}
     if not small:
-        # A tiny real-codec probe avoids learning the first range's ratio by
-        # repeatedly overflowing a large candidate. It is planning only; every
-        # final archive still has an actual-size check and independent decoding.
+        from .compression_plan import sample_profile
         for number, (name, source) in enumerate(members.items(), 1):
-            size = source.stat().st_size
-            if size <= min(65536, settings.max_bytes // 4):
-                ratios[name] = 1.02
-                continue
-            count = min(size, 256 * 1024, max(4096, settings.max_bytes // 8))
-            sample = work / f'ratio-sample-{number:04d}.zip'
-            try:
-                compress_range(sample, name, source, 0, count, count * 2 + 4096,
-                    settings=settings, backend=backend, archiver=archiver,
-                    reporter=reporter, adaptive=False, stage_label='Sample compression ratio')
-                with zipfile.ZipFile(sample) as archive:
-                    ratios[name] = archive.getinfo(name).compress_size / max(1, count)
-            finally:
-                sample.unlink(missing_ok=True)
+            profiles[name] = sample_profile(source, name, work=work, number=number,
+                max_bytes=settings.max_bytes, reporter=reporter,
+                compress=lambda *args, **kwargs: compress_range(*args, settings=settings,
+                    backend=backend, archiver=archiver, **kwargs))
+            ratios[name] = profiles[name].estimate() / max(1, profiles[name].size)
     estimated = sum(path.stat().st_size * ratios.get(name, 1.02)
                     for name, path in members.items()) + len(members) * 512 + 22
     whole = inputs is not None and (small or (backend == '7zip' and estimated < settings.max_bytes * .90))
@@ -664,7 +656,9 @@ def _create_archive_parts(members: dict[str, Path], settings: ArchiveSettings, *
             (compress_whole or _compress_archive)(staged, inputs, settings, backend=backend,
                 archiver=archiver, reporter=reporter, max_bytes=None if small else settings.max_bytes)
             fits = staged.stat().st_size <= settings.max_bytes
-        except RangeTooLarge:
+        except RangeTooLarge as overflow:
+            if overflow.cleanup_error is not None:
+                raise
             fits = False
         if fits:
             _verify_members(staged, members, settings.method, reporter=reporter, checksums=checksums)
@@ -677,6 +671,7 @@ def _create_archive_parts(members: dict[str, Path], settings: ArchiveSettings, *
                 methods = {info.filename: names[info.compress_type] for info in archive.infolist()}
             strategy = 'single_small_archive' if small else 'single_archive_after_ratio_probe'
             parts = [BoundedPart(staged, methods)]
+            parts[0].compression_planning = {name: profile.receipt() for name, profile in profiles.items()}
             _record_archive_dictionaries(parts)
             return parts, signatures, strategy
         staged.unlink(missing_ok=True)
@@ -702,11 +697,13 @@ def _create_archive_parts(members: dict[str, Path], settings: ArchiveSettings, *
     parts = build_bounded_archives(
         members, work=work / 'bounded', basename=destination.name,
         max_bytes=settings.max_bytes, method=settings.method, reporter=reporter, checksums=checksums,
-        estimated_ratios=ratios,
+        estimated_ratios=ratios, compression_profiles=profiles,
         compress_range=lambda path, name, source, offset, count, limit: compress_range(
             path, name, source, offset, count, limit, settings=settings,
             backend=backend, archiver=archiver, reporter=reporter))
     _check_member_signatures(members, signatures)
+    for part in parts:
+        part.compression_planning = {name: profile.receipt() for name, profile in profiles.items()}
     _record_archive_dictionaries(parts)
     return parts, signatures, 'streamed_bounded_members'
 

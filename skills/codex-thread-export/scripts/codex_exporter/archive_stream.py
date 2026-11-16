@@ -36,6 +36,7 @@ class RangeTooLarge(RuntimeError):
         self.input_bytes = input_bytes
         self.output_bytes = output_bytes
         self.limit = limit
+        self.cleanup_error: OSError | None = None
 
 
 def _range_chunks(source: Path, offset: int, count: int, stop_input: threading.Event,
@@ -72,7 +73,9 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
     """
     if offset < 0 or count < 0 or limit < 1:
         raise ValueError('Range offsets, counts and compression budgets must be valid')
-    destination, source = Path(destination), Path(source)
+    # The external encoder runs with destination.parent as cwd. Absolute paths
+    # keep a relative request from accidentally repeating that directory.
+    destination, source = Path(destination).resolve(), Path(source).resolve()
     if destination.exists():
         raise FileExistsError(f'Refusing to replace a compression candidate: {destination}')
     require_space(destination.parent, min(1024 * 1024, max(0, count)),
@@ -95,9 +98,13 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
             stop_input.set()
 
     try:
-        if backend == 'python':
-            with reporter.stage(stage_label, total=count,
-                                detail=f'{name}; streamed range at byte {offset:,}') as meter:
+        python_backend = backend == 'python'
+        detail = (f'{name}; streamed range at byte {offset:,}' if python_backend else
+                  f'7-Zip: {name}; source offset {offset:,}')
+        with reporter.stage(stage_label, total=count if python_backend else None,
+                            unit='bytes' if python_backend else 'percent', detail=detail,
+                            retry_exceptions=(RangeTooLarge,) if adaptive else ()) as meter:
+            if python_backend:
                 with zipfile.ZipFile(destination, 'x', compression=zipfile.ZIP_DEFLATED,
                                      compresslevel=settings.level, allowZip64=True) as archive:
                     info = zipfile.ZipInfo(name)
@@ -112,45 +119,60 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
                             # forced flush blocks or ratio penalty are introduced.
                             archive.fp.flush()
                             monitor()
-                meter.update(state['bytes'], total=state['bytes'],
-                             detail=f'{name}; {state["bytes"]:,} source bytes compressed')
-        else:
-            if archiver is None:
-                raise ValueError('External range compression requires a 7-Zip executable')
-            method = 'LZMA' if settings.method.upper() == 'LZMA' else 'Deflate'
-            command = [str(archiver), 'a', '-tzip', f'-mx={settings.level}', f'-mm={method}',
-                       f'-mmt={settings.threads}', '-y', *SEVEN_ZIP_PROGRESS_ARGS]
-            if method == 'LZMA':
-                configured = int(settings.dictionary[:-1]) * (1024 ** {'k': 1, 'm': 2, 'g': 3}[settings.dictionary[-1].lower()])
-                # File-input 7-Zip automatically limits the encoder dictionary
-                # to available input. Stdin has unknown size, so supply the same
-                # bound explicitly; history beyond the whole range cannot help.
-                effective = max(4096, min(configured, count))
-                dictionary = settings.dictionary if effective >= configured else f'{effective}b'
-                command.extend([f'-md={dictionary}', f'-mfb={settings.word_size}'])
-            command.extend([f'-si{name}', str(destination)])
-            with reporter.stage(stage_label, total=None, unit='percent',
-                                detail=f'7-Zip: {name}; source offset {offset:,}') as meter:
+            else:
+                if archiver is None:
+                    raise ValueError('External range compression requires a 7-Zip executable')
+                method = 'LZMA' if settings.method.upper() == 'LZMA' else 'Deflate'
+                command = [str(archiver), 'a', '-tzip', f'-mx={settings.level}', f'-mm={method}',
+                           f'-mmt={settings.threads}', '-y', *SEVEN_ZIP_PROGRESS_ARGS]
+                if method == 'LZMA':
+                    configured = int(settings.dictionary[:-1]) * (1024 ** {'k': 1, 'm': 2, 'g': 3}[settings.dictionary[-1].lower()])
+                    # Stdin has unknown size. Limit encoder history to the known
+                    # input range; bytes beyond the range cannot improve matches.
+                    effective = max(4096, min(configured, count))
+                    dictionary = settings.dictionary if effective >= configured else f'{effective}b'
+                    command.extend([f'-md={dictionary}', f'-mfb={settings.word_size}'])
+                command.extend([f'-si{name}', str(destination)])
                 completed = run_seven_zip(command, cwd=destination.parent, progress=meter,
                                           input_chunks=chunks, on_tick=monitor,
                                           heartbeat_interval=0.05)
                 if completed.returncode:
                     diagnostic = (completed.stdout + '\n' + completed.stderr).strip()[-1600:]
                     raise RuntimeError(f'7-Zip range compression failed ({completed.returncode}): {diagnostic}')
-        if count and not state['bytes']:
-            raise RuntimeError('Archive compressor accepted no input bytes')
-        if not stop_input.is_set() and state['bytes'] != count:
-            raise RuntimeError('Archive compressor did not consume the complete requested range')
-        size = destination.stat().st_size
-        if size > limit:
-            raise RangeTooLarge(state['bytes'], size, limit)
-        with zipfile.ZipFile(destination) as archive:
-            infos = archive.infolist()
-            if len(infos) != 1 or infos[0].filename != name or infos[0].file_size != state['bytes']:
-                raise RuntimeError('Archive range compressor returned an unexpected member or byte count')
-        return CompressedRange(state['bytes'], state['digest'].hexdigest())
-    except BaseException:
-        destination.unlink(missing_ok=True)
+            # Codec flush and ZIP finalization can cross the budget even when
+            # every monitor tick fit. Keep these checks in the same stage so
+            # their retry/failure status is never falsely reported as complete.
+            if count and not state['bytes']:
+                raise RuntimeError('Archive compressor accepted no input bytes')
+            if not stop_input.is_set() and state['bytes'] != count:
+                raise RuntimeError('Archive compressor did not consume the complete requested range')
+            size = destination.stat().st_size
+            if size > limit:
+                raise RangeTooLarge(state['bytes'], size, limit)
+            with zipfile.ZipFile(destination) as archive:
+                infos = archive.infolist()
+                if len(infos) != 1 or infos[0].filename != name or infos[0].file_size != state['bytes']:
+                    raise RuntimeError('Archive range compressor returned an unexpected member or byte count')
+            if python_backend:
+                meter.update(state['bytes'], total=state['bytes'],
+                             detail=f'{name}; {state["bytes"]:,} source bytes compressed')
+            return CompressedRange(state['bytes'], state['digest'].hexdigest())
+    except BaseException as primary:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            # Retain the primary diagnostic, including its concrete exception
+            # type. A failed removal is separately visible and makes a budget
+            # overflow fatal to callers that would otherwise retry it.
+            if isinstance(primary, RangeTooLarge):
+                primary.cleanup_error = cleanup_error
+            detail = f'Could not remove rejected candidate {destination}: {cleanup_error}'
+            if hasattr(primary, 'add_note'):
+                primary.add_note(detail)
+            cleanup = reporter.stage('Clean rejected compression candidate',
+                                     total=1, unit='files', detail=detail)
+            cleanup.fail(detail=detail)
+            raise primary from cleanup_error
         raise
     finally:
         chunks.close()

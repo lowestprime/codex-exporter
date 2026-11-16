@@ -142,6 +142,7 @@ class ProgressReporter:
         self._live_rows = 0
         self._live_stage: StageProgress | None = None
         self._finished = False
+        self._detail = ''
         try:
             tty = bool(getattr(self.stream, 'isatty', lambda: False)())
         except (OSError, ValueError):
@@ -158,7 +159,7 @@ class ProgressReporter:
         self.color = self.style == 'rich' and 'NO_COLOR' not in os.environ
         self.unicode = self.style == 'rich'
         try:
-            '⠋✓✕━░…'.encode(getattr(self.stream, 'encoding', None) or 'utf-8')
+            '⠋✓✕↻━░…'.encode(getattr(self.stream, 'encoding', None) or 'utf-8')
         except (UnicodeEncodeError, LookupError):
             self.unicode = False
 
@@ -169,10 +170,15 @@ class ProgressReporter:
         self.finish(success=exc_type is None)
 
     def stage(self, name: str, *, total: float | None = None, unit: str = 'bytes',
-              detail: str = '') -> StageProgress:
+              detail: str = '',
+              retry_exceptions: tuple[type[Exception], ...] = ()) -> StageProgress:
+        if not isinstance(retry_exceptions, tuple) or any(
+                not isinstance(kind, type) or not issubclass(kind, Exception)
+                for kind in retry_exceptions):
+            raise TypeError('retry_exceptions must be a tuple of Exception subclasses')
         with self._lock:
             task = StageProgress(self, name, total=total, unit=unit, detail=detail,
-                                 index=len(self._stages) + 1)
+                                 index=len(self._stages) + 1, retry_exceptions=retry_exceptions)
             self._stages.append(task)
             self._emit(task, 'stage_start', force=True)
         task._start_heartbeat()
@@ -202,13 +208,16 @@ class ProgressReporter:
         done, total, unit = task.completed, task.total, task.unit
         complete = task.status == 'complete'
         failed = task.status == 'failed'
+        retry = task.status == 'retry'
         if self.style == 'rich':
-            icon = ('✕' if failed else '✓' if complete else
+            icon = ('✕' if failed else '✓' if complete else '↻' if retry else
                     _SPINNERS[int(stats['elapsed_seconds'] * 5) % len(_SPINNERS)])
             if not self.unicode:
-                icon = 'X' if failed else 'OK' if complete else '|/-\\'[int(stats['elapsed_seconds'] * 5) % 4]
+                icon = ('X' if failed else 'OK' if complete else 'RETRY' if retry else
+                        '|/-\\'[int(stats['elapsed_seconds'] * 5) % 4])
         else:
-            icon = '[failed]' if failed else '[done]' if complete else '[start]' if not task._emitted else '[working]'
+            icon = ('[failed]' if failed else '[done]' if complete else '[retry]' if retry else
+                    '[start]' if not task._emitted else '[working]')
         header = f'{icon} {task.index:02d} {task.name}'
         metrics = []
         percent = stats['percent']
@@ -255,7 +264,7 @@ class ProgressReporter:
                 filled = min(bar_width, max(0, int(bar_width * percent / 100)))
                 fill, empty = ('━', '░') if self.unicode else ('#', '-')
                 body = fill * filled + empty * (bar_width - filled) + ' ' + body
-        color = '31' if failed else '32' if complete else '36'
+        color = '31' if failed else '32' if complete else '33' if retry else '36'
         return [self._paint(_clip(header, width, self.unicode), color),
                 self._paint('    ' + _clip(body, width - 4, self.unicode), color)]
 
@@ -296,23 +305,33 @@ class ProgressReporter:
         task._last_emit = now
         task._emitted = True
 
-    def finish(self, *, detail: str = '', success: bool = True) -> None:
+    def set_detail(self, detail: str) -> None:
+        """Save final-summary context without finishing before resource cleanup."""
+        with self._lock:
+            if not self._finished:
+                self._detail = _clean(detail)
+
+    def finish(self, *, detail: str | None = None, success: bool = True) -> None:
         with self._lock:
             if self._finished:
                 return
             self._finished = True
+            detail = self._detail if detail is None else _clean(detail)
             if self.style == 'off':
                 return
             now = self._clock()
             elapsed = max(0.0, now - self.started)
             completed = sum(task.status == 'complete' for task in self._stages)
             failed = sum(task.status == 'failed' for task in self._stages)
-            success = success and not failed and completed == len(self._stages)
+            retried = sum(task.status == 'retry' for task in self._stages)
+            settled = completed + retried
+            success = success and not failed and settled == len(self._stages)
             status = 'complete' if success else 'failed'
             if self.style == 'json':
                 self._write(json.dumps({'event': 'export_complete' if success else 'export_failed',
                                         'status': status, 'elapsed_seconds': elapsed,
                                         'stages_completed': completed, 'stages_failed': failed,
+                                        'stages_retried': retried, 'stages_settled': settled,
                                         'stages_total': len(self._stages), 'detail': _clean(detail)},
                                        ensure_ascii=True, allow_nan=False) + '\n')
                 return
@@ -320,20 +339,30 @@ class ProgressReporter:
                 self._write('\n')
                 self._live_rows = 0
             icon = ('✓' if success else '✕') if self.unicode else ('[done]' if success else '[failed]')
-            line = f'{icon} Export {status} | {completed}/{len(self._stages)} stages | total {_duration(elapsed)}'
+            line = f'{icon} Export {status} | {settled}/{len(self._stages)} stages'
+            if retried:
+                line += f' | {retried} retried attempt' + ('s' if retried != 1 else '')
+            line += f' | total {_duration(elapsed)}'
             if detail:
                 line += ' | ' + _clean(detail)
             self._write(self._paint(line, '32' if success else '31') + '\n')
 
 
 class StageProgress:
-    """Absolute or incremental counters for one stage; context exit records status."""
+    """Measured counters for one stage, including explicitly retryable attempts.
+
+    Retry exceptions are never suppressed. The caller must recover or finish
+    the overall export with success=False; only known planning control flow
+    should opt into this status. Other exceptions remain permanent failures.
+    """
 
     def __init__(self, reporter: ProgressReporter, name: str, *, total: float | None,
-                 unit: str, detail: str, index: int):
+                 unit: str, detail: str, index: int,
+                 retry_exceptions: tuple[type[Exception], ...] = ()):
         self.reporter = reporter
         self.name = _clean(name, 120)
         self.index = index
+        self._retry_exceptions = retry_exceptions
         self.unit = _clean(unit, 32)
         self.total = _finite_count(total, 'total') if total is not None else None
         self.completed = 0.0
@@ -373,6 +402,8 @@ class StageProgress:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         if exc_type is None:
             self.complete()
+        elif isinstance(exc_value, self._retry_exceptions):
+            self.retry(detail=str(exc_value) or exc_type.__name__)
         else:
             self.fail(detail=str(exc_value) if exc_value else exc_type.__name__)
 
@@ -417,6 +448,19 @@ class StageProgress:
             self.ended = self.reporter._clock()
             self._heartbeat_stop.set()
             self.reporter._emit(self, 'stage_complete', force=True)
+        self._stop_heartbeat()
+
+    def retry(self, *, detail: str | None = None) -> None:
+        """End a known retryable attempt without declaring the export successful."""
+        with self.reporter._lock:
+            if self.status != 'running':
+                return
+            if detail is not None:
+                self.detail = _clean(detail)
+            self.status = 'retry'
+            self.ended = self.reporter._clock()
+            self._heartbeat_stop.set()
+            self.reporter._emit(self, 'stage_retry', force=True)
         self._stop_heartbeat()
 
     def fail(self, *, detail: str | None = None) -> None:
@@ -617,15 +661,19 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
             except (BrokenPipeError, OSError):
                 pass
 
-    reader = threading.Thread(target=read_pipe, name='codex-7zip-output', daemon=True)
-    writer = (threading.Thread(target=write_pipe, name='codex-7zip-input', daemon=True)
-              if input_chunks is not None else None)
+    reader: threading.Thread | None = None
+    writer: threading.Thread | None = None
     started = time.monotonic()
-    reader.start()
-    if writer is not None:
-        writer.start()
     eof = False
     try:
+        # Child ownership starts at Popen, including a failure to start either
+        # helper thread. Unstarted threads must never be joined during cleanup.
+        reader = threading.Thread(target=read_pipe, name='codex-7zip-output', daemon=True)
+        writer = (threading.Thread(target=write_pipe, name='codex-7zip-input', daemon=True)
+                  if input_chunks is not None else None)
+        reader.start()
+        if writer is not None:
+            writer.start()
         while not eof or process.poll() is None:
             if on_tick is not None:
                 on_tick()
@@ -668,7 +716,15 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
         try:
             _stop_process(process)
         finally:
-            if writer is not None:
+            if writer is not None and writer.ident is not None:
                 writer.join(timeout=3)
-            reader.join(timeout=1)
+            # The writer normally closes stdin; a startup failure has no writer
+            # to do so. Close the owned pipe on that path as well.
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            if reader is not None and reader.ident is not None:
+                reader.join(timeout=1)
             process.stdout.close()

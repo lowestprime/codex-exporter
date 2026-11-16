@@ -124,6 +124,7 @@ def _package_batch_impl(results: list[dict[str, Any]], destination: Path, settin
         result = {
             'archive': str(destinations[0]), 'archives': [str(path) for path in destinations],
             'archive_count': len(parts), 'archive_verified': True,
+            'archive_compression_planning': parts[0].compression_planning,
             'archive_packing': parts[0].packing or {'parts': 1, 'fixed_piece_minimum_proved': True,
                 'scope': 'One complete archive; no multipart packing needed'},
             'archive_max_bytes': settings.max_bytes, 'archive_method': settings.method,

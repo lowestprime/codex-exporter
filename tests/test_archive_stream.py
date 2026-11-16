@@ -359,3 +359,166 @@ def test_real_seven_zip_bounded_streams_reconstruct_all_content(tmp_path):
     assert len(parts) >= 4 and max(part.size_bytes for part in parts) <= settings.max_bytes
     assert _rebuild([part.path for part in parts]) == {source.name: raw}
     assert set((tmp_path / 'private').iterdir()) == {part.path for part in parts}
+
+
+def _progress_events(stream):
+    return [json.loads(line) for line in stream.getvalue().splitlines()]
+
+
+def test_range_retry_then_verified_parts_finishes_successfully(tmp_path):
+    import io
+    raw = random.Random(157).randbytes(70_000)
+    source = tmp_path / 'native.bin'
+    source.write_bytes(raw)
+    stream = io.StringIO()
+    reporter = progress.ProgressReporter(style='json', stream=stream)
+    settings = ArchiveSettings(method='Deflate', backend='python', max_bytes=32_768)
+    with reporter:
+        parts = build_bounded_archives({source.name: source}, work=tmp_path / 'private',
+            basename='output.zip', max_bytes=settings.max_bytes, method='Deflate',
+            reporter=reporter,
+            compress_range=lambda path, name, original, offset, count, limit: compress_range(
+                path, name, original, offset, count, limit, settings=settings,
+                backend='python', reporter=reporter))
+    assert _rebuild([part.path for part in parts]) == {source.name: raw}
+    result = _progress_events(stream)
+    assert any(row['event'] == 'stage_retry' for row in result)
+    assert not any(row['event'] == 'stage_failed' for row in result)
+    assert result[-1]['event'] == 'export_complete'
+    assert result[-1]['stages_retried'] >= 1
+    assert result[-1]['stages_settled'] == result[-1]['stages_total']
+
+
+def test_size_overflow_only_after_zip_finalization_is_still_a_retry(tmp_path):
+    import io
+    raw = b'a' * 10
+    source = tmp_path / 'native.bin'
+    source.write_bytes(raw)
+    settings = ArchiveSettings(method='Deflate', backend='python')
+    control = tmp_path / 'control.zip'
+    compress_range(control, 'native.bin', source, 0, len(raw), 10_000,
+                   settings=settings, backend='python')
+    # No monitor tick can observe this overflow: it occurs only when the ZIP
+    # closes and adds its central-directory records after encoder flush.
+    limit = control.stat().st_size - 1
+    stream = io.StringIO()
+    reporter = progress.ProgressReporter(style='json', stream=stream)
+    output = tmp_path / 'candidate.zip'
+    with pytest.raises(RangeTooLarge):
+        compress_range(output, 'native.bin', source, 0, len(raw), limit,
+                       settings=settings, backend='python', reporter=reporter)
+    result = _progress_events(stream)
+    assert result[-1]['event'] == 'stage_retry'
+    assert not any(row['event'] == 'stage_complete' for row in result)
+    assert not output.exists()
+    assert source.read_bytes() == raw
+
+
+def test_nonadaptive_probe_budget_overflow_remains_a_failure(tmp_path):
+    import io
+    source = tmp_path / 'native.bin'
+    source.write_bytes(random.Random(163).randbytes(10_000))
+    stream = io.StringIO()
+    reporter = progress.ProgressReporter(style='json', stream=stream)
+    with pytest.raises(RangeTooLarge):
+        compress_range(tmp_path / 'probe.zip', 'native.bin', source, 0, 10_000, 1_000,
+            settings=ArchiveSettings(method='Deflate', backend='python'),
+            backend='python', adaptive=False, reporter=reporter)
+    result = _progress_events(stream)
+    assert result[-1]['event'] == 'stage_failed'
+    assert not any(row['event'] == 'stage_retry' for row in result)
+
+
+@pytest.mark.parametrize('failure', ['returncode', 'inventory'])
+def test_real_encoder_and_postencode_validation_errors_remain_fatal(tmp_path, monkeypatch, failure):
+    import io
+    source = tmp_path / 'native.bin'
+    source.write_bytes(b'captured data')
+    output = tmp_path / 'candidate.zip'
+    stream = io.StringIO()
+    reporter = progress.ProgressReporter(style='json', stream=stream)
+
+    def encoder(command, **kwargs):
+        raw = b''.join(kwargs['input_chunks'])
+        if failure == 'returncode':
+            return subprocess.CompletedProcess(command, 7, 'synthetic encoder error', '')
+        with zipfile.ZipFile(output, 'x') as archive:
+            archive.writestr('wrong-member.bin', raw)
+        return subprocess.CompletedProcess(command, 0, '', '')
+
+    monkeypatch.setattr(archive_stream, 'run_seven_zip', encoder)
+    with pytest.raises(RuntimeError, match='failed|unexpected member'):
+        compress_range(output, 'native.bin', source, 0, source.stat().st_size, 10_000,
+            settings=ArchiveSettings(), backend='7zip', archiver=tmp_path / '7zz', reporter=reporter)
+    result = _progress_events(stream)
+    assert result[-1]['event'] == 'stage_failed'
+    assert not any(row['event'] in ('stage_complete', 'stage_retry') for row in result)
+    assert not output.exists()
+
+
+def test_real_seven_zip_range_accepts_relative_paths(tmp_path, monkeypatch):
+    executable = os.environ.get('CODEX_EXPORT_TEST_7Z') or shutil.which('7zz') or shutil.which('7z')
+    if not executable:
+        pytest.skip('Optional integration test requires a 7-Zip CLI')
+    executable = Path(executable).resolve()
+    monkeypatch.chdir(tmp_path)
+    Path('work').mkdir()
+    raw = b'{"text":"relative paths preserve exact bytes"}\n' * 100
+    Path('native.jsonl').write_bytes(raw)
+    result = compress_range(Path('work/output.zip'), 'native.jsonl', Path('native.jsonl'),
+        0, len(raw), 100_000, settings=ArchiveSettings(dictionary='8m', threads=2),
+        backend='7zip', archiver=executable)
+    assert result.sha256 == _digest(raw)
+    with zipfile.ZipFile('work/output.zip') as archive:
+        assert archive.read('native.jsonl') == raw
+    assert sorted(path.name for path in Path('work').iterdir()) == ['output.zip']
+
+
+@pytest.mark.parametrize('failure', ['encoder', 'budget'])
+def test_rejected_candidate_cleanup_preserves_primary_error_and_is_visible(
+        tmp_path, monkeypatch, failure):
+    import io
+    source = tmp_path / 'native.bin'
+    source.write_bytes(random.Random(167).randbytes(10_000))
+    output = tmp_path / 'candidate.zip'
+    stream = io.StringIO()
+    reporter = progress.ProgressReporter(style='json', stream=stream)
+    unlink = Path.unlink
+    cleanup_error = PermissionError('Synthetic candidate is still locked')
+
+    def fail_unlink(path, *args, **kwargs):
+        if path == output:
+            raise cleanup_error
+        return unlink(path, *args, **kwargs)
+
+    def failed_encoder(command, **kwargs):
+        b''.join(kwargs['input_chunks'])
+        output.write_bytes(b'failed encoder output')
+        return subprocess.CompletedProcess(command, 7, 'primary encoder diagnostic', '')
+
+    monkeypatch.setattr(Path, 'unlink', fail_unlink)
+    if failure == 'encoder':
+        monkeypatch.setattr(archive_stream, 'run_seven_zip', failed_encoder)
+    expected = RuntimeError if failure == 'encoder' else RangeTooLarge
+    match = 'primary encoder diagnostic' if failure == 'encoder' else 'planning budget'
+    with pytest.raises(expected, match=match) as caught:
+        with reporter:
+            compress_range(output, 'native.bin', source, 0, source.stat().st_size,
+                1_000 if failure == 'budget' else 100_000,
+                settings=ArchiveSettings(method='Deflate', backend='python'),
+                backend='python' if failure == 'budget' else '7zip',
+                archiver=tmp_path / '7zz', reporter=reporter)
+    assert caught.value.__cause__ is cleanup_error
+    if failure == 'budget':
+        assert caught.value.cleanup_error is cleanup_error
+    if sys.version_info >= (3, 11):
+        assert any('still locked' in note for note in caught.value.__notes__)
+    result = _progress_events(stream)
+    assert result[-1]['event'] == 'export_failed'
+    cleanup = next(row for row in result if row['event'] == 'stage_failed'
+                   and row['stage'] == 'Clean rejected compression candidate')
+    assert str(output) in cleanup['detail']
+    assert 'still locked' in cleanup['detail']
+    assert result[-1]['stages_failed'] >= 1
+    assert output.exists()
+    assert source.exists()

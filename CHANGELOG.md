@@ -1,3 +1,31 @@
+## 0.5.1 — Accurate completion, heterogeneous compression, and EOF parity (2026-11-15)
+
+- Report recovered range/whole-archive budget overflows as retries. Keep genuine
+  errors fatal, include explicit JSON retry counts, and finalize reporting only
+  after output operations and owned-resource cleanup complete.
+- Replace prefix-only compression sampling with bounded stratified samples across
+  members. Use regional predictions and measured completed ranges for later
+  boundaries; retain exact cap, CRC/SHA checks, encoded-stream reuse and packing.
+- Unify EOF completeness checks for immutable export snapshots and read-only turn
+  listing. Preserve supported legacy repairs and native bytes; defer incomplete
+  JSON/UTF-8 consistently.
+- Resolve relative ranged-compression paths before changing the child directory.
+  Preserve primary compression errors when candidate deletion also fails; do not
+  treat a cleanup failure as a recoverable size retry.
+- Reap compressors and close pipes when diagnostic/input thread startup fails.
+  Keep cancellation and real encoder errors visible in final progress.
+- Preserve v0.5.0 sorting, paging, versioned help, timestamps, naming, low-disk
+  staging, native source preservation and saved compression preferences.
+
+## 0.5.0 — Lower working storage and navigable listings (2026-11-14)
+
+- Borrow verified snapshots for archive-only native members and stream exact
+  ranges without duplicate raw segment files. Retain explicit loose outputs.
+- Add configurable work storage, bounded measured packing, consistent archive
+  stems, customizable sorting and terminal-aware listing navigation.
+- Add default recorded timestamps with timezone controls and complete versioned
+  help including effective preferences. Bare aliases show identical help.
+
 ## 0.4.0 — Bounded archive sets, exact excerpts, and inclusive selection (2026-11-13)
 
 - Enforce a conservative 512,000,000-byte hard ceiling on all export/review ZIPs.
