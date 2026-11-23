@@ -46,6 +46,10 @@ selection use the same human-turn index. Buffered rendering respects native
 message/tool identities, retains separate repeated occurrences, and pairs tool
 outputs using call IDs. Invalid zero range bounds are rejected.
 
+Modern command completions now retain their aggregate output, recorded exit code,
+and status. Separate stdout/stderr text is retained when the aggregate does not
+contain it, while the configured output-length policy remains in effect.
+
 PowerShell and Bash include `cdx-since-text`, `cdx-since-turn`, `cdx-since-id`, and
 `cdx-since-time` in addition to the generic selector helper:
 

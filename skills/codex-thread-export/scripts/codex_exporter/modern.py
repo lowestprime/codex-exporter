@@ -352,7 +352,7 @@ def stream_export(source: Path, destination: Path, *, session_id: str, title: st
                         tool_outputs=tool_outputs, max_tool_chars=max_tool_chars,
                         strip=strip, max_line_chars=max_line_chars, max_repeated_lines=max_repeated_lines)
                     if rec is None or not rec.text.strip():
-                        reason = cli.known_ignored_reason(obj, include_reasoning_summaries)
+                        reason = cli.known_ignored_reason(obj, include_reasoning_summaries, include_actions=True)
                         counts['ignored_' + reason] += 1
                         if reason == 'unrecognized_schema':
                             counts['unknown_events'] += 1

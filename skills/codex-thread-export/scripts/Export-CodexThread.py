@@ -1047,6 +1047,24 @@ def strip_codex_tool_metadata(text: str) -> tuple[str, dict[str, Any]]:
     return text, meta
 
 
+def tool_output_metadata(obj: dict[str, Any]) -> dict[str, Any]:
+    """Normalize completion aliases without treating command ``code`` as an exit code."""
+    nested = obj.get("metadata")
+    meta = dict(nested) if isinstance(nested, dict) else {}
+    for key in ("exit_code", "exitCode", "code"):
+        if key in meta:
+            meta["exit_code"] = meta[key]
+            break
+    # Presence matters: an explicit null overrides a stale nested completion.
+    for key in ("exit_code", "exitCode"):
+        if key in obj:
+            meta["exit_code"] = obj[key]
+            break
+    if "status" in obj:
+        meta["status"] = obj["status"]
+    return meta
+
+
 def extract_output_and_meta(
     obj: dict[str, Any],
     *,
@@ -1054,18 +1072,49 @@ def extract_output_and_meta(
     max_line_chars: int,
     max_repeated_lines: int,
 ) -> tuple[str, dict[str, Any]]:
+    root_meta = tool_output_metadata(obj)
     meta: dict[str, Any] = {}
 
-    # Tool output records often have {"output":"...","metadata":{...}} as a JSON string.
-    for key in ("output", "result", "stdout", "stderr", "text", "content", "message", "diff", "patch"):
+    def literal_text(value: Any) -> str:
+        # Console streams can themselves be JSON or start with "Output:".
+        # They are recorded body text, not a tool transport envelope.
+        return extract_text(value, strip=strip, max_line_chars=max_line_chars,
+                            max_repeated_lines=max_repeated_lines, json_aware=False)
+
+    aggregate = next((obj[key] for key in ("aggregated_output", "aggregatedOutput")
+                      if isinstance(obj.get(key), str) and obj[key].strip()), None)
+    if aggregate is not None:
+        parts = [literal_text(aggregate)]
+        for name in ("stdout", "stderr"):
+            stream = obj.get(name)
+            # Aggregates can have different truncation budgets. Retain the full
+            # recorded stream when it adds text; overlapping text is intentional.
+            # Compare raw strings before applying configured output cleanup.
+            if isinstance(stream, str) and stream.strip() and stream not in aggregate:
+                body = literal_text(stream)
+                if body:
+                    parts.append(f"Recorded full {name}:\n{body}")
+        return "\n\n".join(part for part in parts if part), root_meta
+
+    # Empty/null/non-string aggregates fall back to established alternatives.
+    # output/result/content are alternative representations, not extra streams.
+    for key in ("output", "result", "stdout", "text", "content", "message", "diff", "patch"):
+        if key == "stdout":
+            streams = [(name, literal_text(obj.get(name))) for name in ("stdout", "stderr")]
+            streams = [(name, body) for name, body in streams if body]
+            if streams:
+                text = ("\n\n".join(f"{name}:\n{body}" for name, body in streams)
+                        if len(streams) > 1 else streams[0][1])
+                meta.update(root_meta)
+                return text, meta
+            continue
         if key not in obj:
             continue
 
         value = obj.get(key)
         parsed = maybe_json(value) if isinstance(value, str) else None
         if isinstance(parsed, dict):
-            if isinstance(parsed.get("metadata"), dict):
-                meta.update(parsed["metadata"])
+            meta.update(tool_output_metadata(parsed))
             text = extract_text(
                 parsed.get("output") if "output" in parsed else parsed,
                 strip=strip,
@@ -1084,12 +1133,12 @@ def extract_output_and_meta(
 
         if text:
             clean_text, transport_meta = strip_codex_tool_metadata(text)
-            meta.update({k: v for k, v in transport_meta.items() if k not in meta})
-            return clean_text, meta
+            merged = dict(transport_meta)
+            merged.update(meta)
+            merged.update(root_meta)
+            return clean_text, merged
 
-    if isinstance(obj.get("metadata"), dict):
-        meta.update(obj["metadata"])
-
+    meta.update(root_meta)
     return "", meta
 
 
@@ -1247,6 +1296,25 @@ def render_patch_file_block(file_info: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def tool_completion_lines(meta: dict[str, Any], *, output_says_success: bool = False) -> list[str]:
+    """Show recorded completion without claiming success for failed/running states."""
+    exit_code = next((meta[key] for key in ("exit_code", "exitCode", "code") if key in meta), None)
+    raw_status = meta.get("status")
+    status = raw_status.strip() if isinstance(raw_status, str) else ""
+    permits_success = not status or status.casefold() in {"completed", "success", "succeeded"}
+    lines: list[str] = []
+    if exit_code not in (None, ""):
+        if (exit_code == 0 or str(exit_code) == "0") and permits_success:
+            lines.append("Success (exit code 0)")
+        else:
+            lines.append(f"Exit code {exit_code}")
+    elif output_says_success and permits_success:
+        lines.append("Success")
+    if status:
+        lines.append(f"Status: {status}")
+    return lines
+
+
 def render_apply_patch_record(command: str, output: str, meta: dict[str, Any]) -> str:
     files = parse_apply_patch(command)
     if not files:
@@ -1274,9 +1342,7 @@ def render_apply_patch_record(command: str, output: str, meta: dict[str, Any]) -
     if cleaned_output and not cleaned_output.lower().startswith("success. updated the following files"):
         parts.append(fenced_block(cleaned_output, guess_lang(cleaned_output, "text"), 3))
 
-    exit_code = meta.get("exit_code", meta.get("exitCode", meta.get("code")))
-    if exit_code == 0 or str(exit_code) == "0" or cleaned_output.lower().startswith("success"):
-        parts.append("Success")
+    parts.extend(tool_completion_lines(meta, output_says_success=cleaned_output.lower().startswith("success")))
 
     return "\n\n".join(p for p in parts if p).strip()
 
@@ -1300,9 +1366,10 @@ def render_action_record(
             out_key = hashlib.sha256(patch_text.encode("utf-8", errors="ignore")).hexdigest()
             return Record("action", "tool", patch_text, timestamp, source_type or title, seq, cmd_key, out_key)
 
-    # Drop tool lifecycle placeholders that carry neither a command nor output.
-    # The GUI direct-copy transcript does not include empty transport markers.
-    if not command and not output:
+    completion = tool_completion_lines(meta)
+    # Keep recorded completion even when an output-body policy hides the body.
+    # Empty transport placeholders still do not create presentation records.
+    if not command and not output and not completion:
         return None
 
     chunks: list[str] = []
@@ -1317,18 +1384,7 @@ def render_action_record(
         # itself is the substantive content.
         chunks.append(fenced_block(output, guess_lang(output, "text"), 3))
 
-    exit_code = meta.get("exit_code")
-    if exit_code is None:
-        exit_code = meta.get("exitCode")
-    if exit_code is None:
-        exit_code = meta.get("code")
-
-    if exit_code == 0 or str(exit_code) == "0":
-        # GUI-style direct copies show "Success"; keep it concise and searchable.
-        if output or command:
-            chunks.append("Success")
-    elif exit_code not in (None, ""):
-        chunks.append(f"Exit code {exit_code}")
+    chunks.extend(completion)
 
     text = "\n\n".join(chunks).strip()
     if not text:
@@ -1391,11 +1447,51 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
     ).strip()
 
 
+# Exact discriminator registries for auditing action-disabled views. The
+# renderer's ACTION_HINTS are compatibility heuristics, not proof that an
+# arbitrary future tool-like schema is understood. Keep these names explicit.
+# Native names: openai/codex codex-rs/protocol/src/items.rs (TurnItem).
+# Response/event names: protocol/src/models.rs and protocol/src/protocol.rs;
+# local_shell_call_output and event/item wrappers also have repository fixtures.
+KNOWN_NATIVE_ACTION_ITEMS = frozenset({
+    "commandexecution", "functioncalloutput", "dynamictoolcall", "filechange",
+    "extension", "mcptoolcall", "imageview",
+})
+KNOWN_RESPONSE_ACTION_TYPES = frozenset({
+    "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+    "local_shell_call", "local_shell_call_output", "mcp_tool_call_output",
+    "web_search_call", "tool_search_call", "tool_search_output", "image_generation_call",
+})
+KNOWN_LEGACY_ACTION_EVENTS = frozenset({
+    "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_updated",
+    "patch_apply_end", "mcp_tool_call_begin", "mcp_tool_call_end",
+    "dynamic_tool_call_request", "dynamic_tool_call_response", "view_image_tool_call",
+})
+
+
+def is_known_action_schema(obj: dict[str, Any]) -> bool:
+    """Recognize supported action envelopes using discriminator strings only.
+
+    This must never extract, parse, stringify, or traverse command/output bodies:
+    a message-only selection may skip gigabytes of those fields. Known action
+    identity does not assert that every possible body field has a rendered view.
+    """
+    top, payload, payload_type, item, item_type = event_type_blob(obj)
+    subtype = item_type.casefold()
+    if top == "event_msg" and payload_type in {"item_started", "item_updated", "item_completed"}:
+        return subtype in KNOWN_NATIVE_ACTION_ITEMS or subtype in KNOWN_RESPONSE_ACTION_TYPES
+    if top in {"event", "response_item", "event_msg"}:
+        if item:
+            return payload_type == "item" and subtype in KNOWN_RESPONSE_ACTION_TYPES
+        return (payload_type in KNOWN_RESPONSE_ACTION_TYPES or
+                (top in {"event", "event_msg"} and payload_type in KNOWN_LEGACY_ACTION_EVENTS))
+    return not payload and top in KNOWN_RESPONSE_ACTION_TYPES | KNOWN_LEGACY_ACTION_EVENTS
+
+
 def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool, *, include_actions: bool = True) -> str:
     top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
     ptype = (payload_type if payload_type not in {"item_completed", "item_started", "item_updated"} else item_type).casefold()
-    if (not include_actions and top_type == "event_msg" and payload_type == "item_completed"
-            and ptype in {"filechange", "extension", "mcptoolcall", "imageview"}):
+    if not include_actions and is_known_action_schema(obj):
         return "action_rendering_disabled"
     if top_type == "response_item" and ptype == "configuration_update":
         return "configuration_metadata"

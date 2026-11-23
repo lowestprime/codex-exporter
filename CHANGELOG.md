@@ -17,6 +17,8 @@
   results by call ID, and reject explicit zero message-range bounds.
 - Resolve response/turn selectors inside an indexed last-N human scope; report
   pending turns without a response as clear errors instead of publishing empties.
+- Preserve aggregate command output and root completion metadata, retain separate
+  stdout/stderr content when needed, and keep literal console JSON intact.
 - Add typed since helpers for PowerShell and Bash, recognize configuration-update
   metadata, and keep known hidden action schemas valid under strict mode.
 

@@ -303,16 +303,38 @@ def test_pending_turn_without_response_reports_clear_error_and_no_empty_export(t
     assert not list((tmp_path/'out').glob('*.md'))
 
 
-def test_strict_message_selection_does_not_fail_only_because_known_actions_are_hidden(tmp_path):
+@pytest.mark.parametrize('mode_args', [
+    ('--mode','last-assistant'), ('--mode','last-substantial','--min-chars','1'),
+    ('--mode','message','--message','2'), ('--mode','range','--from-message','2','--to-message','2'),
+    ('--mode','chat'),
+])
+def test_strict_message_selection_does_not_fail_only_because_known_actions_are_hidden(tmp_path,mode_args):
     source=tmp_path/f'rollout-{SID}.jsonl'
     rows=[
         {'type':'event_msg','payload':{'type':'user_message','message':'Synthetic request'}},
         {'type':'event_msg','payload':{'type':'item_completed','item':{'type':'FileChange','changes':{'synthetic.txt':{'type':'add','content':'saved'}}}}},
+        {'type':'event_msg','payload':{'type':'item_completed','item':{'type':'CommandExecution','command':['echo','synthetic'],'aggregated_output':'recorded output'}}},
+        {'type':'event_msg','payload':{'type':'item_completed','item':{'type':'FunctionCallOutput','name':'synthetic','output':'recorded output'}}},
         {'type':'event_msg','payload':{'type':'agent_message','message':'Synthetic response'}},
     ]
     source.write_text(''.join(json.dumps(row)+'\n' for row in rows))
-    result=run(source,tmp_path,'--mode','last-assistant','--strict-events')
+    result=run(source,tmp_path,*mode_args,'--strict-events')
     assert result.returncode==0,result.stderr
     value=json.loads(result.stdout)
     native=Path(value['source_copy']).read_text()
-    assert 'Synthetic response' in native and 'FileChange' not in native
+    assert 'Synthetic response' in native
+    assert all(kind not in native for kind in ('FileChange','CommandExecution','FunctionCallOutput'))
+
+
+@pytest.mark.parametrize('kind',['FutureToolCall','UnknownCommandExecution'])
+def test_strict_message_view_still_rejects_unknown_future_tool_like_schema(tmp_path,kind):
+    source=tmp_path/f'rollout-{SID}.jsonl'
+    rows=[
+        {'type':'event_msg','payload':{'type':'item_completed','item':{'type':kind,'command':'echo synthetic','output':'unknown body'}}},
+        {'type':'event_msg','payload':{'type':'agent_message','message':'Recorded response'}},
+    ]
+    source.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    result=run(source,tmp_path,'--mode','last-assistant','--strict-events')
+    assert result.returncode != 0
+    assert 'Unknown event schemas' in result.stderr
+    assert not list((tmp_path/'out').glob('*.md'))

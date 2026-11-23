@@ -140,11 +140,37 @@ retain their documented first/last defaults. Indices are one-based.
 
 `response_item/configuration_update` is recognized as configuration metadata.
 Its native bytes remain present; it is not treated as a user turn or a tool
-result. Known modern file-change, extension, MCP-tool, and image-view completions
-remain recognized when a message-only view hides actions, so `--strict-events`
-does not reject them merely because actions are disabled. Unrecognized schemas
-still fail strict handling. Streaming defaults continue to preserve recorded
+result. Supported native command/function-output, file-change, extension, MCP-tool,
+image-view, and legacy action discriminators remain recognized when a message-only
+view hides actions, so `--strict-events` does not reject them merely because actions
+are disabled. Recognition checks explicit schema discriminators without traversing
+large hidden output bodies. An arbitrary new name containing a tool-like word is
+not automatically accepted; unrecognized schemas still fail strict handling. Streaming defaults continue to preserve recorded
 adjacent duplicates.
+
+## Recorded command output and completion state
+
+Modern command-completion records can store their console text in
+`aggregated_output` rather than `output` or `stdout`. The extractor now reads
+nonempty `aggregated_output`/`aggregatedOutput` strings and the recorded root
+`exit_code`/`exitCode` and `status`. Explicit root metadata takes precedence over
+nested transport hints. A failed or in-progress status is not labeled successful.
+Console strings remain literal, including output that happens to look like JSON.
+
+When the aggregate is present, it is the primary representation. An independently
+recorded stdout or stderr stream is added, with a label, only when its complete
+raw text is not already contained in that aggregate. This preserves separately
+recorded text when the aggregate was capped; any overlapping text remains visible
+rather than being reconstructed by a guessed diff. When no combined representation
+exists, nonempty stdout and stderr are both retained with labels if both exist.
+Other `output`/`result`/`content` representations retain their alternative-field
+precedence rather than being concatenated indiscriminately. Empty, null, and
+unsupported aggregate containers fall through to supported alternatives.
+
+The existing `none`, `summary`, `tail`, and `full` output policies apply afterward.
+This can intentionally add output and completion information to Markdown from
+older captures. The original native bytes, source identities, and selection
+coordinates are unchanged.
 
 ## Typed shell helpers
 
@@ -223,4 +249,8 @@ Linux test run.
 - [7-Zip-Zstandard progress printer](https://github.com/mcmilk/7-Zip-zstd/blob/master/CPP/7zip/UI/Console/PercentPrinter.cpp)
 - [Python subprocess pipe and lifecycle semantics](https://docs.python.org/3.13/library/subprocess.html)
 - [Python text I/O newline semantics](https://docs.python.org/3.13/library/io.html)
+- [Codex native protocol item definitions](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/items.rs)
+- [Codex command-completion emitter](https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/events.rs)
+- [Codex stream aggregation](https://github.com/openai/codex/blob/main/codex-rs/core/src/exec.rs)
+- [Codex response item definitions](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs)
 - [PowerShell advanced parameter binding](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_functions_advanced_parameters?view=powershell-7)
