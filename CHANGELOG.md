@@ -19,6 +19,10 @@
   pending turns without a response as clear errors instead of publishing empties.
 - Preserve aggregate command output and root completion metadata, retain separate
   stdout/stderr content when needed, and keep literal console JSON intact.
+- Synchronize the silent-encoder progress regression with the observer instead of
+  assuming an operating-system pipe size or scheduler timing.
+- Update CI/release actions to verified Node 24 implementations and pin each action
+  to its full commit SHA.
 - Add typed since helpers for PowerShell and Bash, recognize configuration-update
   metadata, and keep known hidden action schemas valid under strict mode.
 

@@ -141,15 +141,36 @@ def test_unknown_and_warming_eta_states_are_explicit_in_plain_output():
 
 
 def test_stdin_fallback_is_labeled_input_feed_not_encoder_completion():
-    stream = io.StringIO()
+    raw = b'x' * (128 * 1024)
+    observed_feed = threading.Event()
+
+    class ObservedProgress(io.StringIO):
+        def write(self, text):
+            written = super().write(text)
+            for line in text.splitlines():
+                row = json.loads(line)
+                if (row['event'] == 'stage_progress' and
+                        row['progress_basis'] == 'stdin_bytes_sent' and
+                        0 < row['completed'] < len(raw)):
+                    observed_feed.set()
+            return written
+
+    def input_chunks():
+        yield raw[:8192]
+        # Pipe capacity varies by OS. Keep an interior state observable before
+        # releasing the rest, rather than relying on the child draining slowly.
+        if not observed_feed.wait(timeout=5):
+            raise AssertionError('No interior stdin fallback update observed before producer timeout')
+        yield raw[8192:]
+
+    stream = ObservedProgress()
     reporter = ProgressReporter(style='json', stream=stream, interval=0)
     program = ('import sys,time\n'
                'while sys.stdin.buffer.read(4096): time.sleep(0.01)\n'
                'time.sleep(0.25)\n')
-    raw = b'x' * (128 * 1024)
     with reporter.stage('Silent codec', total=len(raw), unit='bytes') as meter:
         result = run_seven_zip([sys.executable, '-c', program], progress=meter,
-                              input_chunks=(raw[i:i+8192] for i in range(0, len(raw), 8192)),
+                              input_chunks=input_chunks(),
                               input_size=len(raw), heartbeat_interval=0.02, timeout=10)
     assert result.returncode == 0
     measured = events(stream)
