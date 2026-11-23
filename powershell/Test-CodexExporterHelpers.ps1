@@ -56,6 +56,10 @@ $cases = @(
     @{ Name='fast'; Call={ cdx-fast $id --codex-home $homeOption } },
     @{ Name='chatgpt import'; Call={ cdx-chatgpt 'export with spaces.zip' --codex-home $homeOption } },
     @{ Name='since'; Call={ cdx-since $id 'text:anchor words' -Occurrence 2 -ArchiveMaxBytes 123456 --codex-home $homeOption } },
+    @{ Name='since text'; Call={ cdx-since-text $id 'literal anchor' --codex-home $homeOption } },
+    @{ Name='since turn'; Call={ cdx-since-turn $id 2 --codex-home $homeOption } },
+    @{ Name='since id'; Call={ cdx-since-id $id 'native-id' --codex-home $homeOption } },
+    @{ Name='since time'; Call={ cdx-since-time $id '2026-11-23T00:00:00Z' --codex-home $homeOption } },
     @{ Name='turn listing'; Call={ cdx-turns $id --codex-home $homeOption } }
 )
 foreach ($stage in @('base','overrides')) {
@@ -73,7 +77,22 @@ foreach ($stage in @('base','overrides')) {
     Assert-Forward "$stage turn paging" {
         cdx-turns $id --sort turn:desc --pager never --codex-home $homeOption
     } @('--list-turns','--sort','turn:desc','--pager','never')
-    Write-Host "PASS: $stage helper forwarding ($($cases.Count + 4) checks)"
+    $literalPrompt = 'turn:2; $(literal) "quoted" Unicode 🧠'
+    foreach ($reversed in @($false,$true)) {
+        Assert-Forward "$stage typed text order $reversed" {
+            if ($reversed) { cdx-since-text $literalPrompt $id -Occurrence 2 -ArchiveMaxBytes 123456 --codex-home $homeOption }
+            else { cdx-since-text $id $literalPrompt -Occurrence 2 -ArchiveMaxBytes 123456 --codex-home $homeOption }
+        } @('--session-id',$id,'--mode','thread','--since-text',$literalPrompt,'--since-occurrence','2','--archive-max-bytes','123456')
+        $sessionPosition = [Array]::IndexOf($script:Seen, '--session-id')
+        $textPosition = [Array]::IndexOf($script:Seen, '--since-text')
+        if ($script:Seen[$sessionPosition + 1] -cne $id -or $script:Seen[$textPosition + 1] -cne $literalPrompt) {
+            throw "$stage typed text selector or session changed"
+        }
+        if (@($script:Seen | Where-Object { $_ -ceq '--since-text' }).Count -ne 1 -or $script:Seen -ccontains '--since') {
+            throw "$stage typed text selector was duplicated or changed to an implicit selector"
+        }
+    }
+    Write-Host "PASS: $stage helper forwarding ($($cases.Count + 6) checks)"
 }
 Assert-Forward 'Invoke-CodexThreadExport typed selectors' {
     Invoke-CodexThreadExport $id -Mode thread -SinceText 'exact anchor' -SinceOccurrence 2 -ArchiveMaxBytes 512000000 --codex-home $homeOption

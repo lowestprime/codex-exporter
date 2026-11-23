@@ -1,4 +1,4 @@
-# Windows upgrade to Codex Exporter 0.5.1
+# Windows upgrade to Codex Exporter 0.5.2
 
 Upgrade both the Python package and the PowerShell helpers. A wheel updates the
 exporter, while the source release supplies the installer and the new
@@ -15,7 +15,7 @@ backing up the exporter files/profile entries it replaces.
 
 ## Download, verify, and install the wheel and helpers
 
-Use the wheel and source distribution from the **same v0.5.1 release**. The code
+Use the wheel and source distribution from the **same v0.5.2 release**. The code
 checks both downloaded artifacts against that release's `SHA256SUMS.txt` before
 installing or extracting them. A checksum obtained from the same release verifies
 consistency with the published artifact list; it is not an independent
@@ -24,7 +24,7 @@ with separately verified pinned hashes, compare against those exact hashes.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
-$releaseVersion = '0.5.1'
+$releaseVersion = '0.5.2'
 $py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
 $archiver = 'C:\Program Files\7-Zip-Zstandard\7z.exe'
 $installDir = Join-Path $env:LOCALAPPDATA 'codex-exporter\tools'
@@ -99,7 +99,7 @@ with tarfile.open(sys.argv[1], 'r:gz') as archive:
     if ($helperVersion -ne $packageVersion) {
         throw "Helper routing differs: $helperVersion. Inspect CODEX_EXPORT_PYTHON and CODEX_THREAD_EXPORTER."
     }
-    foreach ($helperName in @('cdx-since', 'cdx-turns', 'cdx-browse', 'cdx-help', 'codex-exporter')) {
+    foreach ($helperName in @('cdx-since', 'cdx-since-text', 'cdx-since-turn', 'cdx-since-id', 'cdx-since-time', 'cdx-turns', 'cdx-browse', 'cdx-help', 'codex-exporter')) {
         Get-Command $helperName -CommandType Function -ErrorAction Stop | Out-Null
     }
     Write-Host "PASS: $packageVersion and current helpers installed."
@@ -176,6 +176,8 @@ not a promise that every phase uses that many workers.
 ```powershell
 # Discover exact native user-turn anchors before selecting one.
 cdx-turns 'SESSION-ID'
+cdx-since-text 'SESSION-ID' 'distinct phrase from the user prompt'
+cdx-since-turn 'SESSION-ID' 42
 cdx-since 'SESSION-ID' 'text:distinct phrase from the user prompt'
 cdx-since 'SESSION-ID' 'turn:42'
 cdx-since 'SESSION-ID' 'id:recorded-turn-or-message-id'
@@ -224,9 +226,16 @@ cdx-thread 'SESSION-ID' -Review
 ```
 
 Progress reports capture, indexing/selection, rendering, staging, compression,
-verification, publication, and cleanup separately. Compression percentages are
-those reported by the backend. Unknown-duration work displays elapsed time;
-percentages and throughput are not fabricated.
+verification, publication, and cleanup separately. Streamed ranges use native
+encoder-byte counters and their known input lengths for progress, throughput,
+and recent-rate ETA. Percent-only callbacks remain percentages. Input-feed
+fallback and finalization are labeled separately; unknown-duration operations
+state that ETA is unavailable. See the [detailed progress and selection policy](PROGRESS-AND-SELECTION-v0.5.2.md).
+
+A NUL-only source gap is reported with original coordinates and a SHA-256; bytes
+remain intact if the selected interval covers it. User-turn numbers count observed
+complete user records. No missing content is reconstructed, and arbitrary invalid
+JSON still blocks exact selection. Use `cdx-turns` to inspect current anchors.
 
 `--review` adds review content to the ordinary archive set. Explicit
 `--review --no-archive` creates a verified review text directory alongside loose

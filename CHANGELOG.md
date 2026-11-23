@@ -1,3 +1,31 @@
+## 0.5.2 — Encoder progress, source-gap auditing, and selection identity (2026-11-23)
+
+- Parse native 7-Zip stdin `M` progress against exact range lengths, with real
+  encoder-byte throughput, a bounded recent-rate ETA, and explicit input-feed
+  fallback, waiting, and finalization states.
+- Keep counted work separate from successful stage completion; preserve encoder
+  errors and source-generator failures after subprocess output closes.
+- Replace quadratic buffered timestamp/metadata membership scans with transient
+  indexed membership while preserving ordered values and plain JSON metadata.
+- Add captured record totals and buffered parse/render/write progress, bounded
+  Unicode output writes, normalization milestones, and exact-token count-pass status.
+- Audit only newline-terminated NUL-only records as opaque source gaps; retain
+  original bytes, coordinates, and hashes, and keep other malformed selection
+  records fatal. Propagate gap inclusion/exclusion through nested excerpts.
+- Align response listings with native human-turn indexing; preserve distinct
+  repeated messages and tool calls, retain merged native provenance, match tool
+  results by call ID, and reject explicit zero message-range bounds.
+- Resolve response/turn selectors inside an indexed last-N human scope; report
+  pending turns without a response as clear errors instead of publishing empties.
+- Preserve aggregate command output and root completion metadata, retain separate
+  stdout/stderr content when needed, and keep literal console JSON intact.
+- Synchronize the silent-encoder progress regression with the observer instead of
+  assuming an operating-system pipe size or scheduler timing.
+- Update CI/release actions to verified Node 24 implementations and pin each action
+  to its full commit SHA.
+- Add typed since helpers for PowerShell and Bash, recognize configuration-update
+  metadata, and keep known hidden action schemas valid under strict mode.
+
 ## 0.5.1 — Accurate completion, heterogeneous compression, and EOF parity (2026-11-15)
 
 - Report recovered range/whole-archive budget overflows as retries. Keep genuine

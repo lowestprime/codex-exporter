@@ -423,3 +423,74 @@ def test_context_envelope_followed_by_actual_request_is_not_an_injected_only_rec
     index = index_turns(path)
     assert len(index.turns) == 1
     assert index.turns[0].line == 2
+
+
+@pytest.mark.parametrize('newline', [b'\n', b'\r\n'])
+def test_nul_only_source_gap_is_audited_included_or_excluded_without_changing_bytes(tmp_path, newline):
+    path = tmp_path / 'thread.jsonl'
+    raw = write_rollout(path, [meta(), event('First'), answer('One'), event('Second'), answer('Two')], newline=newline)
+    gap = b'\x00' * 37 + newline
+    before = b''.join(raw[:2]) + gap + b''.join(raw[2:])
+    path.write_bytes(before)
+    with snapshot_source(path, directory=tmp_path) as snapshot:
+        index = index_turns(snapshot)
+        assert len(index.turns) == 2 and len(index.source_gaps) == 1
+        assert index.source_gaps[0].line == 3
+        assert index.source_gaps[0].sha256 == hashlib.sha256(gap).hexdigest()
+        first = excerpt_turns(snapshot, 1, 1, index=index)
+        second = excerpt_turns(snapshot, 2, index=index)
+        for selected, included in ((first, True), (second, False)):
+            audit = selected.metadata['selection']['source_gaps']
+            assert len(audit) == 1
+            assert audit[0]['included_in_excerpt'] is included
+            assert audit[0]['source_snapshot_sha256'] == snapshot.sha256
+            assert audit[0]['source_byte_start'] == len(b''.join(raw[:2]))
+            assert audit[0]['size_bytes'] == len(gap)
+            native = selected.path.read_bytes()
+            assert (gap in native) is included
+            if included:
+                assert native[audit[0]['excerpt_byte_start']:audit[0]['excerpt_byte_end']] == gap
+            assert selected.metadata['captured_line_count'] == len(native.splitlines())
+        nested = excerpt_records(first, [SimpleNamespace(source_seqs=(4,))])
+        nested_audit = nested.metadata['selection']['source_gaps']
+        assert len(nested_audit) == 1
+        assert nested_audit[0]['source_snapshot_sha256'] == snapshot.sha256
+        assert nested_audit[0]['included_in_excerpt'] is False
+        assert gap not in nested.path.read_bytes()
+        nested_second = excerpt_records(second, [SimpleNamespace(source_seqs=(3,))])
+        assert nested_second.metadata['selection']['source_gaps'][0]['included_in_excerpt'] is False
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('corrupt', [b'garbage\n', b'{"type":\n', b'\x00{"type":"event_msg"}\n',
+                                   b'\x00 \x00\n', b'\x00\t\n', b'\x00\x00', b'[]\n', b'null\n'])
+def test_unknown_or_mixed_source_corruption_still_cannot_hide_a_missing_user_anchor(tmp_path, corrupt):
+    path = tmp_path / 'thread.jsonl'
+    raw = write_rollout(path, [event('Observed first'), answer('First reply')])
+    path.write_bytes(b''.join(raw) + corrupt)
+    with pytest.raises(SelectionError):
+        index_turns(path)
+    # Record-mode mapping also fails closed, even when the chosen record precedes corruption.
+    if corrupt.endswith(b'\n'):
+        with snapshot_source(path, directory=tmp_path) as snapshot:
+            with pytest.raises(SelectionError):
+                excerpt_records(snapshot, [SimpleNamespace(source_seqs=(1,))])
+
+
+def test_cross_schema_repetition_with_distinct_explicit_message_ids_is_not_a_mirror(tmp_path):
+    path = tmp_path / 'thread.jsonl'
+    write_rollout(path, [event('Repeat', item_id='first'), item('Repeat', item_id='second')])
+    index = index_turns(path)
+    assert len(index.turns) == 2
+
+
+def test_configuration_metadata_does_not_discard_pending_native_turn_identity(tmp_path):
+    path = tmp_path / 'thread.jsonl'
+    write_rollout(path, [
+        {'type':'event_msg','payload':{'type':'task_started','turn_id':'native-turn'}},
+        {'type':'response_item','payload':{'type':'configuration_update','reasoning':{'effort':'xhigh'}}},
+        event('Observed prompt'), answer('Observed response'),
+    ])
+    index=index_turns(path)
+    assert len(index.turns)==1
+    assert resolve_since(index,'id:native-turn').number==1

@@ -41,6 +41,8 @@ def _ps_quote(value):
     'cdx-last session 2', 'cdx-live session', 'cdx-batch one two',
     'cdx-batch one two --', 'cdx-final session', 'cdx-msg session 2',
     'cdx-range session 2 3', 'cdx-since session "text:exact anchor"',
+    'cdx-since-text session "exact anchor"', 'cdx-since-turn session 2',
+    'cdx-since-id session exact-id', 'cdx-since-time session 2026-11-23',
     'cdx-turns session', 'cdx-project demo', 'cdx-fast session',
     'cdx-audit', 'cdx-chatgpt "some archive.zip"', 'cdx-archive-config',
 ])
@@ -208,3 +210,19 @@ def test_powershell_legacy_profile_migration_is_literal_and_idempotent(tmp_path,
     subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, check=True)
     assert profile.read_bytes() == first
     assert sorted(tmp_path.glob(profile.name + '.codex-exporter-backup-*')) == backups
+
+
+@pytest.mark.skipif(not BASH, reason='Bash not installed')
+@pytest.mark.parametrize('reverse', [False, True])
+def test_bash_typed_since_text_accepts_unambiguous_uuid_order_and_keeps_literal_text(reverse):
+    session = '11111111-2222-4333-8444-555555555555'
+    prompt = 'turn:2; $(literal) "quoted" Unicode 🧠'
+    arguments = [prompt, session] if reverse else [session, prompt]
+    script = (f'source {shlex.quote(str(BASH_HELPER))}\n'
+              '_codex_export_run() { printf "%s\\0" "$@"; }\n'
+              'cdx-since-text ' + ' '.join(shlex.quote(value) for value in arguments)
+              + ' --since-occurrence 2 --archive-max-bytes 123456')
+    result = subprocess.run([BASH, '-eu', '-c', script], capture_output=True, check=True)
+    assert result.stdout.decode().rstrip('\0').split('\0') == [
+        '--session-id', session, '--mode', 'thread', '--since-text', prompt,
+        '--since-occurrence', '2', '--archive-max-bytes', '123456']

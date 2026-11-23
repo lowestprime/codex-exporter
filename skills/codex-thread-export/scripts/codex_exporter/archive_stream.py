@@ -92,6 +92,7 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
             current = destination.stat().st_size
         except FileNotFoundError:
             return
+        meter.update(observations={'output_bytes': current})
         if current > limit:
             raise RangeTooLarge(state['bytes'], current, limit)
         if adaptive and state['bytes'] and current >= cut_at:
@@ -101,8 +102,8 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
         python_backend = backend == 'python'
         detail = (f'{name}; streamed range at byte {offset:,}' if python_backend else
                   f'7-Zip: {name}; source offset {offset:,}')
-        with reporter.stage(stage_label, total=count if python_backend else None,
-                            unit='bytes' if python_backend else 'percent', detail=detail,
+        with reporter.stage(stage_label, total=count, unit='bytes', detail=detail,
+                            progress_basis='measured_work' if python_backend else '7zip_processed_bytes',
                             retry_exceptions=(RangeTooLarge,) if adaptive else ()) as meter:
             if python_backend:
                 with zipfile.ZipFile(destination, 'x', compression=zipfile.ZIP_DEFLATED,
@@ -134,7 +135,7 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
                     command.extend([f'-md={dictionary}', f'-mfb={settings.word_size}'])
                 command.extend([f'-si{name}', str(destination)])
                 completed = run_seven_zip(command, cwd=destination.parent, progress=meter,
-                                          input_chunks=chunks, on_tick=monitor,
+                                          input_chunks=chunks, input_size=count, on_tick=monitor,
                                           heartbeat_interval=0.05)
                 if completed.returncode:
                     diagnostic = (completed.stdout + '\n' + completed.stderr).strip()[-1600:]
@@ -153,9 +154,9 @@ def compress_range(destination: Path, name: str, source: Path, offset: int, coun
                 infos = archive.infolist()
                 if len(infos) != 1 or infos[0].filename != name or infos[0].file_size != state['bytes']:
                     raise RuntimeError('Archive range compressor returned an unexpected member or byte count')
-            if python_backend:
-                meter.update(state['bytes'], total=state['bytes'],
-                             detail=f'{name}; {state["bytes"]:,} source bytes compressed')
+            meter.update(state['bytes'], total=state['bytes'], phase='checking',
+                         progress_basis='verified_member_bytes', progress_resolution=0,
+                         detail=f'{name}; {state["bytes"]:,} source bytes compressed')
             return CompressedRange(state['bytes'], state['digest'].hexdigest())
     except BaseException as primary:
         try:

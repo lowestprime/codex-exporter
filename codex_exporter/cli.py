@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FALLBACK_OUT_DIR = SCRIPT_DIR / "codex-thread-exports"
@@ -429,6 +429,10 @@ class Record:
     command_key: str = ""
     output_key: str = ""
     source_seqs: tuple[int, ...] = ()
+    item_ids: tuple[str, ...] = ()
+    call_id: str = ''
+    turn_id: str = ''
+    source_kind: str = ''
 
     def __post_init__(self) -> None:
         # Keep every native line behind merged call/output cards and duplicates.
@@ -440,6 +444,32 @@ class Record:
                     (self.source_type.casefold() not in ('user_message', 'usermessage')
                      and is_injected_context(self.text))):
                 self.kind, self.role, self.source_type = 'note', 'system', 'injected_context'
+
+
+def same_record_occurrence(previous: Record, current: Record, *, require_identity: bool = False) -> bool:
+    """Recognize mirrors without conflating repeated commands or messages.
+
+    Different explicit IDs always remain distinct. ID-less compatibility is
+    limited to adjacent cross-schema surfaces, never same-schema repetitions.
+    """
+    if (previous.kind, previous.role, previous.text) != (current.kind, current.role, current.text):
+        return False
+    if previous.turn_id and current.turn_id and previous.turn_id != current.turn_id:
+        return False
+    if previous.call_id and current.call_id and previous.call_id != current.call_id:
+        return False
+    if previous.item_ids and current.item_ids and set(previous.item_ids).isdisjoint(current.item_ids):
+        return False
+    same_identity = bool((previous.call_id and previous.call_id == current.call_id) or
+                         set(previous.item_ids).intersection(current.item_ids))
+    return same_identity or (not require_identity and previous.source_kind != current.source_kind)
+
+
+def merge_record_provenance(target: Record, source: Record) -> None:
+    target.source_seqs = tuple(sorted(set(target.source_seqs + source.source_seqs)))
+    target.item_ids = tuple(dict.fromkeys((*target.item_ids, *source.item_ids)))
+    target.call_id = target.call_id or source.call_id
+    target.turn_id = target.turn_id or source.turn_id
 
 
 def cp437_cp1252_mojibake_repair(text: str) -> str:
@@ -1017,6 +1047,24 @@ def strip_codex_tool_metadata(text: str) -> tuple[str, dict[str, Any]]:
     return text, meta
 
 
+def tool_output_metadata(obj: dict[str, Any]) -> dict[str, Any]:
+    """Normalize completion aliases without treating command ``code`` as an exit code."""
+    nested = obj.get("metadata")
+    meta = dict(nested) if isinstance(nested, dict) else {}
+    for key in ("exit_code", "exitCode", "code"):
+        if key in meta:
+            meta["exit_code"] = meta[key]
+            break
+    # Presence matters: an explicit null overrides a stale nested completion.
+    for key in ("exit_code", "exitCode"):
+        if key in obj:
+            meta["exit_code"] = obj[key]
+            break
+    if "status" in obj:
+        meta["status"] = obj["status"]
+    return meta
+
+
 def extract_output_and_meta(
     obj: dict[str, Any],
     *,
@@ -1024,18 +1072,49 @@ def extract_output_and_meta(
     max_line_chars: int,
     max_repeated_lines: int,
 ) -> tuple[str, dict[str, Any]]:
+    root_meta = tool_output_metadata(obj)
     meta: dict[str, Any] = {}
 
-    # Tool output records often have {"output":"...","metadata":{...}} as a JSON string.
-    for key in ("output", "result", "stdout", "stderr", "text", "content", "message", "diff", "patch"):
+    def literal_text(value: Any) -> str:
+        # Console streams can themselves be JSON or start with "Output:".
+        # They are recorded body text, not a tool transport envelope.
+        return extract_text(value, strip=strip, max_line_chars=max_line_chars,
+                            max_repeated_lines=max_repeated_lines, json_aware=False)
+
+    aggregate = next((obj[key] for key in ("aggregated_output", "aggregatedOutput")
+                      if isinstance(obj.get(key), str) and obj[key].strip()), None)
+    if aggregate is not None:
+        parts = [literal_text(aggregate)]
+        for name in ("stdout", "stderr"):
+            stream = obj.get(name)
+            # Aggregates can have different truncation budgets. Retain the full
+            # recorded stream when it adds text; overlapping text is intentional.
+            # Compare raw strings before applying configured output cleanup.
+            if isinstance(stream, str) and stream.strip() and stream not in aggregate:
+                body = literal_text(stream)
+                if body:
+                    parts.append(f"Recorded full {name}:\n{body}")
+        return "\n\n".join(part for part in parts if part), root_meta
+
+    # Empty/null/non-string aggregates fall back to established alternatives.
+    # output/result/content are alternative representations, not extra streams.
+    for key in ("output", "result", "stdout", "text", "content", "message", "diff", "patch"):
+        if key == "stdout":
+            streams = [(name, literal_text(obj.get(name))) for name in ("stdout", "stderr")]
+            streams = [(name, body) for name, body in streams if body]
+            if streams:
+                text = ("\n\n".join(f"{name}:\n{body}" for name, body in streams)
+                        if len(streams) > 1 else streams[0][1])
+                meta.update(root_meta)
+                return text, meta
+            continue
         if key not in obj:
             continue
 
         value = obj.get(key)
         parsed = maybe_json(value) if isinstance(value, str) else None
         if isinstance(parsed, dict):
-            if isinstance(parsed.get("metadata"), dict):
-                meta.update(parsed["metadata"])
+            meta.update(tool_output_metadata(parsed))
             text = extract_text(
                 parsed.get("output") if "output" in parsed else parsed,
                 strip=strip,
@@ -1054,12 +1133,12 @@ def extract_output_and_meta(
 
         if text:
             clean_text, transport_meta = strip_codex_tool_metadata(text)
-            meta.update({k: v for k, v in transport_meta.items() if k not in meta})
-            return clean_text, meta
+            merged = dict(transport_meta)
+            merged.update(meta)
+            merged.update(root_meta)
+            return clean_text, merged
 
-    if isinstance(obj.get("metadata"), dict):
-        meta.update(obj["metadata"])
-
+    meta.update(root_meta)
     return "", meta
 
 
@@ -1217,6 +1296,25 @@ def render_patch_file_block(file_info: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def tool_completion_lines(meta: dict[str, Any], *, output_says_success: bool = False) -> list[str]:
+    """Show recorded completion without claiming success for failed/running states."""
+    exit_code = next((meta[key] for key in ("exit_code", "exitCode", "code") if key in meta), None)
+    raw_status = meta.get("status")
+    status = raw_status.strip() if isinstance(raw_status, str) else ""
+    permits_success = not status or status.casefold() in {"completed", "success", "succeeded"}
+    lines: list[str] = []
+    if exit_code not in (None, ""):
+        if (exit_code == 0 or str(exit_code) == "0") and permits_success:
+            lines.append("Success (exit code 0)")
+        else:
+            lines.append(f"Exit code {exit_code}")
+    elif output_says_success and permits_success:
+        lines.append("Success")
+    if status:
+        lines.append(f"Status: {status}")
+    return lines
+
+
 def render_apply_patch_record(command: str, output: str, meta: dict[str, Any]) -> str:
     files = parse_apply_patch(command)
     if not files:
@@ -1244,9 +1342,7 @@ def render_apply_patch_record(command: str, output: str, meta: dict[str, Any]) -
     if cleaned_output and not cleaned_output.lower().startswith("success. updated the following files"):
         parts.append(fenced_block(cleaned_output, guess_lang(cleaned_output, "text"), 3))
 
-    exit_code = meta.get("exit_code", meta.get("exitCode", meta.get("code")))
-    if exit_code == 0 or str(exit_code) == "0" or cleaned_output.lower().startswith("success"):
-        parts.append("Success")
+    parts.extend(tool_completion_lines(meta, output_says_success=cleaned_output.lower().startswith("success")))
 
     return "\n\n".join(p for p in parts if p).strip()
 
@@ -1270,9 +1366,10 @@ def render_action_record(
             out_key = hashlib.sha256(patch_text.encode("utf-8", errors="ignore")).hexdigest()
             return Record("action", "tool", patch_text, timestamp, source_type or title, seq, cmd_key, out_key)
 
-    # Drop tool lifecycle placeholders that carry neither a command nor output.
-    # The GUI direct-copy transcript does not include empty transport markers.
-    if not command and not output:
+    completion = tool_completion_lines(meta)
+    # Keep recorded completion even when an output-body policy hides the body.
+    # Empty transport placeholders still do not create presentation records.
+    if not command and not output and not completion:
         return None
 
     chunks: list[str] = []
@@ -1287,18 +1384,7 @@ def render_action_record(
         # itself is the substantive content.
         chunks.append(fenced_block(output, guess_lang(output, "text"), 3))
 
-    exit_code = meta.get("exit_code")
-    if exit_code is None:
-        exit_code = meta.get("exitCode")
-    if exit_code is None:
-        exit_code = meta.get("code")
-
-    if exit_code == 0 or str(exit_code) == "0":
-        # GUI-style direct copies show "Success"; keep it concise and searchable.
-        if output or command:
-            chunks.append("Success")
-    elif exit_code not in (None, ""):
-        chunks.append(f"Exit code {exit_code}")
+    chunks.extend(completion)
 
     text = "\n\n".join(chunks).strip()
     if not text:
@@ -1361,9 +1447,54 @@ def extract_reasoning_summary(payload: dict[str, Any]) -> str:
     ).strip()
 
 
-def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool) -> str:
+# Exact discriminator registries for auditing action-disabled views. The
+# renderer's ACTION_HINTS are compatibility heuristics, not proof that an
+# arbitrary future tool-like schema is understood. Keep these names explicit.
+# Native names: openai/codex codex-rs/protocol/src/items.rs (TurnItem).
+# Response/event names: protocol/src/models.rs and protocol/src/protocol.rs;
+# local_shell_call_output and event/item wrappers also have repository fixtures.
+KNOWN_NATIVE_ACTION_ITEMS = frozenset({
+    "commandexecution", "functioncalloutput", "dynamictoolcall", "filechange",
+    "extension", "mcptoolcall", "imageview",
+})
+KNOWN_RESPONSE_ACTION_TYPES = frozenset({
+    "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+    "local_shell_call", "local_shell_call_output", "mcp_tool_call_output",
+    "web_search_call", "tool_search_call", "tool_search_output", "image_generation_call",
+})
+KNOWN_LEGACY_ACTION_EVENTS = frozenset({
+    "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_updated",
+    "patch_apply_end", "mcp_tool_call_begin", "mcp_tool_call_end",
+    "dynamic_tool_call_request", "dynamic_tool_call_response", "view_image_tool_call",
+})
+
+
+def is_known_action_schema(obj: dict[str, Any]) -> bool:
+    """Recognize supported action envelopes using discriminator strings only.
+
+    This must never extract, parse, stringify, or traverse command/output bodies:
+    a message-only selection may skip gigabytes of those fields. Known action
+    identity does not assert that every possible body field has a rendered view.
+    """
+    top, payload, payload_type, item, item_type = event_type_blob(obj)
+    subtype = item_type.casefold()
+    if top == "event_msg" and payload_type in {"item_started", "item_updated", "item_completed"}:
+        return subtype in KNOWN_NATIVE_ACTION_ITEMS or subtype in KNOWN_RESPONSE_ACTION_TYPES
+    if top in {"event", "response_item", "event_msg"}:
+        if item:
+            return payload_type == "item" and subtype in KNOWN_RESPONSE_ACTION_TYPES
+        return (payload_type in KNOWN_RESPONSE_ACTION_TYPES or
+                (top in {"event", "event_msg"} and payload_type in KNOWN_LEGACY_ACTION_EVENTS))
+    return not payload and top in KNOWN_RESPONSE_ACTION_TYPES | KNOWN_LEGACY_ACTION_EVENTS
+
+
+def known_ignored_reason(obj: dict[str, Any], include_reasoning_summaries: bool, *, include_actions: bool = True) -> str:
     top_type, _payload, payload_type, _item, item_type = event_type_blob(obj)
     ptype = (payload_type if payload_type not in {"item_completed", "item_started", "item_updated"} else item_type).casefold()
+    if not include_actions and is_known_action_schema(obj):
+        return "action_rendering_disabled"
+    if top_type == "response_item" and ptype == "configuration_update":
+        return "configuration_metadata"
     if top_type == "response_item" and ptype == "additional_tools":
         return "tool_catalog_metadata"
     if top_type == "token_usage_record" or ptype == "token_count":
@@ -1432,7 +1563,7 @@ def apply_rollback_to_records(records: list[Record], num_turns: int) -> list[Rec
     return records[:cut]
 
 
-def classify_record(
+def _classify_record(
     obj: dict[str, Any],
     *,
     seq: int,
@@ -1589,6 +1720,28 @@ def classify_record(
     return None
 
 
+def classify_record(
+    obj: dict[str, Any], *, seq: int, include_actions: bool,
+    include_reasoning_summaries: bool = False, tool_outputs: str, max_tool_chars: int,
+    strip: bool, max_line_chars: int, max_repeated_lines: int,
+) -> Record | None:
+    record = _classify_record(obj, seq=seq, include_actions=include_actions,
+        include_reasoning_summaries=include_reasoning_summaries, tool_outputs=tool_outputs,
+        max_tool_chars=max_tool_chars, strip=strip, max_line_chars=max_line_chars,
+        max_repeated_lines=max_repeated_lines)
+    if record is not None:
+        top, payload, ptype, item, itype = event_type_blob(obj)
+        origins = (item, payload, obj)
+        record.item_ids = tuple(dict.fromkeys(str(value) for origin in origins
+            for key in ('id', 'item_id', 'message_id', 'event_id', 'client_id')
+            if (value := origin.get(key))))
+        record.call_id = next((str(origin[key]) for origin in origins
+            for key in ('call_id', 'callId') if origin.get(key)), '')
+        record.turn_id = next((str(origin['turn_id']) for origin in origins if origin.get('turn_id')), '')
+        record.source_kind = '/'.join((top, ptype, itype))
+    return record
+
+
 def is_command_only_action(rec: Record) -> bool:
     return rec.kind == "action" and bool(rec.command_key) and not rec.output_key
 
@@ -1598,53 +1751,37 @@ def is_output_only_action(rec: Record) -> bool:
 
 
 def merge_command_outputs(records: list[Record]) -> list[Record]:
-    """Merge command-only action cards with following output-only cards.
+    """Join matching tool occurrences while retaining command source order.
 
-    Codex JSONL often stores tool calls and their outputs as separate records,
-    while the GUI displays them as one user-visible command/output unit. FIFO
-    merging preserves full output lines while removing duplicated transport
-    cards.
+    Parallel completions may arrive out of order. Explicit call IDs take
+    precedence; an ID-less pair is joined only when exactly one ID-less command
+    is pending. Ambiguous or mismatched calls remain separate complete records.
     """
     merged: list[Record] = []
-    pending: list[Record] = []
-
-    def flush_pending() -> None:
-        if pending:
-            merged.extend(pending)
-            pending.clear()
-
+    pending: list[int] = []
     for rec in records:
         if rec.kind != "action":
-            flush_pending()
-            merged.append(rec)
-            continue
-
-        if is_command_only_action(rec):
-            pending.append(rec)
-            continue
-
-        if is_output_only_action(rec) and pending:
-            cmd = pending.pop(0)
-            text = "\n\n".join(part for part in (cmd.text.rstrip(), rec.text.rstrip()) if part).strip()
-            merged.append(
-                Record(
-                    "action",
-                    "tool",
-                    text,
-                    cmd.timestamp or rec.timestamp,
-                    cmd.source_type or rec.source_type,
-                    cmd.seq or rec.seq,
-                    cmd.command_key,
-                    rec.output_key,
-                    tuple(sorted(set(cmd.source_seqs + rec.source_seqs))),
-                )
-            )
-            continue
-
-        flush_pending()
+            pending.clear()
+        elif is_command_only_action(rec):
+            pending.append(len(merged))
+        elif is_output_only_action(rec):
+            if rec.call_id:
+                matches = [position for position in pending if merged[position].call_id == rec.call_id]
+            else:
+                matches = [position for position in pending if not merged[position].call_id] if len(pending) == 1 else []
+            if len(matches) == 1:
+                position = matches[0]
+                cmd = merged[position]
+                if not (cmd.turn_id and rec.turn_id and cmd.turn_id != rec.turn_id):
+                    cmd.text = "\n\n".join(part for part in (cmd.text.rstrip(), rec.text.rstrip()) if part).strip()
+                    cmd.output_key = rec.output_key
+                    cmd.timestamp = cmd.timestamp or rec.timestamp
+                    merge_record_provenance(cmd, rec)
+                    pending.remove(position)
+                    continue
+        else:
+            pending.clear()
         merged.append(rec)
-
-    flush_pending()
     return merged
 
 
@@ -1702,31 +1839,22 @@ def post_process_records(records: list[Record]) -> list[Record]:
     """Remove exporter-induced duplicates, merge split command/output records,
     and add GUI-like action summaries while preserving chronological order."""
     processed: list[Record] = []
-    recent_commands: list[str] = []
-    recent_outputs: list[str] = []
+    recent_actions: list[Record] = []
 
     for rec in records:
-        if rec.kind == "action" and rec.command_key:
-            if rec.command_key in recent_commands and not rec.output_key:
+        if rec.kind == 'message' and rec.role == 'user':
+            recent_actions.clear()
+        if rec.kind == 'action':
+            mirror = next((previous for previous in reversed(recent_actions)
+                           if same_record_occurrence(previous, rec, require_identity=True)), None)
+            if mirror is not None:
+                merge_record_provenance(mirror, rec)
                 continue
-            recent_commands.append(rec.command_key)
-            recent_commands = recent_commands[-12:]
-
-        if rec.kind == "action" and rec.output_key:
-            # Dedupe immediately repeated tool-output JSON echoes.
-            if rec.output_key in recent_outputs[-3:]:
-                continue
-            recent_outputs.append(rec.output_key)
-            recent_outputs = recent_outputs[-12:]
+            recent_actions.append(rec)
+            recent_actions = recent_actions[-12:]
 
         # Remove empty/noisy apply_patch/action cards if any escaped extraction.
         if rec.kind == "action" and rec.text.strip() in {"Action `apply_patch`", "Action `patch_apply_end`", "Action `tool`"}:
-            continue
-
-        # Codex apply_patch emits a separate "Success. Updated the following files"
-        # output record after the meaningful edited-file cards. The GUI direct-copy
-        # view surfaces the file cards and success state, not this duplicate list.
-        if rec.kind == "action" and not rec.command_key and "Success. Updated the following files:" in rec.text:
             continue
 
         processed.append(rec)
@@ -1750,20 +1878,42 @@ def walk_json_values(value: Any, *, depth: int = 0) -> list[Any]:
     return out
 
 
+class _UniqueMetadataValues(list):
+    """Transient ordered values with constant-time membership during parsing.
+
+    JSON encoders see an ordinary list; the set is an attribute, never a metadata
+    key. Only add_unique_meta writes these buckets. parse_session materializes
+    plain lists before returning, releasing the cache before rendering begins.
+    """
+
+    __slots__ = ('_seen',)
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self._seen = set(self)
+
+    def add_unique(self, value: str) -> None:
+        if value not in self._seen:
+            self._seen.add(value)
+            super().append(value)
+
+
 def add_unique_meta(meta: dict[str, Any], key: str, value: str) -> None:
     value = str(value).strip()
     if not value:
         return
-    bucket = meta.setdefault(key, [])
-    if value not in bucket:
-        bucket.append(value)
+    bucket = meta.get(key)
+    if not isinstance(bucket, _UniqueMetadataValues):
+        bucket = _UniqueMetadataValues(bucket if bucket is not None else ())
+        meta[key] = bucket
+    bucket.add_unique(value)
 
 
 def update_session_metadata_from_event(meta: dict[str, Any], obj: dict[str, Any]) -> None:
     """Extract only structural session/turn metadata, never arbitrary tool payloads."""
     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
     candidates: list[dict[str, Any]] = [obj, payload]
-    for key in ("session", "metadata", "settings", "model_info", "collaboration_mode"):
+    for key in ("session", "metadata", "settings", "model_info", "collaboration_mode", "reasoning"):
         value = payload.get(key)
         if isinstance(value, dict):
             candidates.append(value)
@@ -1852,9 +2002,27 @@ def record_token_count(records: list[Record]) -> int:
     return sum(approx_token_count(r.text) for r in records if r.text)
 
 
-def split_prompt_response_blocks(records: list[Record]) -> list[dict[str, Any]]:
-    """Return blocks keyed by each user prompt and its following response records."""
-    user_positions = [i for i, r in enumerate(records) if r.kind == "message" and r.role == "user"]
+def split_prompt_response_blocks(records: list[Record], *, turn_index=None) -> list[dict[str, Any]]:
+    """Return prompt/response blocks, optionally using authoritative native anchors.
+
+    A completed UserMessage mirror may arrive after its response. Chronological
+    selector listings use the native index so that mirror cannot renumber turns.
+    Render-only/live-context callers retain their existing presentation grouping.
+    """
+    if turn_index is None:
+        user_positions = [i for i, r in enumerate(records) if r.kind == "message" and r.role == "user"]
+    else:
+        anchors = {turn.line for turn in turn_index.turns}
+        positions = {}
+        for position, record in enumerate(records):
+            if record.kind == "message" and record.role == "user":
+                for line in record.source_seqs:
+                    if line in anchors:
+                        positions.setdefault(line, position)
+        missing = anchors.difference(positions)
+        if missing:
+            raise RuntimeError(f'{len(missing):,} indexed user prompts have no rendered source provenance; cannot number responses exactly.')
+        user_positions = [positions[turn.line] for turn in turn_index.turns]
     blocks: list[dict[str, Any]] = []
     for idx, start in enumerate(user_positions, 1):
         end = user_positions[idx] if idx < len(user_positions) else len(records)
@@ -2134,10 +2302,14 @@ def render_thread_export(
     source_snapshot: dict[str, Any] | None = None,
     show_timestamps: bool = True,
     timestamp_timezone: str = "local",
+    progress: Any = None,
 ) -> str:
     from codex_exporter.timestamps import TimestampFormatter
     timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
     source_sha = source_sha if source_sha is not None else source_file_sha256(source)
+    if progress is not None:
+        progress.update(0, total=sum(len(record.text) for record in records),
+                        detail="Prepare transcript metadata and turn map")
     summary = export_summary(records, meta)
     parts: list[str] = []
 
@@ -2168,6 +2340,9 @@ def render_thread_export(
     if preamble:
         parts.extend(["### Reconstruction / preamble records", "", render_record_stream(preamble), ""])
 
+    completed = sum(len(rec.text) for rec in records[:first_user])
+    if progress is not None:
+        progress.update(completed, detail="Render transcript turns")
     for block in blocks:
         idx = int(block["index"])
         prompt: Record = block["prompt"]
@@ -2233,14 +2408,19 @@ def render_thread_export(
                 parts.append(response_text)
 
         parts.append("")
+        completed += len(prompt.text) + sum(len(rec.text) for rec in response)
+        if progress is not None:
+            progress.update(completed, detail=f"Rendered turn {idx:,}/{len(blocks):,}")
 
     if not blocks:
         parts.append("_No prompt/response blocks were extracted from this thread._\n")
 
+    if progress is not None:
+        progress.update(phase="finalizing", detail="Assemble rendered transcript")
     return "\n".join(parts).rstrip() + "\n"
 
 
-def finalize_count_placeholders(text: str) -> str:
+def finalize_count_placeholders(text: str, *, progress: Any = None) -> str:
     """Resolve line/token placeholders against the final rendered document.
 
     The original implementation replaced placeholders once and then counted a
@@ -2251,7 +2431,10 @@ def finalize_count_placeholders(text: str) -> str:
     lines = 0
     tokens = 0
     candidate = template
-    for _ in range(12):
+    processed_chars = 0
+    for iteration in range(12):
+        if progress is not None:
+            progress.update(detail=f"Count pass {iteration + 1}; {token_field_label()}; convergence determines remaining passes")
         candidate = (
             template.replace("__CODEX_EXPORT_TOTAL_LINES__", str(lines))
             .replace("__CODEX_EXPORT_TOKEN_COUNT__", str(tokens))
@@ -2259,6 +2442,9 @@ def finalize_count_placeholders(text: str) -> str:
         )
         measured_lines = count_lines(candidate)
         measured_tokens = approx_token_count(candidate)
+        processed_chars += len(candidate)
+        if progress is not None:
+            progress.update(processed_chars)
         if measured_lines == lines and measured_tokens == tokens:
             return candidate
         lines, tokens = measured_lines, measured_tokens
@@ -2481,11 +2667,12 @@ def parse_session(
         "_raw_source_truncation_tokens_reported": 0,
     }
     last_key: tuple[str, str, str] | None = None
+    seq = 0
 
     with open_rollout_text(path) as f:
         for seq, line in enumerate(f, 1):
             if progress is not None:
-                progress.update(seq)
+                progress.update(seq - 1)
             if not line.strip():
                 continue
             meta["_source_event_count"] = int(meta.get("_source_event_count", 0)) + 1
@@ -2495,6 +2682,7 @@ def parse_session(
                 meta["_raw_source_truncation_tokens_reported"] += sum(int(match.group("count").replace(",", "")) for match in raw_truncation_matches)
             obj, status = parse_jsonl_line(line)
             if obj is None:
+                last_key = None
                 meta["_parse_errors"].append({
                     "line": seq,
                     "error": status.get("error") or status.get("original_error") or "unknown parse error",
@@ -2581,24 +2769,33 @@ def parse_session(
                 max_repeated_lines=max_repeated_lines,
             )
             if not rec or not rec.text.strip():
-                reason = known_ignored_reason(obj, include_reasoning_summaries)
+                reason = known_ignored_reason(obj, include_reasoning_summaries, include_actions=include_actions)
                 meta["_ignored_event_types"][key_name] += 1
                 meta["_ignored_event_reasons"][reason] += 1
                 if reason == "unrecognized_schema":
                     meta["_unknown_event_types"][key_name] += 1
+                if reason not in {"metadata_only", "telemetry_token_count", "configuration_metadata"}:
+                    last_key = None
                 continue
 
             meta["_recognized_event_types"][key_name] += 1
             key = (rec.kind, rec.role, rec.text)
-            if key == last_key and not (rec.role == 'user' and rec.source_type == records[-1].source_type):
-                records[-1].source_seqs = tuple(sorted(set(records[-1].source_seqs + rec.source_seqs)))
+            if key == last_key and records and same_record_occurrence(records[-1], rec):
+                merge_record_provenance(records[-1], rec)
                 audit_increment("cleaned", "adjacent_duplicate_record", 1)
                 continue
             last_key = key
             records.append(rec)
 
+    # Keep the returned/public metadata shape unchanged and release membership
+    # caches once the source pass is finished. This is one linear pass per bucket.
+    for key, bucket in tuple(meta.items()):
+        if isinstance(bucket, _UniqueMetadataValues):
+            meta[key] = list(bucket)
     meta["_parse_error_count"] = len(meta["_parse_errors"])
     meta["_repaired_json_line_count"] = len(meta["_repaired_json_lines"])
+    if progress is not None:
+        progress.update(seq, phase="finalizing", detail=f"{seq:,} source records parsed; resolving action details")
     return post_process_records(records), meta
 
 
@@ -2812,8 +3009,8 @@ def choose_records(records: list[Record], args: argparse.Namespace) -> list[Reco
         return [messages[args.message - 1]]
 
     if args.mode == "range":
-        start = args.from_message or 1
-        end = args.to_message or len(messages)
+        start = args.from_message if args.from_message is not None else 1
+        end = args.to_message if args.to_message is not None else len(messages)
         if start < 1 or end > len(messages) or start > end:
             raise RuntimeError(f"Invalid message range. Valid range is 1..{len(messages)}")
         return messages[start - 1 : end]
@@ -2875,11 +3072,11 @@ def print_message_list(records: list[Record], *, settings=None, json_output: boo
     return rows
 
 
-def print_response_list(records: list[Record], *, settings=None, json_output: bool = False) -> list[dict[str, Any]]:
+def print_response_list(records: list[Record], *, settings=None, json_output: bool = False, turn_index=None) -> list[dict[str, Any]]:
     from codex_exporter.display import DisplaySettings, sort_rows, print_listing
     settings = settings or DisplaySettings()
     rows = []
-    for block in split_prompt_response_blocks(records):
+    for block in split_prompt_response_blocks(records, turn_index=turn_index):
         response = block['response']
         preview = next((r.text.strip().splitlines()[0] for r in response
                         if r.kind == 'message' and r.role == 'assistant' and r.text.strip()), '')
@@ -2909,12 +3106,23 @@ def render_record(rec: Record, index: int | None, plain: bool, ui_style: bool, *
     return f"## {idx}{heading_role}\n\n{stamp}{rec.text.rstrip()}"
 
 
-def render_export(records: list[Record], title: str, source: Path, mode: str, plain: bool, ui_style: bool, include_meta: bool, *, source_sha: str | None = None, show_timestamps: bool = True, timestamp_timezone: str = 'local') -> str:
+def render_export(records: list[Record], title: str, source: Path, mode: str, plain: bool, ui_style: bool, include_meta: bool, *, source_sha: str | None = None, show_timestamps: bool = True, timestamp_timezone: str = 'local', progress: Any = None) -> str:
     from codex_exporter.timestamps import TimestampFormatter
     timestamps = TimestampFormatter(show_timestamps, timestamp_timezone)
+    completed = 0
+    if progress is not None:
+        progress.update(0, total=sum(len(record.text) for record in records))
     if plain or ui_style:
-        return "\n\n".join(render_record(r, None, plain, ui_style, timestamps=timestamps)
-                            for r in records if r.text.strip()).rstrip() + "\n"
+        rendered: list[str] = []
+        for rec in records:
+            if rec.text.strip():
+                rendered.append(render_record(rec, None, plain, ui_style, timestamps=timestamps))
+            completed += len(rec.text)
+            if progress is not None:
+                progress.update(completed)
+        if progress is not None:
+            progress.update(phase="finalizing", detail="Assemble rendered text")
+        return "\n\n".join(rendered).rstrip() + "\n"
     parts: list[str] = [f"# {title}", ""]
     if include_meta:
         sha = source_sha if source_sha is not None else source_file_sha256(source)
@@ -2930,7 +3138,26 @@ def render_export(records: list[Record], title: str, source: Path, mode: str, pl
     for i, rec in enumerate(records, 1):
         parts.append(render_record(rec, i, plain=False, ui_style=False, timestamps=timestamps))
         parts.append("")
+        completed += len(rec.text)
+        if progress is not None:
+            progress.update(completed)
+    if progress is not None:
+        progress.update(phase="finalizing", detail="Assemble rendered text")
     return "\n".join(parts).rstrip() + "\n"
+
+
+def write_rendered_text(path: Path, text: str, *, progress: Any = None) -> None:
+    """Write bounded Unicode chunks, retaining exact LF output and measured work."""
+    if progress is not None:
+        progress.update(0, total=len(text))
+    with path.open('w', encoding='utf-8', newline='\n') as output:
+        for offset in range(0, len(text), 1024 * 1024):
+            chunk = text[offset:offset + 1024 * 1024]
+            output.write(chunk)
+            if progress is not None:
+                progress.update(offset + len(chunk))
+        if progress is not None:
+            progress.update(phase='finalizing', detail='Flush rendered text')
 
 
 def wrap_markdown(text: str, title: str | None = None) -> str:
@@ -3884,6 +4111,12 @@ def _main() -> int:
             publish_destinations[str(staged)] = public_path.with_suffix('.zip')
             return staged
 
+        def warn_source_gaps(gaps):
+            if gaps:
+                print(f'WARNING: {len(gaps):,} NUL-only source gap(s) detected. Their origin and any missing content are unknown. '
+                      'Turn numbers count observed complete user records. Original gap bytes are retained if selected; '
+                      'the source-gap audit also records gaps outside the selected excerpt.', file=sys.stderr)
+
         def record_turn_listing(index, source_path, session_id):
             rows = sort_rows(turn_rows(index), kind='turns', sort=args.sort, order=args.sort_order)
             excluded = len(index.injected_context_lines)
@@ -3893,7 +4126,10 @@ def _main() -> int:
                 'source_physical_bytes_at_open': index.physical_size_bytes,
                 'deferred_tail_bytes': index.deferred_tail_bytes,
                 'context_records_excluded_from_anchors': excluded,
+                'source_gap_policy': SOURCE_GAP_POLICY,
+                'source_gaps': [{**gap.audit(index.sha256), 'included_in_source_prefix': True} for gap in index.source_gaps],
                 'turns': rows})
+            warn_source_gaps(index.source_gaps)
             if excluded:
                 print(f'NOTE: {excluded:,} complete injected/service context records remain in the source but are not user-turn anchors. '
                       'Inspect this listing before reusing numeric selectors from older versions; native IDs and source lines stay stable.', file=sys.stderr)
@@ -3914,7 +4150,7 @@ def _main() -> int:
         for source_path, supplied_sid in sources:
             args = copy.copy(base_args)
             from codex_exporter.snapshot import snapshot_source
-            from codex_exporter.selection import index_turns, index_live_turns, resolve_since, excerpt_turns, excerpt_records, turn_rows
+            from codex_exporter.selection import index_turns, index_live_turns, resolve_since, excerpt_turns, excerpt_records, turn_rows, SOURCE_GAP_POLICY
             if args.list_turns and source_path.suffix.casefold() != '.zst':
                 try:
                     turn_index = index_live_turns(source_path, progress=reporter)
@@ -3931,7 +4167,9 @@ def _main() -> int:
                 staging_dir = out_dir if not (args.no_file or args.list or args.list_responses or args.list_turns) else None
             with snapshot_source(source_path, directory=staging_dir, reporter=reporter) as snapshot:
                 preselected = False
-                needs_turns = args.list_turns or args.since or (not args.live_context and not (args.list or args.list_responses)
+                single_turn_selection = False
+                turn_index = None
+                needs_turns = args.list_turns or (args.list_responses and not args.live_context) or args.since or (not args.live_context and not (args.list or args.list_responses)
                     and (args.last_n_turns is not None or args.mode in ('turn', 'response', 'last-response')))
                 if needs_turns:
                     try:
@@ -3942,6 +4180,7 @@ def _main() -> int:
                     if args.list_turns:
                         record_turn_listing(turn_index, source_path, supplied_sid)
                         continue
+                    warn_source_gaps(turn_index.source_gaps)
                     if turn_index.injected_context_lines:
                         print(f'NOTE: Turn indexing excluded {len(turn_index.injected_context_lines):,} complete context envelopes from human turn anchors; '
                               'their native bytes remain in the selected interval. Numeric selectors may differ from older versions.', file=sys.stderr)
@@ -3952,10 +4191,22 @@ def _main() -> int:
                             anchor = resolve_since(turn_index, args.since, occurrence=args.since_occurrence)
                             start_turn = anchor.number
                             descriptor = f'{args.mode}-since-turn-{start_turn:04d}'
+                        elif args.list_responses:
+                            pass
                         elif args.last_n_turns is not None:
                             if not turn_index.turns:
                                 raise ValueError('No actual user turns were found for --last')
                             start_turn = max(1, len(turn_index.turns) - args.last_n_turns + 1)
+                            if args.mode in ('turn', 'response'):
+                                scoped_count = len(turn_index.turns) - start_turn + 1
+                                if args.response is None or not 1 <= args.response <= scoped_count:
+                                    raise ValueError(f'--response must be 1..{scoped_count:,} within the --last user-turn scope')
+                                start_turn = stop_turn = start_turn + args.response - 1
+                                args.response = 1
+                                single_turn_selection = True
+                            elif args.mode == 'last-response':
+                                start_turn = len(turn_index.turns)
+                                single_turn_selection = True
                             args.last_n_turns = None
                         elif args.mode in ('turn', 'response'):
                             if args.response is None:
@@ -3963,8 +4214,10 @@ def _main() -> int:
                             anchor = resolve_since(turn_index, f'turn:{args.response}')
                             start_turn = stop_turn = anchor.number
                             args.response = 1
+                            single_turn_selection = True
                         elif args.mode == 'last-response' and turn_index.turns:
                             start_turn = len(turn_index.turns)
+                            single_turn_selection = True
                         if start_turn is not None:
                             with reporter.stage('Select native JSONL interval') as meter:
                                 snapshot = excerpt_turns(snapshot, start_turn, stop_turn, index=turn_index, progress=meter)
@@ -4045,7 +4298,7 @@ def _main() -> int:
                     continue
                 reset_runtime_audit()
                 include_actions = args.mode in {"thread", "response", "turn", "last-response", "chat-actions", "actions"} or args.list_responses
-                with reporter.stage("Parse captured records", unit="records") as meter:
+                with reporter.stage("Parse captured records", total=snapshot.metadata.get("captured_line_count"), unit="records") as meter:
                     records, meta = parse_session(
                         path=snapshot.path,
                         include_actions=include_actions,
@@ -4070,44 +4323,71 @@ def _main() -> int:
                     record_listings.append({'source': str(source_path), 'messages': rows})
                     continue
                 if args.list_responses:
-                    rows = print_response_list(records, settings=display_settings, json_output=args.json_result)
-                    record_listings.append({'source': str(source_path), 'responses': rows})
+                    if preselected:
+                        turn_index = index_turns(snapshot, progress=reporter)
+                    rows = print_response_list(records, settings=display_settings, json_output=args.json_result, turn_index=turn_index)
+                    record_listings.append({'source': str(source_path), 'responses': rows,
+                        'turn_index_policy': 'human_user_turns_v2' if turn_index is not None else 'reconstructed_display_records',
+                        'source_gap_policy': SOURCE_GAP_POLICY,
+                        'source_gaps': snapshot.metadata.get('selection', {}).get('source_gaps',
+                            [gap.audit(turn_index.sha256) for gap in turn_index.source_gaps] if turn_index is not None else []),
+                        'source_snapshot': snapshot.metadata})
                     continue
 
-                scoped = select_last_n_turns(records, args.last_n_turns)
-                if preselected and base_args.last_n_turns is None and args.mode == 'turn':
-                    selected_records = records
-                elif preselected and base_args.last_n_turns is None and args.mode in ('response', 'last-response'):
-                    selected_records = [record for record in records if not (record.kind == 'message' and record.role == 'user')]
-                else:
-                    selected_records = choose_records(scoped, args)
+                try:
+                    scoped = select_last_n_turns(records, args.last_n_turns)
+                    if preselected and single_turn_selection and args.mode == 'turn':
+                        selected_records = records
+                    elif preselected and single_turn_selection and args.mode in ('response', 'last-response'):
+                        selected_records = [record for record in records if not (record.kind == 'message' and record.role == 'user')]
+                    else:
+                        selected_records = choose_records(scoped, args)
+                    if not selected_records and args.mode not in ('thread', 'chat-actions'):
+                        raise ValueError(f'No records matching --mode {args.mode} are present in the captured selection. '
+                                         'Choose an earlier turn or retry after additional records are written.')
+                except (ValueError, RuntimeError) as exc:
+                    ap.error(str(exc))
                 # A subset archive carries only the native lines behind its rendered records.
                 # Contiguous turn exports already retain their complete source interval.
                 if archive_settings.copy_source and not args.no_file and (
                         args.mode not in ('thread', 'turn', 'chat-actions') or
                         (args.last_n_turns is not None and not preselected) or
-                        (args.mode == 'turn' and base_args.last_n_turns is not None)):
-                    with reporter.stage('Select matching native records') as meter:
-                        snapshot = excerpt_records(snapshot, selected_records, progress=meter)
+                        (args.mode == 'turn' and base_args.last_n_turns is not None and not single_turn_selection)):
+                    try:
+                        with reporter.stage('Select matching native records') as meter:
+                            snapshot = excerpt_records(snapshot, selected_records, progress=meter)
+                    except ValueError as exc:
+                        ap.error(str(exc))
+                    if turn_index is None:
+                        warn_source_gaps(snapshot.metadata['selection'].get('source_gaps'))
                 effective_sid = supplied_sid or parse_session_id_from_name(source_path) or str(meta.get("id") or "")
                 title = discover_title(records, meta, args.name, effective_sid)
                 descriptor = mode_descriptor(args)
-                with reporter.stage("Render selected records", unit="records", detail=f"{len(selected_records):,} selected records"):
+                with reporter.stage("Render selected records", unit="characters", detail=f"{len(selected_records):,} selected records") as meter:
                     if args.mode == "thread" and not args.plain:
-                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone, progress=meter)
                     elif args.mode == "turn" and not args.plain and not args.ui_style:
-                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
+                        text = render_thread_export(records=selected_records, title=title, source=source_path, mode=descriptor, meta=meta, session_id=effective_sid, include_frontmatter=not args.no_frontmatter, include_map=not args.no_map, fence_turns=args.fence_turns, source_sha=snapshot.sha256, source_snapshot=snapshot.metadata, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone, progress=meter)
                     else:
-                        text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone)
-                with reporter.stage("Normalize rendered text", unit="steps"):
+                        text = render_export(selected_records, title, source_path, descriptor, args.plain, args.ui_style, not args.plain, source_sha=snapshot.sha256, show_timestamps=args.timestamps, timestamp_timezone=args.timestamp_timezone, progress=meter)
+                with reporter.stage("Normalize rendered text", unit="steps",
+                                    total=int(not args.keep_mojibake) + 2 + int(args.wrap_md)) as meter:
                     if not args.keep_mojibake:
+                        meter.update(detail="Repair configured text encoding artifacts")
                         text = cp437_cp1252_mojibake_repair(text)
+                        meter.advance(1)
+                    meter.update(detail="Apply configured redaction")
                     text = redact(text, args.redact)
+                    meter.advance(1)
+                    meter.update(detail="Apply configured text cleanup")
                     text = strip_hogs(text, enabled=not args.keep_hogs, max_line_chars=args.max_line_chars, max_repeated_lines=args.max_repeated_lines)
+                    meter.advance(1)
                     if args.wrap_md:
+                        meter.update(detail="Wrap Markdown")
                         text = wrap_markdown(text, title=args.wrap_title or None)
-                with reporter.stage("Count rendered output", unit="steps", detail=token_field_label()):
-                    text = finalize_count_placeholders(text)
+                        meter.advance(1)
+                with reporter.stage("Count rendered output", unit="characters", detail=token_field_label()) as meter:
+                    text = finalize_count_placeholders(text, progress=meter)
 
                 include_short = args.stable_filenames or args.include_session_short_id or len(sources) > 1
                 filename = render_filename(template, title=title, mode=descriptor, session_id=effective_sid, text=text, include_session_short_id=include_short)
@@ -4133,9 +4413,8 @@ def _main() -> int:
                         validate_destination(output_path)
                         output_path = rendered_path(output_path)
                         output_path.parent.mkdir(parents=True, exist_ok=True)
-                        with reporter.stage("Write Markdown", unit="files", total=1) as meter:
-                            output_path.write_text(text, encoding="utf-8", newline="\n")
-                            meter.update(1)
+                        with reporter.stage("Write Markdown", unit="characters", total=len(text)) as meter:
+                            write_rendered_text(output_path, text, progress=meter)
 
                 manifest_path = None
                 if args.manifest:
