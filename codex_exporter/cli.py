@@ -1782,13 +1782,35 @@ def walk_json_values(value: Any, *, depth: int = 0) -> list[Any]:
     return out
 
 
+class _UniqueMetadataValues(list):
+    """Transient ordered values with constant-time membership during parsing.
+
+    JSON encoders see an ordinary list; the set is an attribute, never a metadata
+    key. Only add_unique_meta writes these buckets. parse_session materializes
+    plain lists before returning, releasing the cache before rendering begins.
+    """
+
+    __slots__ = ('_seen',)
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self._seen = set(self)
+
+    def add_unique(self, value: str) -> None:
+        if value not in self._seen:
+            self._seen.add(value)
+            super().append(value)
+
+
 def add_unique_meta(meta: dict[str, Any], key: str, value: str) -> None:
     value = str(value).strip()
     if not value:
         return
-    bucket = meta.setdefault(key, [])
-    if value not in bucket:
-        bucket.append(value)
+    bucket = meta.get(key)
+    if not isinstance(bucket, _UniqueMetadataValues):
+        bucket = _UniqueMetadataValues(bucket if bucket is not None else ())
+        meta[key] = bucket
+    bucket.add_unique(value)
 
 
 def update_session_metadata_from_event(meta: dict[str, Any], obj: dict[str, Any]) -> None:
@@ -2669,6 +2691,11 @@ def parse_session(
             last_key = key
             records.append(rec)
 
+    # Keep the returned/public metadata shape unchanged and release membership
+    # caches once the source pass is finished. This is one linear pass per bucket.
+    for key, bucket in tuple(meta.items()):
+        if isinstance(bucket, _UniqueMetadataValues):
+            meta[key] = list(bucket)
     meta["_parse_error_count"] = len(meta["_parse_errors"])
     meta["_repaired_json_line_count"] = len(meta["_repaired_json_lines"])
     if progress is not None:

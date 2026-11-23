@@ -34,7 +34,9 @@ and the known source range length for progress, throughput, and a changing ETA.
 A recent measured-work window adapts to changing content. Startup, stalled
 telemetry, input-feed fallback, and finalization are explicit; input completion
 is not reported as archive completion. Buffered parse/render/write stages also
-report measured work. See the [progress and selection guide](docs/PROGRESS-AND-SELECTION-v0.5.2.md).
+report measured work. Buffered metadata collection also avoids repeated scans of
+an ever-growing timestamp list while preserving the original ordered values.
+See the [progress and selection guide](docs/PROGRESS-AND-SELECTION-v0.5.2.md).
 
 Incremental indexing now recognizes a narrowly defined NUL-only source record as
 an audited gap. It warns, records original coordinates and SHA-256, and retains

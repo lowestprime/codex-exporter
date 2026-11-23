@@ -5,6 +5,8 @@
   fallback, waiting, and finalization states.
 - Keep counted work separate from successful stage completion; preserve encoder
   errors and source-generator failures after subprocess output closes.
+- Replace quadratic buffered timestamp/metadata membership scans with transient
+  indexed membership while preserving ordered values and plain JSON metadata.
 - Add captured record totals and buffered parse/render/write progress, bounded
   Unicode output writes, normalization milestones, and exact-token count-pass status.
 - Audit only newline-terminated NUL-only records as opaque source gaps; retain

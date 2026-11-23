@@ -181,6 +181,24 @@ through the captured boundary. It is a fresh snapshot/selection on each call,
 not a persistent export cursor that changes future commands automatically.
 Re-run a listing when the source has grown before relying on numeric anchors.
 
+## Linear metadata collection in buffered modes
+
+The full-source validation exposed another cost in the classic parser: each
+observed timestamp searched the entire accumulated timestamp list before being
+appended. With mostly unique timestamps, doubling the records approximately
+quadrupled that metadata work. This affected source parsing before message,
+range, and action filtering.
+
+Metadata buckets now build a membership set once while retaining an ordered list
+of the original values. Membership has average constant cost, and first-seen
+order, normalization, duplicate handling, and JSON values remain unchanged.
+The transient set is an object attribute rather than a metadata key; buckets are
+converted back to ordinary lists when parsing finishes. No cache or set is added
+to manifests or result JSON. The streaming renderer does not use this collector.
+
+This removes the quadratic metadata scan. It does not claim that every buffered
+mode has bounded memory or that arbitrary input processing becomes constant time.
+
 ## Resource and validation boundaries
 
 The byte index and streaming thread/turn-range path remain bounded by index size
