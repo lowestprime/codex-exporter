@@ -30,8 +30,10 @@ class _Digest:
     complete_digest: Any = field(default_factory=hashlib.sha256)
     size: int = 0
     complete_size: int = 0
+    line_count: int = 0
 
     def update(self, data: bytes) -> None:
+        self.line_count += data.count(b'\n')
         last_newline = data.rfind(b'\n')
         if last_newline >= 0:
             self.digest.update(data[:last_newline + 1])
@@ -246,6 +248,7 @@ def snapshot_source(source: Path, *, directory: Path | None = None,
             'physical_prefix_sha256': physical_sha,
             'decoded_prefix_bytes': state.size,
             'captured_size_bytes': included_bytes,
+            'captured_line_count': state.line_count + int(included_bytes > state.complete_size),
             'captured_sha256': sha,
             'deferred_tail_bytes': deferred,
             'deferred_tail_sha256': deferred_sha,

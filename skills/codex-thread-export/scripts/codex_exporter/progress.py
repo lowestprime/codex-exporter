@@ -1,9 +1,10 @@
 """Measured export progress and a bounded, interruptible 7-Zip runner.
 
 All display output goes to stderr.  Counts describe the current stage only:
-7-Zip percentages are never converted into invented byte throughput.  A stage
-without a known denominator shows elapsed time instead of a guessed percentage.
-The default renderer uses a terminal bar, or sparse plain events when redirected.
+7-Zip percentages remain percentages; native ``M`` frames expose processed bytes
+at 1 MiB resolution. Input-feed fallback is labeled separately. ETA estimates
+use recent measured work and become unavailable during unmeasured finalization
+or stalls. The default renderer uses a terminal bar, or sparse redirected logs.
 """
 from __future__ import annotations
 
@@ -27,6 +28,10 @@ PROGRESS_STYLES = ('auto', 'rich', 'plain', 'json', 'off')
 SEVEN_ZIP_PROGRESS_ARGS = ('-bsp1', '-bso1', '-bse1', '-bb1', '-sccUTF-8')
 _ANSI = re.compile(r'\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-_])')
 _PERCENT = re.compile(r'^\s*(\d{1,3}(?:\.\d+)?)%(?:\s+(.*))?$')
+_PROCESSED_MIB = re.compile(r'^\s*(\d{1,20})M(?:\s+(.*))?$')
+_RATE_WINDOW_SECONDS = 30.0
+_RATE_SAMPLE_SECONDS = 0.2
+_STALE_PROGRESS_SECONDS = 10.0
 _MEMBER = re.compile(r'^\s*[+UT-]\s+(.+)$')
 _FRAMES = re.compile(r'[\r\n\b]+')
 _SPINNERS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
@@ -170,7 +175,8 @@ class ProgressReporter:
         self.finish(success=exc_type is None)
 
     def stage(self, name: str, *, total: float | None = None, unit: str = 'bytes',
-              detail: str = '',
+              detail: str = '', progress_basis: str = 'measured_work',
+              progress_resolution: float = 0,
               retry_exceptions: tuple[type[Exception], ...] = ()) -> StageProgress:
         if not isinstance(retry_exceptions, tuple) or any(
                 not isinstance(kind, type) or not issubclass(kind, Exception)
@@ -178,7 +184,9 @@ class ProgressReporter:
             raise TypeError('retry_exceptions must be a tuple of Exception subclasses')
         with self._lock:
             task = StageProgress(self, name, total=total, unit=unit, detail=detail,
-                                 index=len(self._stages) + 1, retry_exceptions=retry_exceptions)
+                                 index=len(self._stages) + 1, retry_exceptions=retry_exceptions,
+                                 progress_basis=progress_basis,
+                                 progress_resolution=progress_resolution)
             self._stages.append(task)
             self._emit(task, 'stage_start', force=True)
         task._start_heartbeat()
@@ -222,7 +230,8 @@ class ProgressReporter:
         metrics = []
         percent = stats['percent']
         if percent is not None:
-            metrics.append(f'{percent:.1f}%')
+            scope = 'input ' if task.progress_basis == 'stdin_bytes_sent' else ''
+            metrics.append(f'{scope}{percent:.1f}%')
         if unit != 'percent':
             if total is not None:
                 if unit == 'bytes':
@@ -235,9 +244,16 @@ class ProgressReporter:
                 metrics.append(_amount(done, unit))
             if stats['rate_per_second'] is not None:
                 metrics.append(_amount(stats['rate_per_second'], unit) + '/s')
-        metrics.append('elapsed ' + _duration(stats['elapsed_seconds']))
         if stats['eta_seconds'] is not None:
-            metrics.append('ETA ~' + _duration(stats['eta_seconds']))
+            label = 'input ETA ~' if stats['eta_scope'] == 'input_feed' else 'ETA ~'
+            metrics.append(label + _duration(stats['eta_seconds']))
+        elif task.status == 'running':
+            state = stats['eta_status']
+            metrics.append({'warming_up': 'ETA estimating',
+                            'unknown_total': 'ETA unavailable',
+                            'waiting_for_progress': 'ETA waiting for progress',
+                            'finalizing': 'finalizing; ETA unavailable'}[state])
+        metrics.append('elapsed ' + _duration(stats['elapsed_seconds']))
         if self.style != 'rich':
             return [' | '.join([header, *metrics, *([task.detail] if task.detail else [])])]
         columns = self._width or shutil.get_terminal_size(fallback=(120, 24)).columns
@@ -292,6 +308,7 @@ class ProgressReporter:
             payload = {'event': event, 'stage': task.name, 'stage_index': task.index,
                        'status': task.status, 'unit': task.unit, 'completed': task.completed,
                        'total': task.total, 'detail': task.detail,
+                       'observations': dict(task.observations),
                        'export_elapsed_seconds': max(0.0, now - self.started), **task._stats(now)}
             self._write(json.dumps(payload, ensure_ascii=True, allow_nan=False) + '\n')
         elif self.style == 'rich':
@@ -358,7 +375,8 @@ class StageProgress:
 
     def __init__(self, reporter: ProgressReporter, name: str, *, total: float | None,
                  unit: str, detail: str, index: int,
-                 retry_exceptions: tuple[type[Exception], ...] = ()):
+                 retry_exceptions: tuple[type[Exception], ...] = (),
+                 progress_basis: str = 'measured_work', progress_resolution: float = 0):
         self.reporter = reporter
         self.name = _clean(name, 120)
         self.index = index
@@ -368,8 +386,14 @@ class StageProgress:
         self.completed = 0.0
         self.detail = _clean(detail)
         self.status = 'running'
+        self.progress_basis = _clean(progress_basis, 64)
+        self.progress_resolution = _finite_count(progress_resolution, 'progress_resolution')
+        self.phase = 'working'
+        self.observations: dict[str, float | str | bool | None] = {}
         self.started = reporter._clock()
         self.ended: float | None = None
+        self._samples: deque[tuple[float, float]] = deque([(self.started, 0.0)], maxlen=256)
+        self._last_advance = self.started
         self._last_emit = -math.inf
         self._emitted = False
         self._heartbeat_stop = threading.Event()
@@ -408,25 +432,95 @@ class StageProgress:
             self.fail(detail=str(exc_value) if exc_value else exc_type.__name__)
 
     def _stats(self, now: float) -> dict:
-        elapsed = max(0.0, (self.ended if self.ended is not None else now) - self.started)
-        percent = 100 * self.completed / self.total if self.total else None
-        rate = self.completed / elapsed if elapsed >= 0.1 and self.completed > 0 else None
-        eta = ((self.total - self.completed) / rate
-               if self.status == 'running' and self.total and rate and self.completed < self.total else None)
-        return {'elapsed_seconds': elapsed, 'percent': percent,
-                'rate_per_second': rate if self.unit != 'percent' else None, 'eta_seconds': eta}
+        current = self.ended if self.ended is not None else now
+        elapsed = max(0.0, current - self.started)
+        work_percent = 100 * self.completed / self.total if self.total else None
+        # Use a recent window, not an entire-job average that remains optimistic
+        # when a later, less compressible region becomes much slower.
+        reference = self._samples[0]
+        for sample in self._samples:
+            if sample[0] <= current - _RATE_WINDOW_SECONDS:
+                reference = sample
+            else:
+                break
+        span = current - reference[0]
+        delta = self.completed - reference[1]
+        rate = delta / span if span >= 0.1 and delta > 0 else None
+        stale = current - self._last_advance >= _STALE_PROGRESS_SECONDS
+        phase = self.phase
+        eta = None
+        if self.status != 'running':
+            eta_status = self.status
+            phase = self.status
+        elif phase in ('finalizing', 'checking') or (self.total is not None and self.completed >= self.total):
+            eta_status, phase = 'finalizing', 'finalizing'
+        elif self.total is None:
+            eta_status = 'unknown_total'
+        elif stale:
+            eta_status = 'waiting_for_progress'
+        elif not rate or elapsed < 0.1:
+            eta_status = 'warming_up'
+        else:
+            eta_status = 'estimated'
+            eta = max(0.0, (self.total - self.completed) / rate)
+        if stale and self.status == 'running':
+            rate = None
+        # Finishing all counted input is not proof that the encoder has flushed,
+        # the ZIP has closed or the caller's validation has passed. Keep factual
+        # counts/work_percent, but reserve a full stage bar for observed success.
+        percent = None if self.status == 'running' and eta_status == 'finalizing' else work_percent
+        return {'elapsed_seconds': elapsed, 'percent': percent, 'work_percent': work_percent,
+                'rate_per_second': rate if self.unit != 'percent' else None, 'eta_seconds': eta,
+                'eta_status': eta_status,
+                'eta_scope': 'input_feed' if self.progress_basis == 'stdin_bytes_sent' else 'stage_work',
+                'progress_basis': self.progress_basis,
+                'progress_resolution': self.progress_resolution, 'phase': phase}
 
     def update(self, completed: float | None = None, *, total: float | None = None,
-               detail: str | None = None) -> None:
+               detail: str | None = None, phase: str | None = None,
+               progress_basis: str | None = None, progress_resolution: float | None = None,
+               observations: Mapping[str, float | str | bool | None] | None = None) -> None:
         with self.reporter._lock:
             if self.status != 'running':
                 return
+            now = self.reporter._clock()
+            basis_changed = progress_basis is not None and progress_basis != self.progress_basis
+            if progress_basis is not None:
+                self.progress_basis = _clean(progress_basis, 64)
+            if progress_resolution is not None:
+                self.progress_resolution = _finite_count(progress_resolution, 'progress_resolution')
             if completed is not None:
-                self.completed = _finite_count(completed, 'completed')
+                value = _finite_count(completed, 'completed')
+                if value != self.completed or basis_changed:
+                    if value < self.completed or basis_changed:
+                        self._samples.clear()
+                        self._samples.append((now, value))
+                    else:
+                        if now - self._samples[-1][0] >= _RATE_SAMPLE_SECONDS:
+                            self._samples.append((now, value))
+                        while len(self._samples) > 2 and self._samples[1][0] < now - _RATE_WINDOW_SECONDS:
+                            self._samples.popleft()
+                    if value > self.completed:
+                        self._last_advance = now
+                    self.completed = value
             if total is not None:
                 self.total = _finite_count(total, 'total')
             if detail is not None:
                 self.detail = _clean(detail)
+            if phase is not None:
+                self.phase = _clean(phase, 32)
+            if observations is not None:
+                if len(observations) > 16:
+                    raise ValueError('Progress observations must remain bounded')
+                for key, value in observations.items():
+                    key = _clean(key, 64)
+                    if key not in self.observations and len(self.observations) >= 16:
+                        raise ValueError('Progress observations must remain bounded')
+                    if isinstance(value, str):
+                        value = _clean(value, 256)
+                    elif value is not None and not isinstance(value, bool):
+                        value = _finite_count(value, key)
+                    self.observations[key] = value
             self.reporter._emit(self, 'stage_progress')
 
     def advance(self, amount: float, *, detail: str | None = None) -> None:
@@ -480,36 +574,57 @@ class SevenZipProgressParser:
     """Consume 7-Zip's backspace/CR/newline frames, including split UTF-8 reads.
 
     The caller supplies decoded text.  A file log line identifies the file being
-    processed; it is not treated as proof that that file has finished.  Nor is
-    7-Zip's percentage interpreted as bytes read or output bytes produced.
+    processed; it is not treated as proof that that file has finished. Percent
+    frames remain percentages. For stdin, native ``M`` frames report processed
+    input at 1 MiB resolution and can use the caller's known range denominator.
     """
 
     def __init__(self, progress: StageProgress | None):
-        if progress is not None and progress.unit != 'percent':
-            raise ValueError("7-Zip progress stages must use unit='percent'")
+        if progress is not None and progress.unit not in ('percent', 'bytes'):
+            raise ValueError("7-Zip progress stages must use unit='percent' or 'bytes'")
         self.progress = progress
         self._pending = ''
         self._member = ''
-        self._last_update: tuple[float, str] | None = None
+        self._last_update: tuple[float, str, str] | None = None
+        self.measured_basis: str | None = None
 
     def _record(self, text: str, *, complete: bool) -> None:
         if self.progress is None:
             return
         text = _clean(text, 16384)
         match = _PERCENT.fullmatch(text)
-        if match:
-            percent = float(match.group(1))
-            if percent > 100:
-                return
+        mib_match = _PROCESSED_MIB.fullmatch(text) if self.progress.unit == 'bytes' else None
+        if match or mib_match:
+            measured = match or mib_match
+            assert measured is not None
+            if match:
+                amount = float(match.group(1))
+                if amount > 100:
+                    return
+                # Percent callbacks describe encoder work, not byte throughput.
+                # Byte stages use native M frames; do not invent finer byte counts
+                # by converting an integer percentage back into input bytes.
+                if self.progress.unit != 'percent':
+                    return
+                total, basis, resolution = 100, '7zip_percent', 1
+            else:
+                # Official 7-Zip and 7-Zip-Zstandard print Completed >> 20 as M
+                # when stdin's total is unknown. This is a lower-bound sample,
+                # not compressed output bytes and not bytes merely sent to stdin.
+                amount = int(measured.group(1)) * 1048576
+                if self.progress.total is not None and amount > self.progress.total:
+                    return
+                total, basis, resolution = self.progress.total, '7zip_processed_bytes', 1048576
             detail = '7-Zip: ' + (self._member or 'compressing members')
-            # Some 7-Zip variants include the current member after the counter.
-            suffix = match.group(2) or ''
+            suffix = measured.group(2) or ''
             inline_member = re.match(r'(?:\d+\s+)?[+UT-]\s+(.+)', suffix)
             if inline_member:
                 detail = '7-Zip: ' + inline_member.group(1)
-            value = (percent, detail)
+            value = (amount, detail, basis)
+            self.measured_basis = basis
             if value != self._last_update:
-                self.progress.update(percent, total=100, detail=detail)
+                self.progress.update(amount, total=total, detail=detail, phase='compressing',
+                                     progress_basis=basis, progress_resolution=resolution)
                 self._last_update = value
             return
         if not complete:
@@ -525,7 +640,7 @@ class SevenZipProgressParser:
         elif text.startswith('Add new data to archive:'):
             self.progress.update(detail='7-Zip: compressing members')
         elif text.startswith('Files read from disk:'):
-            self.progress.update(detail='7-Zip: finalizing archive')
+            self.progress.update(detail='7-Zip: finalizing archive', phase='finalizing')
 
     def feed(self, text: str, *, final: bool = False) -> None:
         # Bound even a faulty/malicious archiver that never sends delimiters.
@@ -588,7 +703,7 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
                   env: Mapping[str, str] | None = None, output_limit: int = 65536,
                   heartbeat_interval: float = 0.2, timeout: float | None = None,
                   cancel_event: threading.Event | None = None,
-                  input_chunks: Iterable[bytes] | None = None,
+                  input_chunks: Iterable[bytes] | None = None, input_size: int | None = None,
                   on_tick: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
     """Run 7-Zip without deadlocking pipes or retaining unbounded diagnostic logs.
 
@@ -598,11 +713,18 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
     ``stderr`` is empty.  Nonzero exits are returned for the caller to handle.
     Ctrl+C, explicit cancellation, and timeouts terminate and reap the child.
     Optional input chunks are streamed through a separate writer, so an input
-    range never needs a duplicate raw file. The monitor callback runs alongside
-    pipe draining and may stop input or raise to cancel an oversized candidate.
+    range never needs a duplicate raw file. With ``input_size`` and a byte stage,
+    native MiB counters become measured range progress. A silent variant falls
+    back to separately labeled input-feed progress, never encoder-completion
+    claims. The monitor callback runs alongside pipe draining and may stop input
+    or raise to cancel an oversized candidate.
     A successful exit supplies the observed completion signal even when 7-Zip
     did not print a final 100% frame.  Archive verification remains a later stage.
     """
+    if input_size is not None:
+        input_size = _finite_count(input_size, 'input_size')
+        if input_chunks is None:
+            raise ValueError('input_size requires streamed input_chunks')
     parser = SevenZipProgressParser(progress)
     interval = max(0.02, _finite_count(heartbeat_interval, 'heartbeat_interval'))
     if timeout is not None:
@@ -611,6 +733,8 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
     chunks: queue.Queue[bytes | BaseException | None] = queue.Queue(maxsize=16)
     stop = threading.Event()
+    input_lock = threading.Lock()
+    input_state = {'sent': 0, 'exhausted': False, 'error': None}
     args = [os.fspath(arg) for arg in command]
     process = subprocess.Popen(args, cwd=cwd, env=env,
                                stdin=subprocess.PIPE if input_chunks is not None else subprocess.DEVNULL,
@@ -649,17 +773,44 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
                     if not written:
                         raise BrokenPipeError('7-Zip closed its input stream')
                     pending = pending[written:]
+                    with input_lock:
+                        input_state['sent'] += written
+            if not stop.is_set():
+                with input_lock:
+                    input_state['exhausted'] = True
         except BrokenPipeError:
             # Let the process exit and preserve its actionable diagnostic log.
             # The caller also checks the number of bytes successfully supplied.
             pass
         except BaseException as error:
+            with input_lock:
+                input_state['error'] = error
             send(error)
         finally:
             try:
                 process.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
+
+    def input_telemetry() -> None:
+        if progress is None or input_chunks is None:
+            return
+        with input_lock:
+            sent, exhausted = input_state['sent'], input_state['exhausted']
+        observations = {'input_bytes_sent': sent, 'input_total_bytes': input_size,
+                        'input_complete': exhausted}
+        # Only the main thread emits telemetry; input writes are separately
+        # counted under a small lock. Native encoder measurements take priority.
+        if progress.unit == 'bytes' and input_size is not None:
+            total = sent if exhausted else input_size
+            if parser.measured_basis is None:
+                progress.update(sent, total=total, progress_basis='stdin_bytes_sent',
+                                phase='finalizing' if exhausted else 'feeding',
+                                progress_resolution=1, observations=observations)
+            else:
+                progress.update(total=total, observations=observations)
+        else:
+            progress.update(observations=observations)
 
     reader: threading.Thread | None = None
     writer: threading.Thread | None = None
@@ -675,6 +826,7 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
         if writer is not None:
             writer.start()
         while not eof or process.poll() is None:
+            input_telemetry()
             if on_tick is not None:
                 on_tick()
             if cancel_event is not None and cancel_event.is_set():
@@ -698,6 +850,7 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
                 elif value:
                     text = decoder.decode(value)
                     tail.append(text)
+                    input_telemetry()
                     parser.feed(text)
             if progress is not None:
                 progress.heartbeat()
@@ -705,9 +858,26 @@ def run_seven_zip(command: Sequence[str | os.PathLike[str]], *,
         tail.append(text)
         parser.feed(text, final=True)
         returncode = process.wait()
+        if writer is not None:
+            writer.join(timeout=3)
+            with input_lock:
+                writer_error = input_state['error']
+            if writer_error is not None:
+                raise writer_error
+            with input_lock:
+                input_exhausted = input_state['exhausted']
+            if returncode == 0 and not input_exhausted:
+                raise RuntimeError('7-Zip exited before consuming the complete input stream')
+            input_telemetry()
         if progress is not None:
             if returncode == 0:
-                progress.update(100, total=100, detail='7-Zip completed; independent archive verification follows')
+                detail = '7-Zip completed; checking candidate; full archive verification follows'
+                if progress.unit == 'bytes' and input_chunks is not None:
+                    with input_lock:
+                        sent = input_state['sent']
+                    progress.update(sent, total=sent, phase='checking', detail=detail)
+                else:
+                    progress.update(100, total=100, phase='checking', detail=detail)
             else:
                 progress.update(detail=f'7-Zip exited with code {returncode}')
         return subprocess.CompletedProcess(args, returncode, stdout=tail.text(), stderr='')

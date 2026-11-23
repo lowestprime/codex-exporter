@@ -391,6 +391,57 @@ function cdx-since {
     if ($PSBoundParameters.ContainsKey('ArchiveMaxBytes')) { $parameters.ArchiveMaxBytes = $ArchiveMaxBytes }
     Invoke-CodexThreadExport @parameters
 }
+function cdx-since-text {
+    [CmdletBinding(PositionalBinding=$false)]
+    param([Parameter(Mandatory, Position=0)][string]$SessionId,
+        [Parameter(Mandatory, Position=1)][ValidateNotNullOrEmpty()][string]$Text,
+        [Alias('SinceOccurrence')][ValidateRange(1,2147483647)][int]$Occurrence,
+        [ValidateRange(16384,512000000)][long]$ArchiveMaxBytes,
+        [Parameter(ValueFromRemainingArguments=$true)][object[]]$Rest = @())
+    # Canonical order is SESSION TEXT. Accept TEXT UUID only when the UUID position is unambiguous.
+    $uuid = '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+    if ($SessionId -notmatch $uuid -and $Text -match $uuid) { $SessionId, $Text = $Text, $SessionId }
+    $parameters = @{ SessionId=$SessionId; Mode='thread'; SinceText=$Text; Rest=$Rest }
+    if ($PSBoundParameters.ContainsKey('Occurrence')) { $parameters.SinceOccurrence = $Occurrence }
+    if ($PSBoundParameters.ContainsKey('ArchiveMaxBytes')) { $parameters.ArchiveMaxBytes = $ArchiveMaxBytes }
+    Invoke-CodexThreadExport @parameters
+}
+function cdx-since-turn {
+    [CmdletBinding(PositionalBinding=$false)]
+    param([Parameter(Mandatory, Position=0)][string]$SessionId,
+        [Parameter(Mandatory, Position=1)][ValidateRange(1,2147483647)][int]$Turn,
+        [Alias('SinceOccurrence')][ValidateRange(1,2147483647)][int]$Occurrence,
+        [ValidateRange(16384,512000000)][long]$ArchiveMaxBytes,
+        [Parameter(ValueFromRemainingArguments=$true)][object[]]$Rest = @())
+    $parameters = @{ SessionId=$SessionId; Mode='thread'; SinceTurn=$Turn; Rest=$Rest }
+    if ($PSBoundParameters.ContainsKey('Occurrence')) { $parameters.SinceOccurrence = $Occurrence }
+    if ($PSBoundParameters.ContainsKey('ArchiveMaxBytes')) { $parameters.ArchiveMaxBytes = $ArchiveMaxBytes }
+    Invoke-CodexThreadExport @parameters
+}
+function cdx-since-id {
+    [CmdletBinding(PositionalBinding=$false)]
+    param([Parameter(Mandatory, Position=0)][string]$SessionId,
+        [Parameter(Mandatory, Position=1)][ValidateNotNullOrEmpty()][string]$Id,
+        [Alias('SinceOccurrence')][ValidateRange(1,2147483647)][int]$Occurrence,
+        [ValidateRange(16384,512000000)][long]$ArchiveMaxBytes,
+        [Parameter(ValueFromRemainingArguments=$true)][object[]]$Rest = @())
+    $parameters = @{ SessionId=$SessionId; Mode='thread'; SinceId=$Id; Rest=$Rest }
+    if ($PSBoundParameters.ContainsKey('Occurrence')) { $parameters.SinceOccurrence = $Occurrence }
+    if ($PSBoundParameters.ContainsKey('ArchiveMaxBytes')) { $parameters.ArchiveMaxBytes = $ArchiveMaxBytes }
+    Invoke-CodexThreadExport @parameters
+}
+function cdx-since-time {
+    [CmdletBinding(PositionalBinding=$false)]
+    param([Parameter(Mandatory, Position=0)][string]$SessionId,
+        [Parameter(Mandatory, Position=1)][ValidateNotNullOrEmpty()][string]$Time,
+        [Alias('SinceOccurrence')][ValidateRange(1,2147483647)][int]$Occurrence,
+        [ValidateRange(16384,512000000)][long]$ArchiveMaxBytes,
+        [Parameter(ValueFromRemainingArguments=$true)][object[]]$Rest = @())
+    $parameters = @{ SessionId=$SessionId; Mode='thread'; SinceTime=$Time; Rest=$Rest }
+    if ($PSBoundParameters.ContainsKey('Occurrence')) { $parameters.SinceOccurrence = $Occurrence }
+    if ($PSBoundParameters.ContainsKey('ArchiveMaxBytes')) { $parameters.ArchiveMaxBytes = $ArchiveMaxBytes }
+    Invoke-CodexThreadExport @parameters
+}
 function cdx-turns {
     [CmdletBinding(PositionalBinding=$false)]
     param([Parameter(Mandatory, Position=0)][string]$SessionId,

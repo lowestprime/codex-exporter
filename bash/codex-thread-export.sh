@@ -186,6 +186,31 @@ cdx-since() {
     local sid=$1 selector=$2; shift 2
     _codex_export_run --session-id "$sid" --mode thread --since "$selector" "$@"
 }
+cdx-since-text() {
+    _codex_export_require "cdx-since-text SESSION TEXT [--since-occurrence N] [options]" 2 "$#" || return
+    local sid=$1 selector=$2; shift 2
+    # Canonical order is SESSION TEXT; recognize the historical TEXT UUID spelling only unambiguously.
+    local uuid='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$' swap
+    if [[ ! $sid =~ $uuid && $selector =~ $uuid ]]; then
+        swap=$sid; sid=$selector; selector=$swap
+    fi
+    _codex_export_run --session-id "$sid" --mode thread --since-text "$selector" "$@"
+}
+cdx-since-turn() {
+    _codex_export_require "cdx-since-turn SESSION TURN [--since-occurrence N] [options]" 2 "$#" || return
+    local sid=$1 selector=$2; shift 2
+    _codex_export_run --session-id "$sid" --mode thread --since-turn "$selector" "$@"
+}
+cdx-since-id() {
+    _codex_export_require "cdx-since-id SESSION ID [--since-occurrence N] [options]" 2 "$#" || return
+    local sid=$1 selector=$2; shift 2
+    _codex_export_run --session-id "$sid" --mode thread --since-id "$selector" "$@"
+}
+cdx-since-time() {
+    _codex_export_require "cdx-since-time SESSION TIME [--since-occurrence N] [options]" 2 "$#" || return
+    local sid=$1 selector=$2; shift 2
+    _codex_export_run --session-id "$sid" --mode thread --since-time "$selector" "$@"
+}
 cdx-turns() {
     _codex_export_require "cdx-turns SESSION [options]" 1 "$#" || return
     local sid=$1; shift

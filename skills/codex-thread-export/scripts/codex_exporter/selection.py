@@ -24,6 +24,12 @@ from .progress import ProgressReporter
 from .snapshot import CHUNK_BYTES, SourceSnapshot, is_complete_jsonl_record
 
 PREVIEW_CHARS = 240
+SOURCE_GAP_POLICY = (
+    'Only newline-terminated records containing exclusively NUL bytes are classified as source gaps. '
+    'Their origin and any missing historical content are unknown. User-turn numbers count observed '
+    'complete user records; no missing content is reconstructed. All gap bytes remain unchanged '
+    'when their source interval is selected; every known gap is audited even when excluded.'
+)
 
 
 class SelectionError(ValueError):
@@ -73,6 +79,21 @@ class HistoryEvent:
 
 
 @dataclass(frozen=True)
+class SourceGap:
+    line: int
+    byte_start: int
+    byte_end: int
+    nul_bytes: int
+    sha256: str
+
+    def audit(self, snapshot_sha256: str) -> dict[str, Any]:
+        return {'kind': 'nul_only_record', 'source_snapshot_sha256': snapshot_sha256,
+                'source_line': self.line, 'source_byte_start': self.byte_start,
+                'source_byte_end': self.byte_end, 'size_bytes': self.byte_end - self.byte_start,
+                'nul_bytes': self.nul_bytes, 'sha256': self.sha256}
+
+
+@dataclass(frozen=True)
 class TurnIndex:
     path: Path
     size_bytes: int
@@ -87,6 +108,7 @@ class TurnIndex:
     signature: tuple[int, ...]
     deferred_tail_bytes: int = 0
     physical_size_bytes: int = 0
+    source_gaps: tuple[SourceGap, ...] = ()
 
 
 def _signature(path: Path) -> tuple[int, ...]:
@@ -126,8 +148,19 @@ def _bounded_lines(stream, size: int):
         yield line, raw
 
 
+def _source_gap(raw: bytes, line: int, start: int) -> SourceGap | None:
+    # Do not generalize this to malformed JSON or mixed NUL/text records: either
+    # could conceal a user anchor. An unterminated NUL tail may still be live.
+    if not raw.startswith(b'\x00') or not raw.endswith(b'\n'):
+        return None
+    body = raw[:-2] if raw.endswith(b'\r\n') else raw[:-1]
+    if body and body.count(b'\x00') == len(body):
+        return SourceGap(line, start, start + len(raw), len(body), hashlib.sha256(raw).hexdigest())
+    return None
+
+
 def _parse(raw: bytes, line: int) -> tuple[dict[str, Any] | None, bool]:
-    if not raw.strip():
+    if not raw.strip() or _source_gap(raw, line, 0) is not None:
         return None, False
     try:
         value = json.loads(raw)
@@ -324,7 +357,8 @@ def _substantive(obj: dict[str, Any]) -> bool:
         return False
     if ptype == 'item_started' and itype == 'usermessage':
         return False
-    if ptype in ('token_count', 'task_started', 'task_complete', 'turn_started', 'turn_complete'):
+    if ptype in ('token_count', 'task_started', 'task_complete', 'turn_started', 'turn_complete',
+                 'configuration_update', 'additional_tools'):
         return False
     if str(payload.get('role') or item.get('role') or obj.get('role') or '').casefold() in ('system', 'developer'):
         return False
@@ -346,6 +380,7 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_li
     histories: list[HistoryEvent] = []
     injected: list[int] = []
     repairs: list[int] = []
+    gaps: list[SourceGap] = []
     metadata = None
     digest = hashlib.sha256()
     ids_seen: dict[str, int] = {}
@@ -370,6 +405,9 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_li
                 offset, total_lines = start, line - 1
                 break
             digest.update(raw)
+            gap = _source_gap(raw, line, start)
+            if gap is not None:
+                gaps.append(gap)
             obj, repaired = _parse(raw, line)
             if repaired:
                 repairs.append(line)
@@ -406,6 +444,8 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_li
                                        or explicit_turn_id == turns[ids_seen[item_id]].turn_id)), None)
                 if (duplicate is None and turns and not activity and kind not in active_kinds
                         and turns[-1].text_sha256 == text_hash
+                        and (not item_ids or not turns[-1].item_ids
+                             or not set(item_ids).isdisjoint(turns[-1].item_ids))
                         and (not effective_turn_id or not turns[-1].turn_id or effective_turn_id == turns[-1].turn_id)):
                     duplicate = len(turns) - 1
                 if duplicate is not None:
@@ -462,7 +502,7 @@ def index_turns(source: Path | SourceSnapshot, *, progress: Any = None, _live_li
         raise SelectionError('Snapshot checksum does not match its capture metadata; no selection was produced.')
     return TurnIndex(path, offset, total_lines, sha, tuple(turns), metadata, tuple(contexts),
                      tuple(histories), tuple(injected), tuple(repairs), before,
-                     deferred_tail_bytes=deferred_tail, physical_size_bytes=before[2])
+                     deferred_tail_bytes=deferred_tail, physical_size_bytes=before[2], source_gaps=tuple(gaps))
 
 
 def index_live_turns(path: Path, *, progress: Any = None) -> TurnIndex:
@@ -593,8 +633,55 @@ def _with_context(ranges: list[SourceRange], metadata: SourceRange | None,
     return _merge_ranges([*ranges, *extra])
 
 
+def _audit_source_gaps(snapshot: SourceSnapshot, ranges: list[SourceRange],
+                       source_gaps: Iterable[SourceGap]) -> list[dict[str, Any]]:
+    """Carry original coordinates through nested excerpts without hiding gaps.
+
+    Each audit's source coordinates refer to its source_snapshot_sha256. Excerpt
+    coordinates refer only to the newly emitted file. An excluded ancestor gap
+    remains disclosed even when this pass cannot encounter its bytes again.
+    """
+    ancestors = snapshot.metadata.get('selection', {}).get('source_gaps', [])
+    audits = [dict(value) for value in ancestors]
+    by_line = {value['excerpt_line']: value for value in audits
+               if value.get('included_in_excerpt') and 'excerpt_line' in value}
+    candidates = [(value, value.get('excerpt_line'), value.get('excerpt_byte_start'),
+                   value.get('excerpt_byte_end')) for value in audits]
+    for gap in source_gaps:
+        prior = by_line.get(gap.line)
+        if (prior is not None and prior.get('sha256') == gap.sha256
+                and prior.get('excerpt_byte_start') == gap.byte_start
+                and prior.get('excerpt_byte_end') == gap.byte_end):
+            continue
+        candidates.append((gap.audit(snapshot.sha256), gap.line, gap.byte_start, gap.byte_end))
+    result = []
+    starts = [span.byte_start for span in ranges]
+    byte_bases = []
+    line_bases = []
+    byte_base = line_base = 0
+    for span in ranges:
+        byte_bases.append(byte_base)
+        line_bases.append(line_base)
+        byte_base += span.byte_end - span.byte_start
+        line_base += span.line_end - span.line_start + 1
+    for value, line, start, end in candidates:
+        value = {key: item for key, item in value.items()
+                 if key not in ('included_in_excerpt', 'excerpt_line', 'excerpt_byte_start', 'excerpt_byte_end')}
+        position = bisect_right(starts, start) - 1 if start is not None else -1
+        included = position >= 0 and end is not None and end <= ranges[position].byte_end
+        value['included_in_excerpt'] = included
+        if included:
+            span = ranges[position]
+            value.update(excerpt_line=line_bases[position] + line - span.line_start + 1,
+                         excerpt_byte_start=byte_bases[position] + start - span.byte_start,
+                         excerpt_byte_end=byte_bases[position] + end - span.byte_start)
+        result.append(value)
+    return result
+
+
 def _copy_excerpt(snapshot: SourceSnapshot, ranges: list[SourceRange], *, selection: dict[str, Any],
-                  history_events: Iterable[HistoryEvent] = (), progress: Any = None) -> SourceSnapshot:
+                  history_events: Iterable[HistoryEvent] = (), source_gaps: Iterable[SourceGap] = (),
+                  progress: Any = None) -> SourceSnapshot:
     if not snapshot.owns_staged_path():
         raise SelectionError('Native excerpts require an owned verified snapshot, not the live rollout.')
     before = _signature(snapshot.path)
@@ -650,6 +737,8 @@ def _copy_excerpt(snapshot: SourceSnapshot, ranges: list[SourceRange], *, select
             'input_snapshot_size_bytes': snapshot.size_bytes,
             'sha256': digest.hexdigest(), 'size_bytes': copied, 'line_count': lines,
             'ranges': provenance,
+            'source_gap_policy': SOURCE_GAP_POLICY,
+            'source_gaps': _audit_source_gaps(snapshot, ranges, source_gaps),
             'context_lines': [line for span in ranges if span.kind == 'context'
                               for line in range(span.line_start, span.line_end + 1)],
             'embedded_history_record_count': sum(event.embedded_history for event in histories),
@@ -657,7 +746,7 @@ def _copy_excerpt(snapshot: SourceSnapshot, ranges: list[SourceRange], *, select
             'history_policy': 'Retain every selected native record, including post-anchor compaction or rollback events. Embedded replacement history may quote older content; it is not rewritten or silently omitted.',
         }
         metadata = {**snapshot.metadata, 'policy': 'selected_records_from_verified_snapshot',
-                    'captured_size_bytes': copied, 'captured_sha256': digest.hexdigest(),
+                    'captured_size_bytes': copied, 'captured_line_count': lines, 'captured_sha256': digest.hexdigest(),
                     'selection': selection}
         return replace(snapshot, path=target, sha256=digest.hexdigest(), size_bytes=copied, metadata=metadata)
     except BaseException:
@@ -694,7 +783,7 @@ def excerpt_turns(snapshot: SourceSnapshot, start_turn: int | TurnAnchor, stop_t
         'start_turn_id': first.turn_id, 'start_timestamp': first.timestamp,
         'start_prompt_sha256': first.text_sha256,
         'repaired_json_lines': [line for line in index.repaired_json_lines if any(span.line_start <= line <= span.line_end for span in ranges)],
-    }, history_events=index.history_events, progress=progress)
+    }, history_events=index.history_events, source_gaps=index.source_gaps, progress=progress)
 
 
 def excerpt_records(snapshot: SourceSnapshot, records: Iterable[Any], *, include_context: bool = True,
@@ -723,9 +812,13 @@ def excerpt_records(snapshot: SourceSnapshot, records: Iterable[Any], *, include
     metadata = None
     offset = reported = 0
     found: set[int] = set()
+    gaps: list[SourceGap] = []
     with snapshot.path.open('rb') as source, _stage(progress, 'Map selected source records', snapshot.size_bytes) as task:
         for line, raw in _bounded_lines(source, before[2]):
             start, offset = offset, offset + len(raw)
+            gap = _source_gap(raw, line, start)
+            if gap is not None:
+                gaps.append(gap)
             obj, _ = _parse(raw, line)
             if obj is not None:
                 if str(obj.get('type') or '').casefold() == 'session_meta' and metadata is None:
@@ -751,4 +844,4 @@ def excerpt_records(snapshot: SourceSnapshot, records: Iterable[Any], *, include
         ranges = _with_context(ranges, metadata, contexts)
     return _copy_excerpt(snapshot, ranges, selection={
         'mode': 'rendered_record_lines', 'selected_source_line_count': len(selected),
-    }, history_events=histories, progress=progress)
+    }, history_events=histories, source_gaps=gaps, progress=progress)

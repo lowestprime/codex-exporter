@@ -1,4 +1,4 @@
-# Codex Exporter 0.5.1 — accurate export outcomes and adaptive archive planning
+# Codex Exporter 0.5.2 — measured compression ETA and reliable incremental exports
 
 Export a running Codex thread with **every final ZIP at most 512,000,000 bytes**.
 A fitting single-session export contains the familiar three files: Markdown,
@@ -26,6 +26,37 @@ A verified fixed snapshot allows the session to keep running. The original rollo
 is never moved, deleted or modified. Read the [bounded archive, selection and
 browser guide](docs/BOUNDED-EXPORTS-AND-SELECTION.md) for exact guarantees, controls,
 configuration and the limits of remote ChatGPT compatibility.
+
+## New in 0.5.2
+
+Streamed 7-Zip compression now uses the encoder's native processed-byte counters
+and the known source range length for progress, throughput, and a changing ETA.
+A recent measured-work window adapts to changing content. Startup, stalled
+telemetry, input-feed fallback, and finalization are explicit; input completion
+is not reported as archive completion. Buffered parse/render/write stages also
+report measured work. See the [progress and selection guide](docs/PROGRESS-AND-SELECTION-v0.5.2.md).
+
+Incremental indexing now recognizes a narrowly defined NUL-only source record as
+an audited gap. It warns, records original coordinates and SHA-256, and retains
+the bytes whenever the selected interval includes them. It does not reconstruct
+missing content or silently skip arbitrary malformed JSON. Response listings and
+selection use the same human-turn index. Buffered rendering respects native
+message/tool identities, retains separate repeated occurrences, and pairs tool
+outputs using call IDs. Invalid zero range bounds are rejected.
+
+PowerShell and Bash include `cdx-since-text`, `cdx-since-turn`, `cdx-since-id`, and
+`cdx-since-time` in addition to the generic selector helper:
+
+```powershell
+cdx-since-text 'SESSION-ID' 'distinct phrase in the starting prompt'
+cdx-since-turn 'SESSION-ID' 42
+cdx-since-id 'SESSION-ID' 'recorded-turn-or-message-id'
+cdx-since-time 'SESSION-ID' '2026-11-23T09:30:00-08:00'
+cdx-last 'SESSION-ID' 4
+```
+
+Upgrade both the Python package and shell helpers. Existing compression,
+archive-size, output, and workspace preferences remain in effect.
 
 ## New in 0.5.1
 
@@ -148,7 +179,7 @@ if (-not (Test-Path -LiteralPath $py -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $archiver -PathType Leaf)) {
     throw 'Select the installed compatible 7-Zip CLI.'
 }
-& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.1/codex_exporter-0.5.1-py3-none-any.whl'
+& $py -m pip install --upgrade --no-deps 'https://github.com/lowestprime/codex-exporter/releases/download/v0.5.2/codex_exporter-0.5.2-py3-none-any.whl'
 if ($LASTEXITCODE -ne 0) { throw 'Exporter upgrade failed.' }
 & $py -m codex_exporter --version
 if ($LASTEXITCODE -ne 0) { throw 'Exporter version check failed.' }
@@ -269,9 +300,14 @@ if a repair remains unsuccessful.
 Progress is sent to **stderr** so stdout remains the final path or `--json`
 result. Interactive terminals receive a compact colored bar, icons, elapsed
 time, measured throughput, and ETA when the stage has a meaningful denominator.
-Compression displays the percentages actually reported by 7-Zip; it does not
-turn those percentages into invented byte throughput or a guessed overall job
-percentage. Unknown-duration work displays activity and elapsed time.
+Streamed range compression uses native 7-Zip `M` counters (binary MiB) against
+its exact input length. Other compression paths retain backend percentages;
+percentages are never converted to invented byte throughput. An explicitly
+labeled input-feed fallback is used only when native telemetry is unavailable.
+Rates and ETA use recent measured work. Unknown-duration work displays activity,
+elapsed time, and an explicit unavailable ETA. Finalization is separate from
+successful stage completion; no overall job percentage or ETA is guessed from
+the number of dynamically discovered stages.
 
 ```powershell
 codex-export --session-id UUID --mode thread --progress-style auto
@@ -492,6 +528,10 @@ At the direct CLI level, `--out-dir` and `--choose-out-dir` are remembered by de
 | `cdx-response <ID>` | Latest response, wrapped Markdown, clipboard |
 | `cdx-last <ID> N` | Last `N` turns with matching JSONL |
 | `cdx-since <ID> SELECTOR` | Inclusive prompt/turn/ID/time selection through snapshot end |
+| `cdx-since-text <ID> TEXT` | Inclusive literal prompt-text selection |
+| `cdx-since-turn <ID> N` | Inclusive observed human-turn number selection |
+| `cdx-since-id <ID> NATIVE-ID` | Inclusive recorded turn/message ID selection |
+| `cdx-since-time <ID> ISO` | Inclusive offset-aware time selection |
 | `cdx-turns <ID>` | List actual user-turn anchors, IDs, timestamps and prompt previews |
 | `cdx-live <ID>` | Reconstructed compaction/rollback-aware live context |
 | `cdx-batch <ID1>,<ID2>` | Deterministic batch export with short IDs |
