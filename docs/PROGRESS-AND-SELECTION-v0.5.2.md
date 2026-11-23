@@ -97,8 +97,9 @@ This policy has five guarantees:
 4. Known gaps remain disclosed in selection provenance even when outside the
    chosen range; inclusion and coordinate scope are distinguished. Nested
    excerpts preserve that audit trail.
-5. Mixed NUL/text, other malformed JSON, invalid UTF-8, and non-object records
-   are not covered by this exception. They continue to block exact selection.
+5. Mixed NUL/text, invalid UTF-8, non-object records, and malformed JSON that
+   cannot be handled by the existing narrow Windows-path escape repair remain
+   errors. This exception does not permit arbitrary damaged records.
 
 An unterminated NUL tail remains subject to the unfinished-tail policy because a
 live writer may still be appending it. Turn numbers count observed complete human
